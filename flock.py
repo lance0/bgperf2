@@ -98,11 +98,13 @@ class FlockTarget(Flock, Target):
         ).decode('utf-8'))
         return neighbor_received_output['neighbor_summary']['default']['recv_converged']
     
-    def get_neighbor_received_routes(self):
+    def get_neighbor_received_routes(self, dckr_override=None):
         ## if we call this before the daemon starts we will not get output
         
         tester_count, neighbors_checked = self.get_test_counts()
-        neighbors_accepted = self.get_neighbors_state() - 1 # have to discount the monitor
+        neighbors_accepted = self.get_neighbors_state(
+            dckr_override=dckr_override
+        ) - 1 # have to discount the monitor
         i = 0
         for n in neighbors_checked.keys():
             if i >= neighbors_accepted:
@@ -112,4 +114,3 @@ class FlockTarget(Flock, Target):
 
 
         return neighbors_checked, neighbors_checked
-

@@ -7,8 +7,17 @@ import subprocess
 # Default path to rustbgpd source tree for local builds
 RUSTBGPD_SOURCE = os.environ.get('RUSTBGPD_SOURCE', '/home/lance/projects/rustbgpd')
 
+RUST_BUILDER_IMAGE = (
+    'rust:1.95-bookworm@sha256:'
+    '6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1'
+)
+DEBIAN_RUNTIME_IMAGE = (
+    'debian:bookworm-slim@sha256:'
+    '60eac759739651111db372c07be67863818726f754804b8707c90979bda511df'
+)
+
 DOCKERFILE_CONTENT = '''\
-FROM rust:1.95-bookworm AS builder
+FROM {builder_image} AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler \
@@ -17,8 +26,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY . .
 RUN cargo build --workspace --release --locked
+RUN mkdir -p /build-provenance \
+    && {{ \
+        echo 'builder_base={builder_image}'; \
+        rustc --version --verbose; \
+        cargo --version --verbose; \
+        protoc --version; \
+        dpkg-query -W -f='${{Package}}=${{Version}}\\n' | sort; \
+    }} > /build-provenance/builder.txt
 
-FROM debian:bookworm-slim
+FROM {runtime_image}
 WORKDIR /root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,12 +44,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/rustbgpd /usr/local/bin/rustbgpd
 COPY --from=builder /build/target/release/rbgp /usr/local/bin/rustbgpctl
+COPY --from=builder /build-provenance/builder.txt /usr/local/share/rustbgpd-builder-provenance.txt
+
+RUN {{ \
+        echo 'runtime_base={runtime_image}'; \
+        dpkg-query -W -f='${{Package}}=${{Version}}\\n' | sort; \
+    }} > /usr/local/share/rustbgpd-runtime-provenance.txt
 
 RUN mkdir -p /var/lib/rustbgpd
-'''
+'''.format(builder_image=RUST_BUILDER_IMAGE, runtime_image=DEBIAN_RUNTIME_IMAGE)
 
 DOCKERFILE_CONTENT_PROF = '''\
-FROM rust:1.95-bookworm AS builder
+FROM {builder_image} AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler \
@@ -41,8 +64,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY . .
 RUN cargo build --workspace --profile release-prof --features jemalloc --locked
+RUN mkdir -p /build-provenance \
+    && {{ \
+        echo 'builder_base={builder_image}'; \
+        rustc --version --verbose; \
+        cargo --version --verbose; \
+        protoc --version; \
+        dpkg-query -W -f='${{Package}}=${{Version}}\\n' | sort; \
+    }} > /build-provenance/builder.txt
 
-FROM debian:bookworm-slim
+FROM {runtime_image}
 WORKDIR /root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -51,12 +82,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release-prof/rustbgpd /usr/local/bin/rustbgpd
 COPY --from=builder /build/target/release-prof/rbgp /usr/local/bin/rustbgpctl
+COPY --from=builder /build-provenance/builder.txt /usr/local/share/rustbgpd-builder-provenance.txt
+
+RUN {{ \
+        echo 'runtime_base={runtime_image}'; \
+        dpkg-query -W -f='${{Package}}=${{Version}}\\n' | sort; \
+    }} > /usr/local/share/rustbgpd-runtime-provenance.txt
 
 RUN mkdir -p /var/lib/rustbgpd
-'''
+'''.format(builder_image=RUST_BUILDER_IMAGE, runtime_image=DEBIAN_RUNTIME_IMAGE)
 
 DOCKERFILE_CONTENT_DHAT = '''\
-FROM rust:1.95-bookworm AS builder
+FROM {builder_image} AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler \
@@ -65,8 +102,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY . .
 RUN cargo build --workspace --profile release-prof --features dhat-heap --locked
+RUN mkdir -p /build-provenance \
+    && {{ \
+        echo 'builder_base={builder_image}'; \
+        rustc --version --verbose; \
+        cargo --version --verbose; \
+        protoc --version; \
+        dpkg-query -W -f='${{Package}}=${{Version}}\\n' | sort; \
+    }} > /build-provenance/builder.txt
 
-FROM debian:bookworm-slim
+FROM {runtime_image}
 WORKDIR /root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -75,9 +120,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release-prof/rustbgpd /usr/local/bin/rustbgpd
 COPY --from=builder /build/target/release-prof/rbgp /usr/local/bin/rustbgpctl
+COPY --from=builder /build-provenance/builder.txt /usr/local/share/rustbgpd-builder-provenance.txt
+
+RUN {{ \
+        echo 'runtime_base={runtime_image}'; \
+        dpkg-query -W -f='${{Package}}=${{Version}}\\n' | sort; \
+    }} > /usr/local/share/rustbgpd-runtime-provenance.txt
 
 RUN mkdir -p /var/lib/rustbgpd
-'''
+'''.format(builder_image=RUST_BUILDER_IMAGE, runtime_image=DEBIAN_RUNTIME_IMAGE)
 
 
 class RustBGPd(Container):
@@ -105,6 +156,7 @@ class RustBGPd(Container):
             return
 
         source_revision = cls._clean_revision(source, 'rustbgpd source')
+        cls._require_checkout_at_head(source, checkout, source_revision)
         adapter_root = os.path.dirname(os.path.realpath(__file__))
         cls._require_tracked_file(adapter_root, __file__, 'rustbgpd adapter')
         adapter_revision = cls._clean_revision(
@@ -175,16 +227,52 @@ class RustBGPd(Container):
 
     @staticmethod
     def _render_dockerfile(content, source_revision, adapter_revision):
-        return content.replace(
-            'FROM debian:bookworm-slim\n',
-            'FROM debian:bookworm-slim\n'
+        runtime_preamble = (
+            'FROM {}\n'
             'LABEL org.opencontainers.image.revision="{}"\n'
-            'LABEL org.rustbgpd.bgperf2.revision="{}"\n'.format(
-                source_revision,
-                adapter_revision,
-            ),
+            'LABEL org.rustbgpd.bgperf2.revision="{}"\n'
+            'LABEL org.opencontainers.image.base.name="{}"\n'
+            'LABEL org.opencontainers.image.base.digest="sha256:{}"\n'
+            'LABEL org.rustbgpd.bgperf2.builder-base.digest="sha256:{}"\n'
+            'LABEL org.rustbgpd.bgperf2.rust-toolchain="1.95"\n'
+        ).format(
+            DEBIAN_RUNTIME_IMAGE,
+            source_revision,
+            adapter_revision,
+            DEBIAN_RUNTIME_IMAGE,
+            DEBIAN_RUNTIME_IMAGE.rsplit('sha256:', 1)[1],
+            RUST_BUILDER_IMAGE.rsplit('sha256:', 1)[1],
+        )
+        return content.replace(
+            'FROM {}\n'.format(DEBIAN_RUNTIME_IMAGE),
+            runtime_preamble,
             1,
         )
+
+    @staticmethod
+    def _require_checkout_at_head(path, checkout, head_revision):
+        """Require the requested checkout to resolve to the clean source HEAD."""
+        requested = checkout or 'HEAD'
+        try:
+            requested_revision = subprocess.check_output(
+                ['git', '-C', path, 'rev-parse', '{}^{{commit}}'.format(requested)],
+                text=True,
+                stderr=subprocess.STDOUT,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(
+                'rustbgpd checkout {!r} does not resolve to a commit'.format(requested)
+            ) from error
+
+        if requested_revision != head_revision:
+            raise RuntimeError(
+                'rustbgpd checkout {!r} resolves to {}, but the clean source HEAD is {}; '
+                'check out that revision in RUSTBGPD_SOURCE first'.format(
+                    requested,
+                    requested_revision,
+                    head_revision,
+                )
+            )
 
     @staticmethod
     def _require_tracked_file(repo, path, label):

@@ -75,6 +75,11 @@ def rm_line():
     pass
 
 
+def monitor_confirms_neighbor_checkpoint(target, recved, required, existing):
+    """Apply rustbgpd's monitor fallback without erasing target evidence."""
+    return existing or (target == 'rustbgpd' and recved >= required)
+
+
 def gc_thresh3():
     gc_thresh3 = '/proc/sys/net/ipv4/neigh/default/gc_thresh3'
     with open(gc_thresh3) as f:
@@ -616,8 +621,12 @@ def bench(args):
             # blocked or slow under heavy load (e.g. single-task RIB
             # implementations).  If the monitor has received enough
             # prefixes, treat the neighbors checkpoint as met.
-            if recved >= output_stats['required'] and not neighbors_checkpoint:
-                neighbors_checkpoint = True
+            neighbors_checkpoint = monitor_confirms_neighbor_checkpoint(
+                args.target,
+                recved,
+                output_stats['required'],
+                neighbors_checkpoint,
+            )
 
             # we are trying to discover if the tests have finished
             #  in the ieal world, we'd know how many prefixes were sent and we'd just check for that
@@ -715,7 +724,7 @@ def print_final_stats(args, target_version, stats):
     print()
 
 def stats_header():
-    return("name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date,cores,Mem (GB), tester errors, failed, MSG, filters")
+    return("name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date,cores,Mem (GB), tester errors, tester timeouts, failed, MSG, filters")
 
 
 def create_output_stats(args, target_version, stats, fail=False):

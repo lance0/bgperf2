@@ -5,13 +5,18 @@ import unittest
 from unittest import mock
 
 import bgperf2
+from flock import FlockTarget
+from frr import FRRoutingTarget
 from rustbgpd import (
+    DEBIAN_RUNTIME_IMAGE,
     DOCKERFILE_CONTENT,
     DOCKERFILE_CONTENT_DHAT,
     DOCKERFILE_CONTENT_PROF,
+    RUST_BUILDER_IMAGE,
     RustBGPd,
     RustBGPdTarget,
 )
+from srlinux import SRLinuxTarget
 
 
 class RustBgpdAdapterTests(unittest.TestCase):
@@ -23,6 +28,10 @@ class RustBgpdAdapterTests(unittest.TestCase):
         ):
             self.assertIn('cargo build --workspace', dockerfile)
             self.assertIn('--locked', dockerfile)
+            self.assertIn('FROM {} AS builder'.format(RUST_BUILDER_IMAGE), dockerfile)
+            self.assertIn('FROM {}'.format(DEBIAN_RUNTIME_IMAGE), dockerfile)
+            self.assertIn('rustbgpd-builder-provenance.txt', dockerfile)
+            self.assertIn('rustbgpd-runtime-provenance.txt', dockerfile)
 
         rendered = RustBGPd._render_dockerfile(
             DOCKERFILE_CONTENT_DHAT,
@@ -37,6 +46,67 @@ class RustBgpdAdapterTests(unittest.TestCase):
             'LABEL org.rustbgpd.bgperf2.revision="{}"\n'.format('b' * 40),
             rendered,
         )
+        self.assertIn(
+            'LABEL org.opencontainers.image.base.digest="sha256:{}"'.format(
+                DEBIAN_RUNTIME_IMAGE.rsplit('sha256:', 1)[1]
+            ),
+            rendered,
+        )
+
+    def test_monitor_fallback_is_scoped_to_rustbgpd(self):
+        required = 200000
+        for target in ('bird', 'flock', 'frr', 'srlinux'):
+            checkpoint = False
+            for received in (0, required, required + 1):
+                checkpoint = bgperf2.monitor_confirms_neighbor_checkpoint(
+                    target,
+                    received,
+                    required,
+                    checkpoint,
+                )
+                self.assertFalse(checkpoint, target)
+
+        checkpoint = False
+        for received in (0, required):
+            checkpoint = bgperf2.monitor_confirms_neighbor_checkpoint(
+                'rustbgpd',
+                received,
+                required,
+                checkpoint,
+            )
+        self.assertTrue(checkpoint)
+        self.assertTrue(
+            bgperf2.monitor_confirms_neighbor_checkpoint('frr', 0, required, True)
+        )
+
+    def test_neighbor_stats_override_compatibility(self):
+        scenario = {
+            'testers': [{
+                'neighbors': {
+                    '10.0.0.1': {'check-points': 10},
+                },
+            }],
+        }
+
+        frr = object.__new__(FRRoutingTarget)
+        frr.scenario_global_conf = scenario
+        frr.get_neighbors_state = mock.Mock(return_value=({}, {'10.0.0.1': 10}))
+        frr._get_EOR_from_log = mock.Mock(return_value={'10.0.0.1': True})
+        self.assertEqual(
+            frr.get_neighbor_received_routes(dckr_override='client'),
+            ({'10.0.0.1': True}, {'10.0.0.1': True}),
+        )
+        frr.get_neighbors_state.assert_called_once_with(dckr_override='client')
+
+        for target_class in (FlockTarget, SRLinuxTarget):
+            target = object.__new__(target_class)
+            target.scenario_global_conf = scenario
+            target.get_neighbors_state = mock.Mock(return_value=2)
+            self.assertEqual(
+                target.get_neighbor_received_routes(dckr_override='client'),
+                ({'10.0.0.1': True}, {'10.0.0.1': True}),
+            )
+            target.get_neighbors_state.assert_called_once_with(dckr_override='client')
 
     def test_neighbor_json_maps_received_prefixes(self):
         target = object.__new__(RustBGPdTarget)
@@ -110,7 +180,7 @@ class RustBgpdAdapterTests(unittest.TestCase):
             profile='dhat',
         )
 
-    def test_csv_quirk_remains_explicit_and_deterministic(self):
+    def test_csv_schema_labels_distinct_tester_counters(self):
         args = argparse.Namespace(
             label=None,
             target='rustbgpd',
@@ -132,23 +202,34 @@ class RustBgpdAdapterTests(unittest.TestCase):
             'min_free': 8 * 1024 * 1024 * 1024,
             'cores': 8,
             'memory': 16 * 1024 * 1024 * 1024,
-            'tester_errors': 0,
-            'tester_timeouts': 0,
+            'tester_errors': 7,
+            'tester_timeouts': 11,
         }
 
         header = [field.strip() for field in bgperf2.stats_header().split(',')]
         row = bgperf2.create_output_stats(args, '0.50.0', stats)
 
-        self.assertEqual(len(header), 24)
+        self.assertEqual(len(header), 25)
         self.assertEqual(len(row), 25)
-        self.assertEqual(header[20:22], ['tester errors', 'failed'])
-        self.assertEqual(row[20:22], [0, 0])
+        self.assertEqual(
+            header[20:25],
+            ['tester errors', 'tester timeouts', 'failed', 'MSG', 'filters'],
+        )
+        self.assertEqual(row[20:25], [7, 11, '', '', ''])
 
     def test_clean_revision_rejects_dirty_checkout(self):
         with mock.patch('subprocess.check_output') as check_output:
             check_output.side_effect = ['abc123\n', ' M rustbgpd.py\n']
             with self.assertRaisesRegex(RuntimeError, 'must be clean'):
                 RustBGPd._clean_revision('/repo', 'adapter')
+
+    def test_requested_checkout_must_match_clean_source_head(self):
+        with mock.patch('subprocess.check_output', return_value='abc123\n'):
+            RustBGPd._require_checkout_at_head('/repo', 'release', 'abc123')
+
+        with mock.patch('subprocess.check_output', return_value='def456\n'):
+            with self.assertRaisesRegex(RuntimeError, 'clean source HEAD is abc123'):
+                RustBGPd._require_checkout_at_head('/repo', 'release', 'abc123')
 
     def test_adapter_must_be_tracked(self):
         with mock.patch('subprocess.check_output') as check_output:

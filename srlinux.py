@@ -122,11 +122,13 @@ set / network-instance default protocols bgp neighbor {0} peer-group neighbors
 
         return neighbor_received_output['neighbor_summary']['recv_converged']
     
-    def get_neighbor_received_routes(self):
+    def get_neighbor_received_routes(self, dckr_override=None):
         ## if we call this before the daemon starts we will not get output
         
         tester_count, neighbors_checked = self.get_test_counts()
-        neighbors_accepted = self.get_neighbors_state() - 1 # have to discount the monitor
+        neighbors_accepted = self.get_neighbors_state(
+            dckr_override=dckr_override
+        ) - 1 # have to discount the monitor
 
         i = 0
         for n in neighbors_checked.keys():
@@ -137,4 +139,3 @@ set / network-instance default protocols bgp neighbor {0} peer-group neighbors
 
 
         return neighbors_checked, neighbors_checked
-
