@@ -180,7 +180,7 @@ class RustBgpdAdapterTests(unittest.TestCase):
             profile='dhat',
         )
 
-    def test_csv_schema_labels_distinct_tester_counters(self):
+    def test_csv_quirk_uses_distinct_tester_counter_sentinels(self):
         args = argparse.Namespace(
             label=None,
             target='rustbgpd',
@@ -209,13 +209,19 @@ class RustBgpdAdapterTests(unittest.TestCase):
         header = [field.strip() for field in bgperf2.stats_header().split(',')]
         row = bgperf2.create_output_stats(args, '0.50.0', stats)
 
-        self.assertEqual(len(header), 25)
+        tester_errors_index = 20
+        tester_timeouts_index = 21
+        failed_index = 22
+
+        self.assertEqual(len(header), 24)
         self.assertEqual(len(row), 25)
         self.assertEqual(
-            header[20:25],
-            ['tester errors', 'tester timeouts', 'failed', 'MSG', 'filters'],
+            header[tester_errors_index:24],
+            ['tester errors', 'failed', 'MSG', 'filters'],
         )
-        self.assertEqual(row[20:25], [7, 11, '', '', ''])
+        self.assertEqual(row[tester_errors_index], 7)
+        self.assertEqual(row[tester_timeouts_index], 11)
+        self.assertEqual(row[failed_index:25], ['', '', ''])
 
     def test_clean_revision_rejects_dirty_checkout(self):
         with mock.patch('subprocess.check_output') as check_output:

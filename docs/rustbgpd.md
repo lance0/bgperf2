@@ -56,8 +56,9 @@ python3 bgperf2.py bench -t rustbgpd --image bgperf/rustbgpd-dhat \
 
 Keep the same image and daemon process for the DHAT capture and bgperf2 CSV.
 
-This adapter adds the missing `tester timeouts` CSV header so all 25 emitted
-values have a distinct label. `test_rustbgpd.py` uses different error and
-timeout sentinels to lock the final five column indices. Receipt consumers
-should still archive the adapter revision with the CSV so the schema is
-unambiguous.
+The upstream CSV has 24 header labels but 25 row values because the
+`tester_timeouts` value is emitted without a label. `test_rustbgpd.py` uses
+different error and timeout sentinels to lock their distinct row indices and
+the following shifted fields. Receipt consumers must pin this schema or reject
+it rather than silently shifting later columns, and should archive the adapter
+revision with the CSV.

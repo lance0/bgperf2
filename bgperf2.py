@@ -724,7 +724,7 @@ def print_final_stats(args, target_version, stats):
     print()
 
 def stats_header():
-    return("name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date,cores,Mem (GB), tester errors, tester timeouts, failed, MSG, filters")
+    return("name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date,cores,Mem (GB), tester errors, failed, MSG, filters")
 
 
 def create_output_stats(args, target_version, stats, fail=False):
