@@ -292,6 +292,38 @@ class RustBGPdTarget(RustBGPd, Target):
     CONTAINER_NAME = 'bgperf_rustbgpd_target'
     CONFIG_FILE_NAME = 'config.toml'
 
+    def run(self, scenario_global_conf, dckr_net_name=''):
+        self._require_policy_free_scenario(scenario_global_conf)
+        return super(RustBGPdTarget, self).run(
+            scenario_global_conf,
+            dckr_net_name,
+        )
+
+    @staticmethod
+    def _require_policy_free_scenario(scenario_global_conf):
+        """Reject policy inputs this adapter cannot faithfully configure."""
+        unsupported = []
+        if scenario_global_conf.get('target', {}).get('filter_test'):
+            unsupported.append('target.filter_test')
+        if scenario_global_conf.get('policy'):
+            unsupported.append('policy')
+
+        for tester in scenario_global_conf.get('testers', []):
+            if not tester:
+                continue
+            for neighbor_name, neighbor in tester.get('neighbors', {}).items():
+                filters = neighbor.get('filter', {})
+                if any(filters.values()):
+                    unsupported.append(
+                        'testers.neighbors.{}.filter'.format(neighbor_name)
+                    )
+
+        if unsupported:
+            raise RuntimeError(
+                'rustbgpd target does not implement generated filter/policy '
+                'configuration: {}'.format(', '.join(unsupported))
+            )
+
     def write_config(self):
         config = '[global]\n'
         config += 'asn = {}\n'.format(self.conf['as'])

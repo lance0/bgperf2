@@ -56,6 +56,14 @@ python3 bgperf2.py bench -t rustbgpd --image bgperf/rustbgpd-dhat \
 
 Keep the same image and daemon process for the DHAT capture and bgperf2 CSV.
 
+The generated rustbgpd target currently supports policy-free convergence
+receipts only. It fails before starting containers if `--filter_test`, nonempty
+generated policy definitions, or nonempty per-neighbor filter assignments are
+present; it does not silently label an unconfigured filter run. Under a
+zero-route startup, only rustbgpd receives the extended 120-second grace used
+by the high-load receipt. Other targets retain bgperf2's 15-second failure
+threshold.
+
 The upstream CSV has 24 header labels but 25 row values because the
 `tester_timeouts` value is emitted without a label. `test_rustbgpd.py` uses
 different error and timeout sentinels to lock their distinct row indices and

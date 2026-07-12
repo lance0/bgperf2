@@ -80,6 +80,11 @@ def monitor_confirms_neighbor_checkpoint(target, recved, required, existing):
     return existing or (target == 'rustbgpd' and recved >= required)
 
 
+def zero_route_failure_grace_seconds(target):
+    """Give only the rustbgpd receipt extra zero-route startup time."""
+    return 120 if target == 'rustbgpd' else 15
+
+
 def gc_thresh3():
     gc_thresh3 = '/proc/sys/net/ipv4/neigh/default/gc_thresh3'
     with open(gc_thresh3) as f:
@@ -668,7 +673,10 @@ def bench(args):
                 bench_prefix = f"{args.target}_{args.tester_type}_{args.prefix_num}_{args.neighbor_num}"
                 create_bench_graphs(bench_stats, prefix=bench_prefix)       
 
-            if elapsed.seconds > 120 and recved_checkpoint == 0 and last_recved_count == 0 and recved == 0:
+            if (elapsed.seconds > zero_route_failure_grace_seconds(args.target)
+                    and recved_checkpoint == 0
+                    and last_recved_count == 0
+                    and recved == 0):
                 last_recved_count = 1_000_000 # make it artifically high so things fail quickly
 
         # Too many of the same counts in a row, not progressing

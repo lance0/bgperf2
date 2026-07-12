@@ -79,6 +79,52 @@ class RustBgpdAdapterTests(unittest.TestCase):
             bgperf2.monitor_confirms_neighbor_checkpoint('frr', 0, required, True)
         )
 
+    def test_zero_route_failure_grace_is_scoped_to_rustbgpd(self):
+        self.assertEqual(bgperf2.zero_route_failure_grace_seconds('rustbgpd'), 120)
+        for target in ('bird', 'flock', 'frr', 'gobgp', 'srlinux'):
+            self.assertEqual(
+                bgperf2.zero_route_failure_grace_seconds(target),
+                15,
+                target,
+            )
+
+    def test_rustbgpd_rejects_unimplemented_policy_inputs(self):
+        clean = {
+            'target': {},
+            'policy': {},
+            'testers': [{
+                'neighbors': {
+                    '10.0.0.1': {'filter': {'in': []}},
+                },
+            }],
+        }
+        RustBGPdTarget._require_policy_free_scenario(clean)
+
+        scenarios = (
+            {
+                'target': {'filter_test': 'ixp'},
+                'policy': {},
+                'testers': [],
+            },
+            {
+                'target': {},
+                'policy': {'p1': {'match': []}},
+                'testers': [],
+            },
+            {
+                'target': {},
+                'policy': {},
+                'testers': [{
+                    'neighbors': {
+                        '10.0.0.1': {'filter': {'out': ['p1']}},
+                    },
+                }],
+            },
+        )
+        for scenario in scenarios:
+            with self.assertRaisesRegex(RuntimeError, 'does not implement'):
+                RustBGPdTarget._require_policy_free_scenario(scenario)
+
     def test_neighbor_stats_override_compatibility(self):
         scenario = {
             'testers': [{
