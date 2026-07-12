@@ -4,9 +4,11 @@ import subprocess
 import unittest
 from unittest import mock
 
+import base as base_module
 import bgperf2
 from flock import FlockTarget
 from frr import FRRoutingTarget
+from openbgp import OpenBGPTarget
 from rustbgpd import (
     DEBIAN_RUNTIME_IMAGE,
     DOCKERFILE_CONTENT,
@@ -20,6 +22,37 @@ from srlinux import SRLinuxTarget
 
 
 class RustBgpdAdapterTests(unittest.TestCase):
+    def test_openbgp_filter_file_is_closed(self):
+        opened = mock.mock_open(read_data='filter contents')
+        target = object.__new__(OpenBGPTarget)
+
+        with mock.patch('builtins.open', opened):
+            self.assertEqual(target.get_filter_test_config(), 'filter contents')
+
+        opened.assert_called_once_with('filters/openbgp.conf', mode='r')
+        opened.return_value.__enter__.assert_called_once_with()
+        opened.return_value.__exit__.assert_called_once()
+
+    def test_neighbor_stats_closes_dedicated_docker_client(self):
+        class ImmediateThread:
+            def __init__(self, target):
+                self.target = target
+                self.daemon = False
+
+            def start(self):
+                self.target()
+
+        container = object.__new__(base_module.Container)
+        container.stop_monitoring = True
+        client = mock.Mock()
+
+        with mock.patch('base.Thread', ImmediateThread), \
+                mock.patch('settings.Client', return_value=client) as client_factory:
+            container.neighbor_stats(mock.Mock())
+
+        client_factory.assert_called_once_with(version='auto')
+        client.close.assert_called_once_with()
+
     def test_all_build_profiles_use_root_lockfile(self):
         for dockerfile in (
             DOCKERFILE_CONTENT,

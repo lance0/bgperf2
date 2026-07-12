@@ -167,4 +167,4 @@ class GoBGPTarget(GoBGP, Target):
 
 ## Caveats
 #   I don't think accepting policy is configured correctly. it 
-#    doesn't seem to be applied to the neighobr
+#    doesn't seem to be applied to the neighbor

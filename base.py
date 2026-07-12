@@ -214,16 +214,19 @@ class Container(object):
         # (e.g. 60s+ gRPC queries under load) don't block the shared
         # connection pool used by the monitor and stats threads.
         from settings import Client
-        neighbor_dckr = Client(version='auto')
 
         def stats():
-            while True:
-                if self.stop_monitoring:
-                    return
-                neighbors_received_full, neighbors_checked = self.get_neighbor_received_routes(dckr_override=neighbor_dckr)
-                queue.put({'who': self.name, 'neighbors_checked': neighbors_checked})
-                queue.put({'who': self.name, 'neighbors_received_full': neighbors_received_full})
-                time.sleep(1)
+            neighbor_dckr = Client(version='auto')
+            try:
+                while True:
+                    if self.stop_monitoring:
+                        return
+                    neighbors_received_full, neighbors_checked = self.get_neighbor_received_routes(dckr_override=neighbor_dckr)
+                    queue.put({'who': self.name, 'neighbors_checked': neighbors_checked})
+                    queue.put({'who': self.name, 'neighbors_received_full': neighbors_received_full})
+                    time.sleep(1)
+            finally:
+                neighbor_dckr.close()
 
         t = Thread(target=stats)
         t.daemon = True
