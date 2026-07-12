@@ -218,10 +218,12 @@ return true;
         else:
             return ret.strip('\n')
 
-    def get_neighbors_state(self):
+    def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}
         neighbors_received = {}
-        neighbor_received_output = self.local("birdc 'show protocols all'").decode('utf-8')
+        neighbor_received_output = self.local(
+            "birdc 'show protocols all'", dckr_override=dckr_override
+        ).decode('utf-8')
         
         with open('bird.tfsm') as template:
             fsm = textfsm.TextFSM(template)

@@ -91,10 +91,13 @@ class JunosTarget(Junos, Target):
         return dckr.exec_start(i['Id'], stream=False, detach=False).decode('utf-8').split('\n')[3].strip('\n').split(':')[1].split(' ')[1]
 
 
-    def get_neighbors_state(self):
+    def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}
         neighbors_received = {}
-        neighbor_received_output = json.loads(self.local("cli show bgp neighbor \| no-more \| display json").decode('utf-8'))
+        neighbor_received_output = json.loads(self.local(
+            r"cli show bgp neighbor \| no-more \| display json",
+            dckr_override=dckr_override,
+        ).decode('utf-8'))
 
         for neighbor in neighbor_received_output['bgp-information'][0]['bgp-peer']:
 
@@ -120,5 +123,4 @@ class JunosTarget(Junos, Target):
             cap_add=['NET_ADMIN']
         )
         return host_config
-
 

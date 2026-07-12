@@ -148,10 +148,12 @@ no bgp ebgp-requires-policy
         ret = super().exec_version_cmd()
         return ret.split('\n')[0]
     
-    def get_neighbors_state(self):
+    def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}
         neighbors_received = {}
-        neighbor_received_output = self.local("vtysh -c 'sh ip bgp summary json'")
+        neighbor_received_output = self.local(
+            "vtysh -c 'sh ip bgp summary json'", dckr_override=dckr_override
+        )
         if neighbor_received_output:
             neighbor_received_output = json.loads(neighbor_received_output.decode('utf-8'))
 
@@ -186,4 +188,3 @@ no bgp ebgp-requires-policy
         assert(len(neighbors_received_full) == len(neighbors_checked))
 
         return neighbors_received_full, neighbors_checked
-
