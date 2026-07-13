@@ -6,6 +6,8 @@ import subprocess
 
 # Default path to rustbgpd source tree for local builds
 RUSTBGPD_SOURCE = os.environ.get('RUSTBGPD_SOURCE', '/home/lance/projects/rustbgpd')
+RUSTBGPD_EVENT_HISTORY_ENV = 'RUSTBGPD_EVENT_HISTORY'
+RUSTBGPD_EVENT_HISTORY_OFF_ENV = 'RUSTBGPD_EVENT_HISTORY_OFF'
 
 RUST_BUILDER_IMAGE = (
     'rust:1.95-bookworm@sha256:'
@@ -324,6 +326,35 @@ class RustBGPdTarget(RustBGPd, Target):
                 'configuration: {}'.format(', '.join(unsupported))
             )
 
+    @staticmethod
+    def _event_history_mode(environ=None):
+        """Resolve the explicit rustbgpd event-history benchmark mode."""
+        environ = os.environ if environ is None else environ
+        requested = environ.get(RUSTBGPD_EVENT_HISTORY_ENV)
+        legacy_off = environ.get(RUSTBGPD_EVENT_HISTORY_OFF_ENV)
+
+        if requested is None:
+            # Keep the old OFF switch's non-empty-string truthiness. When no
+            # mode is selected, omit the block so the adapter can still run
+            # against rustbgpd revisions that predate [event_history].
+            return 'disabled' if legacy_off else None
+
+        if requested not in ('enabled', 'disabled'):
+            raise RuntimeError(
+                '{} must be "enabled" or "disabled", got {!r}'.format(
+                    RUSTBGPD_EVENT_HISTORY_ENV,
+                    requested,
+                )
+            )
+        if legacy_off and requested == 'enabled':
+            raise RuntimeError(
+                '{}=enabled conflicts with legacy {}'.format(
+                    RUSTBGPD_EVENT_HISTORY_ENV,
+                    RUSTBGPD_EVENT_HISTORY_OFF_ENV,
+                )
+            )
+        return requested
+
     def write_config(self):
         config = '[global]\n'
         config += 'asn = {}\n'.format(self.conf['as'])
@@ -347,13 +378,15 @@ class RustBGPdTarget(RustBGPd, Target):
         config += 'enforcement = "legacy"\n'
         config += '\n'
 
-        # The durable event-history outbox (ADR-0072) is default-on and
-        # persists every route event to SQLite. Set RUSTBGPD_EVENT_HISTORY_OFF=1
-        # to measure baseline daemon RSS without it (the v0.30-era comparison
-        # point predates event-history entirely).
-        if os.environ.get('RUSTBGPD_EVENT_HISTORY_OFF'):
+        # The durable event-history outbox (ADR-0072) is opt-in/default-off on
+        # current rustbgpd. Render explicit selections, while leaving the block
+        # absent when unset so pre-v0.30 daemon revisions remain benchmarkable.
+        event_history_mode = self._event_history_mode()
+        if event_history_mode is not None:
             config += '[event_history]\n'
-            config += 'enabled = false\n'
+            config += 'enabled = {}\n'.format(
+                'true' if event_history_mode == 'enabled' else 'false'
+            )
             config += '\n'
 
         neighbors = list(flatten(
