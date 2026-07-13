@@ -90,16 +90,21 @@ class FlockTarget(Flock, Target):
         i= dckr.exec_create(container=self.name, cmd=version, stderr=True)
         return dckr.exec_start(i['Id'], stream=False, detach=False).decode('utf-8').strip('\n')
 
-    def get_neighbors_state(self):
+    def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}
-        neighbor_received_output = json.loads(self.local("/usr/bin/flockc bgp --host 127.0.0.1 -J").decode('utf-8'))
+        neighbor_received_output = json.loads(self.local(
+            "/usr/bin/flockc bgp --host 127.0.0.1 -J",
+            dckr_override=dckr_override,
+        ).decode('utf-8'))
         return neighbor_received_output['neighbor_summary']['default']['recv_converged']
     
-    def get_neighbor_received_routes(self):
+    def get_neighbor_received_routes(self, dckr_override=None):
         ## if we call this before the daemon starts we will not get output
         
         tester_count, neighbors_checked = self.get_test_counts()
-        neighbors_accepted = self.get_neighbors_state() - 1 # have to discount the monitor
+        neighbors_accepted = self.get_neighbors_state(
+            dckr_override=dckr_override
+        ) - 1 # have to discount the monitor
         i = 0
         for n in neighbors_checked.keys():
             if i >= neighbors_accepted:
@@ -109,5 +114,3 @@ class FlockTarget(Flock, Target):
 
 
         return neighbors_checked, neighbors_checked
-
-

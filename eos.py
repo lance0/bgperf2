@@ -76,10 +76,12 @@ class EosTarget(Eos, Target):
 
 
 
-    def get_neighbors_state(self):
+    def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}
         neighbors_received = {}
-        neighbor_received_output = self.local("Cli -c 'sh ip bgp summary |json'")
+        neighbor_received_output = self.local(
+            "Cli -c 'sh ip bgp summary |json'", dckr_override=dckr_override
+        )
         if neighbor_received_output:
             neighbor_received_output = json.loads(neighbor_received_output.decode('utf-8'))["vrfs"]["default"]["peers"]
 
@@ -89,7 +91,6 @@ class EosTarget(Eos, Target):
             neighbors_accepted[n] = rcd
         return neighbors_received, neighbors_accepted
     
-
 
 
 

@@ -118,10 +118,13 @@ fib-update no
         i= dckr.exec_create(container=self.name, cmd=version, stderr=True)
         return dckr.exec_start(i['Id'], stream=False, detach=False).decode('utf-8').strip('\n')
 
-    def get_neighbors_state(self):
+    def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}
         neighbors_received_full = {}
-        neighbor_received_output = json.loads(self.local("/usr/local/sbin/bgpctl -j show neighbor").decode('utf-8'))
+        neighbor_received_output = json.loads(self.local(
+            "/usr/local/sbin/bgpctl -j show neighbor",
+            dckr_override=dckr_override,
+        ).decode('utf-8'))
         for neigh in neighbor_received_output['neighbors']:
             neighbors_accepted[neigh['remote_addr']] = neigh['stats']['prefixes']['received']
             neighbors_received_full[neigh['remote_addr']] = False if neigh['stats']['update']['received']['eor'] == 0 else True
@@ -131,7 +134,5 @@ fib-update no
 
 
     def get_filter_test_config(self): 
-        file = open("filters/openbgp.conf", mode='r')
-        filters = file.read()
-        file.close
-        return filters
+        with open("filters/openbgp.conf", mode='r') as file:
+            return file.read()
