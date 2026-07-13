@@ -56,6 +56,33 @@ python3 bgperf2.py bench -t rustbgpd --image bgperf/rustbgpd-dhat \
 
 Keep the same image and daemon process for the DHAT capture and bgperf2 CSV.
 
+## Event-history mode
+
+rustbgpd's durable event-history outbox is opt-in and defaults off on current
+revisions. When a mode is selected, the adapter writes it explicitly into
+`config.toml` so published comparisons do not silently depend on a daemon default.
+
+For rustbgpd v0.30.0 and newer, set `RUSTBGPD_EVENT_HISTORY` to exactly
+`enabled` or `disabled` for comparable runs:
+
+```bash
+RUSTBGPD_EVENT_HISTORY=disabled \
+  python3 bgperf2.py bench -t rustbgpd -n 2 -p 100000
+
+RUSTBGPD_EVENT_HISTORY=enabled \
+  python3 bgperf2.py bench -t rustbgpd -n 2 -p 100000
+```
+
+When unset, the adapter omits `[event_history]` so it remains compatible with
+rustbgpd revisions before v0.30.0, which reject that unknown block. Published
+comparisons against v0.30.0 or newer should set the variable explicitly; earlier
+revisions must leave it unset. The legacy
+`RUSTBGPD_EVENT_HISTORY_OFF` switch remains accepted as disabled-only
+compatibility with its original semantics: any nonempty value, including `0`,
+selects disabled, while an empty value is inactive. Combining an active legacy
+switch with `RUSTBGPD_EVENT_HISTORY=enabled` fails before the config is written
+instead of producing an ambiguous receipt.
+
 The generated rustbgpd target currently supports policy-free convergence
 receipts only. It fails before starting containers if `--filter_test`, nonempty
 generated policy definitions, or nonempty per-neighbor filter assignments are

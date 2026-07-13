@@ -1,6 +1,8 @@
 import argparse
 import datetime
+import os
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -15,6 +17,8 @@ from rustbgpd import (
     DOCKERFILE_CONTENT_DHAT,
     DOCKERFILE_CONTENT_PROF,
     RUST_BUILDER_IMAGE,
+    RUSTBGPD_EVENT_HISTORY_ENV,
+    RUSTBGPD_EVENT_HISTORY_OFF_ENV,
     RustBGPd,
     RustBGPdTarget,
 )
@@ -22,6 +26,76 @@ from srlinux import SRLinuxTarget
 
 
 class RustBgpdAdapterTests(unittest.TestCase):
+    def render_rustbgpd_config(self, environ):
+        target = object.__new__(RustBGPdTarget)
+        target.conf = {
+            'as': 65000,
+            'router-id': '192.0.2.1',
+        }
+        target.scenario_global_conf = {
+            'testers': [],
+            'monitor': {
+                'local-address': '192.0.2.2',
+                'as': 65001,
+            },
+        }
+        with tempfile.TemporaryDirectory() as host_dir:
+            target.host_dir = host_dir
+            with mock.patch.dict(os.environ, environ, clear=True):
+                target.write_config()
+            with open(os.path.join(host_dir, target.CONFIG_FILE_NAME)) as config_file:
+                return config_file.read()
+
+    def test_unset_event_history_omits_block_for_old_revision_compatibility(self):
+        config = self.render_rustbgpd_config({})
+
+        self.assertNotIn('[event_history]', config)
+
+    def test_event_history_can_be_selected_explicitly(self):
+        enabled = self.render_rustbgpd_config({
+            RUSTBGPD_EVENT_HISTORY_ENV: 'enabled',
+        })
+        disabled = self.render_rustbgpd_config({
+            RUSTBGPD_EVENT_HISTORY_ENV: 'disabled',
+        })
+
+        self.assertIn('[event_history]\nenabled = true\n', enabled)
+        self.assertIn('[event_history]\nenabled = false\n', disabled)
+
+    def test_event_history_mode_requires_exact_tokens(self):
+        for value in ('yes', ' Enabled ', 'ENABLED', 'Disabled', ''):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    RuntimeError, 'must be "enabled" or "disabled"'):
+                RustBGPdTarget._event_history_mode({
+                    RUSTBGPD_EVENT_HISTORY_ENV: value,
+                })
+
+    def test_event_history_enabled_conflicts_with_truthy_legacy_off(self):
+        with self.assertRaisesRegex(RuntimeError, 'conflicts with legacy'):
+            RustBGPdTarget._event_history_mode({
+                RUSTBGPD_EVENT_HISTORY_ENV: 'enabled',
+                RUSTBGPD_EVENT_HISTORY_OFF_ENV: '0',
+            })
+
+    def test_legacy_event_history_off_switch_remains_disabled(self):
+        config = self.render_rustbgpd_config({
+            RUSTBGPD_EVENT_HISTORY_OFF_ENV: '0',
+        })
+
+        self.assertIn('[event_history]\nenabled = false\n', config)
+
+    def test_empty_legacy_event_history_off_switch_remains_inactive(self):
+        unset = self.render_rustbgpd_config({
+            RUSTBGPD_EVENT_HISTORY_OFF_ENV: '',
+        })
+        enabled = self.render_rustbgpd_config({
+            RUSTBGPD_EVENT_HISTORY_ENV: 'enabled',
+            RUSTBGPD_EVENT_HISTORY_OFF_ENV: '',
+        })
+
+        self.assertNotIn('[event_history]', unset)
+        self.assertIn('[event_history]\nenabled = true\n', enabled)
+
     def test_openbgp_filter_file_is_closed(self):
         opened = mock.mock_open(read_data='filter contents')
         target = object.__new__(OpenBGPTarget)
