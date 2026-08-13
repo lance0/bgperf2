@@ -21,21 +21,60 @@ class GoBGP(Container):
 
     CONTAINER_NAME = None
     GUEST_DIR = '/root/config'
+    IMAGE_REPO = 'bgperf/gobgp'
+    DAEMON_BINARY = '/go/bin/gobgpd'
+    VERSIONS = ('3.35.0', '3.37.0')
+    DEFAULT_REF = 'master'
 
     def __init__(self, host_dir, conf, image='bgperf/gobgp'):
         super(GoBGP, self).__init__(self.CONTAINER_NAME, image, host_dir, self.GUEST_DIR, conf)
 
+    # On the daemon base class rather than GoBGPTarget so the monitor -- which
+    # is a GoBGP, not a target -- can report its version too. It is the
+    # instrument every timing in the results is read from, so which build it
+    # was matters as much as the target's.
+    def get_version_cmd(self):
+        return "gobgpd --version"
+
+    def exec_version_cmd(self):
+        ret = (super().exec_version_cmd() or '').strip()
+        m = re.search(r'gobgpd version (\S+)', ret)
+        if not m:
+            raise VersionUnavailable(
+                'unexpected output from `gobgpd --version`: {0!r}'.format(ret))
+        return m.group(1)
+
     @classmethod
-    def build_image(cls, force=False, tag='bgperf/gobgp', checkout='HEAD', nocache=False):
+    def resolve_ref(cls, version):
+        '''GoBGP tags releases as v<version>; branches pass through.'''
+        if not version:
+            return cls.DEFAULT_REF
+        version = str(version).strip()
+        if re.fullmatch(r'\d+(\.\d+)*', version):
+            return 'v{0}'.format(version)
+        return version
+
+    # Old GoBGP releases need the Go toolchain they were written against;
+    # 'golang:latest' stops working eventually, so pin per series when it does.
+    BUILD_VARS = {'base_image': 'golang:latest'}
+    VERSION_BUILD_VARS = ()
+
+    @classmethod
+    def build_image(cls, force=False, tag=None, checkout=None, nocache=False, version=None):
+        # The checkout used to be interpolated into a string with no placeholder,
+        # so every build silently produced master regardless of the ref asked for.
+        tag = tag or cls.image_tag()
+        v = cls.build_vars(version)
+        v['ref'] = checkout or v['ref']
         cls.dockerfile = '''
-FROM golang:latest
+FROM {base_image}
 WORKDIR /root
-RUN git clone https://github.com/osrg/gobgp.git && cd gobgp && go mod download
+RUN git clone https://github.com/osrg/gobgp.git && cd gobgp && git checkout {ref} && go mod download
 RUN cd gobgp && go install ./cmd/gobgpd
 RUN cd gobgp && go install ./cmd/gobgp
 RUN rm -rf /root/gobgp && cp /go/bin/gobgp /root/gobgp
-'''.format(checkout)
-        super(GoBGP, cls).build_image(force, tag, nocache)
+'''.format(**v)
+        super(GoBGP, cls).build_image(force, tag, nocache=nocache)
 
 
 class GoBGPTarget(GoBGP, Target):
@@ -134,14 +173,6 @@ class GoBGPTarget(GoBGP, Target):
             guest_dir=self.guest_dir,
             config_file_name=self.CONFIG_FILE_NAME,
             debug_level='info')
-
-    def get_version_cmd(self):
-        return "gobgpd --version"
-
-    def exec_version_cmd(self):
-        ret = super().exec_version_cmd()
-        return ret.split(' ')[2].strip('\n')
-
 
     def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}

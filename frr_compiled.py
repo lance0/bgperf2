@@ -1,5 +1,7 @@
 
 
+import re
+
 from base import *
 from frr import  FRRoutingTarget
 
@@ -7,16 +9,78 @@ from frr import  FRRoutingTarget
 class FRRoutingCompiled(Container):
     CONTAINER_NAME = None
     GUEST_DIR = '/root/config'
+    IMAGE_REPO = 'bgperf/frr_c'
+    DAEMON_BINARY = '/usr/lib/frr/bgpd'
+    # vtysh reaches bgpd over a socket, so `show version` cannot be answered by
+    # a bare container -- it prints "Exiting: failed to connect to any daemons."
+    # `verify` says so rather than reporting the image as broken.
+    VERSION_NEEDS_DAEMON = True
+    # What `prepare -t frr_c` builds alongside the master build: the end of the
+    # 8.x and 9.x series, and both ends of 10.x. Each one is a full FRR compile,
+    # so this stays a shortlist -- add others with `update frr_c --version X.Y`.
+    #
+    # These are branch tips, so '8.5' is the latest 8.5.x plus any fixes merged
+    # since. For an exact release use the three-part form ('8.5.7'), which
+    # resolves to the frr-8.5.7 tag instead.
+    VERSIONS = ('8.5', '9.1', '10.0', '10.7')
+    DEFAULT_REF = 'master'
+
+    BUILD_VARS = {
+        'ubuntu_version': '22.04',
+        # Runs just before ./configure, for dependencies a release needs that
+        # the current recipe does not install. 'true' is the do-nothing default.
+        'extra_setup': 'true',
+        'configure_extra': '',
+    }
+
+    # Older releases drift away from the current recipe -- a distro that no
+    # longer has their dependencies, a configure flag that did not exist yet.
+    # Override per series here; first match wins, so list specific before broad:
+    #
+    #   VERSION_BUILD_VARS = (
+    #       ('8.', {'ubuntu_version': '20.04'}),
+    #       ('10', {'configure_extra': '--enable-grpc'}),
+    #   )
+    #
+    # If a version needs a different Dockerfile rather than different values,
+    # put one in dockerfiles/frr_c/<version>.dockerfile instead.
+    VERSION_BUILD_VARS = ()
 
     def __init__(self, host_dir, conf, image='bgperf/frr_c'):
         super(FRRoutingCompiled, self).__init__(self.CONTAINER_NAME, image, host_dir, self.GUEST_DIR, conf)
 
     @classmethod
-    def build_image(cls, force=False, tag='bgperf/frr_c', checkout='stable/8.0', nocache=False):
+    def resolve_ref(cls, version):
+        '''FRR versions map onto its branch and tag naming.
+
+        A release series lives on a maintenance branch ('10.1' -> stable/10.1),
+        a bare major means its first release ('9' -> stable/9.0), and a full
+        point release is a tag ('10.1.1' -> frr-10.1.1). Anything else passes
+        through, so 'master' or a sha still work.
+        '''
+        if not version:
+            return cls.DEFAULT_REF
+        version = str(version).strip()
+        if re.fullmatch(r'\d+', version):
+            return 'stable/{0}.0'.format(version)
+        if re.fullmatch(r'\d+\.\d+', version):
+            return 'stable/{0}'.format(version)
+        if re.fullmatch(r'\d+\.\d+\.\d+', version):
+            return 'frr-{0}'.format(version)
+        return version
+
+    @classmethod
+    def build_image(cls, force=False, tag=None, checkout=None, nocache=False, version=None):
+        tag = tag or cls.image_tag()
+        v = cls.build_vars(version)
+        v['ref'] = checkout or v['ref']
         # copied from https://github.com/FRRouting/frr/blob/master/docker/ubuntu-ci/Dockerfile
         #  but you have to remove any lines that include # comments
+        #
+        # NOTE: this is a format string -- a literal { or } added below has to
+        # be doubled, and every {name} must exist in BUILD_VARS.
         cls.dockerfile = '''
-ARG UBUNTU_VERSION=22.04
+ARG UBUNTU_VERSION={ubuntu_version}
 FROM ubuntu:$UBUNTU_VERSION
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -120,21 +184,30 @@ RUN mkdir -p /etc/apt/keyrings && \
     apt-get update && apt-get install -y librtr-dev libyang2-dev libyang2-tools
 
 
-#USER frr:frr    
-RUN cd ~/ && git clone https://github.com/FRRouting/frr.git 
+#USER frr:frr
+# Clone and checkout in one layer on purpose: the ref is part of the layer key,
+# so a version released after an earlier build still gets a fresh clone instead
+# of a cached one that has never heard of its branch.
+RUN cd ~/ && git clone https://github.com/FRRouting/frr.git && cd frr && git checkout {ref}
+
+RUN {extra_setup}
 
 
 
 #COPY --chown=frr:frr ./ /home/frr/frr/
 
+# Do NOT add --enable-gcov here. It compiles gcov coverage instrumentation
+# (-fprofile-arcs -ftest-coverage) into bgpd itself, so every benchmark would
+# time an instrumented binary against everyone else's optimized one. It was
+# present for years and was visible at runtime only as "profiling: ... .gcda"
+# lines in the daemon log, which read like harmless noise.
 RUN cd ~/frr && \
     ./bootstrap.sh && \
     ./configure \
        --prefix=/usr \
        --sysconfdir=/etc \
-       --localstatedir=/var \
+       --localstatedir=/var/run/frr \
        --sbindir=/usr/lib/frr \
-       --enable-gcov \
        --enable-rpki \
        --enable-multipath=256 \
        --enable-user=frr \
@@ -144,15 +217,16 @@ RUN cd ~/frr && \
        --enable-scripting \
        --enable-configfile-mask=0640 \
        --enable-logfile-mask=0640 \
+       {configure_extra} \
        --with-pkg-extra-version=-my-manual-build && \
     make -j $(nproc) && \
     sudo make install
 
 RUN cd ~/frr && make check || true
 
-RUN sudo cp ~/frr/docker/ubuntu-ci/docker-start /usr/sbin/docker-start && rm -rf ~/frr
+#RUN sudo cp ~/frr/docker/ubuntu-ci/docker-start /usr/sbin/docker-start
 
-CMD ["/usr/sbin/docker-start"]
+#CMD ["/usr/sbin/docker-start"]
 
 RUN sudo install -m 755 -o frr -g frr -d /var/log/frr && \
     sudo install -m 755 -o frr -g frr -d /var/opt/frr && \
@@ -162,16 +236,19 @@ RUN sudo install -m 755 -o frr -g frr -d /var/log/frr && \
     sudo install -m 640 -o frr -g frrvty /dev/null /etc/frr/vtysh.conf && \
     sudo install -m 755 -o frr -g frr -d /var/lib/frr && \
     sudo install -m 755 -o frr -g frr -d /var/etc/frr && \
-    sudo install -m 755 -o frr -g frr -d /var/run/frr
+    sudo install -m 755 -o frr -g frr -d /var/run/frr && \
+    touch /var/bgpd.pid && chown frr.frr /var/bgpd.pid
 
 
 #RUN sudo mkdir /etc/frr /var/lib/frr /var/run/frr /frr
 #    sudo chown frr:frr /etc/frr /var/lib/frr /var/run/frr
 #    sudo mkdir -p /root/config && sudo chown frr:frr /root/config
 
-'''.format(checkout)
-        print("FRRoutingCompiled")
-        super(FRRoutingCompiled, cls).build_image(force, tag, nocache)
+'''.format(**v)
+        # No logging here: render_dockerfile() calls this to get the recipe text,
+        # and anything printed lands in `bgperf2.py dockerfile > frr.dockerfile`,
+        # which Docker then rejects. build_version() announces the build instead.
+        super(FRRoutingCompiled, cls).build_image(force, tag, nocache=nocache)
 
 
 class FRRoutingCompiledTarget(FRRoutingCompiled, FRRoutingTarget):
@@ -179,4 +256,4 @@ class FRRoutingCompiledTarget(FRRoutingCompiled, FRRoutingTarget):
     CONTAINER_NAME = 'bgperf_frrouting_compiled_target'
 
     def __init__(self, host_dir, conf, image='bgperf/frr_c'):
-        super(FRRoutingTarget, self).__init__(host_dir, conf, image='bgperf/frr_c')
+        super(FRRoutingTarget, self).__init__(host_dir, conf, image=image)

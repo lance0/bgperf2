@@ -136,12 +136,17 @@ RUN mkdir -p /var/lib/rustbgpd
 class RustBGPd(Container):
     CONTAINER_NAME = None
     GUEST_DIR = '/root/config'
+    IMAGE_REPO = 'bgperf/rustbgpd'
+    DEFAULT_REF = 'HEAD'
+    SUPPORTS_VERSIONS = False
+    DAEMON_BINARY = '/usr/local/bin/rustbgpd'
 
     def __init__(self, host_dir, conf, image='bgperf/rustbgpd'):
         super(RustBGPd, self).__init__(self.CONTAINER_NAME, image, host_dir, self.GUEST_DIR, conf)
 
     @classmethod
-    def build_image(cls, force=False, tag='bgperf/rustbgpd', checkout='', nocache=False, profile=False):
+    def build_image(cls, force=False, tag='bgperf/rustbgpd', checkout='', nocache=False,
+                    profile=False, version=None):
         """Build rustbgpd Docker image from the local source tree.
 
         Set RUSTBGPD_SOURCE env var to override the source path
@@ -207,6 +212,20 @@ class RustBGPd(Container):
             # Clean up the temp dockerfile
             if os.path.exists(dockerfile_path):
                 os.remove(dockerfile_path)
+
+    @classmethod
+    def render_dockerfile(cls, version=None):
+        """Render the release recipe without contacting Docker."""
+        if version:
+            cls.image_tag(version)
+        source_revision = cls._clean_revision(RUSTBGPD_SOURCE, 'rustbgpd source')
+        adapter_root = os.path.dirname(os.path.realpath(__file__))
+        adapter_revision = cls._clean_revision(adapter_root, 'bgperf2 adapter')
+        return cls._render_dockerfile(
+            DOCKERFILE_CONTENT,
+            source_revision,
+            adapter_revision,
+        )
 
     @staticmethod
     def _clean_revision(path, label):

@@ -20,22 +20,68 @@ class BIRD(Container):
 
     CONTAINER_NAME = None
     GUEST_DIR = '/root/config'
+    IMAGE_REPO = 'bgperf/bird'
+    DAEMON_BINARY = '/usr/local/sbin/bird'
+    VERSIONS = ('2.19.2', '3.3.2')
+    DEFAULT_REF = 'master'
 
     def __init__(self, host_dir, conf, image='bgperf/bird', name=None):
         super(BIRD, self).__init__(name if name is not None else self.CONTAINER_NAME, image, host_dir, self.GUEST_DIR, conf)
 
+    # Version reading lives on the daemon base class, not on BIRDTarget, so a
+    # BIRD tester can report its version too -- the load generator's build is
+    # part of what makes a result reproducible.
+    def get_version_cmd(self):
+        return "bird --version"
+
+    def exec_version_cmd(self):
+        # bird prints its banner on stderr, so stderr=True is load-bearing.
+        ret = (super().exec_version_cmd(stderr=True) or '').strip()
+        # Match the banner rather than taking the third word of whatever came
+        # back: applied to an error message that produced 'exec', which reached
+        # benchmarks/baseline/baseline-benchmark.csv as a BIRD version.
+        m = re.search(r'BIRD version (\S+)', ret)
+        if not m:
+            raise VersionUnavailable(
+                'unexpected output from `{0}`: {1!r}'.format(
+                    self.get_version_cmd(), ret))
+        return m.group(1)
+
     @classmethod
-    def build_image(cls, force=False, tag='bgperf/bird', checkout='HEAD', branch='master', nocache=False):
+    def resolve_ref(cls, version):
+        '''BIRD tags releases as v<version>; branches pass through.'''
+        if not version:
+            return cls.DEFAULT_REF
+        version = str(version).strip()
+        if re.fullmatch(r'\d+(\.\d+)*', version):
+            return 'v{0}'.format(version)
+        return version
+
+    BUILD_VARS = {
+        'base_image': 'ubuntu:latest',
+        'packages': 'git autoconf libtool gawk make flex bison libncurses-dev '
+                    'libreadline6-dev iproute2',
+        'configure_extra': '',
+    }
+    # BIRD 3 has different build dependencies from BIRD 2; override per series
+    # here, or drop a whole Dockerfile in dockerfiles/bird/<version>.dockerfile.
+    VERSION_BUILD_VARS = ()
+
+    @classmethod
+    def build_image(cls, force=False, tag=None, checkout=None, nocache=False, version=None):
+        # Clone and checkout share a layer so the ref is part of the layer key:
+        # a cached clone from an older build would not know a newer tag.
+        tag = tag or cls.image_tag()
+        v = cls.build_vars(version)
+        v['ref'] = checkout or v['ref']
         cls.dockerfile = '''
-FROM ubuntu:latest
+FROM {base_image}
 WORKDIR /root
-RUN apt-get update && apt-get install -qy git autoconf libtool gawk make \
-flex bison libncurses-dev libreadline6-dev iproute2
-RUN apt-get install -qy flex
-RUN git config --global http.sslverify false && git clone https://gitlab.nic.cz/labs/bird.git -b {0} bird
-RUN cd bird && git checkout {0} && autoreconf -i && ./configure && make && make install
-'''.format(branch)
-        super(BIRD, cls).build_image(force, tag, nocache)
+RUN apt-get update && apt-get install -qy {packages}
+RUN git config --global http.sslverify false && git clone https://gitlab.nic.cz/labs/bird.git bird && cd bird && git checkout {ref}
+RUN cd bird && autoreconf -i && ./configure {configure_extra} && make && make install
+'''.format(**v)
+        super(BIRD, cls).build_image(force, tag, nocache=nocache)
 
 
 class BIRDTarget(BIRD, Target):
@@ -45,14 +91,22 @@ class BIRDTarget(BIRD, Target):
     DYNAMIC_NEIGHBORS = True
 
     def write_config(self):
-        config = '''router id {0};
+        # BIRD 3 is the multi-threaded rewrite, but it starts a single worker
+        # unless told otherwise -- benchmarked without this it looks like 2.x.
+        # BIRD 2 parses the keyword and ignores it, so a shared batch config
+        # can set it for both.
+        threads = ''
+        if self.conf.get('threads'):
+            threads = 'threads {0};\n'.format(int(self.conf['threads']))
+
+        config = '''{2}router id {0};
 protocol device {{ }}
 protocol direct {{ disabled; }}
 protocol kernel {{ ipv4 {{ import none; export none; }}; }}
 
 log stderr all;
 #debug protocols all; # this seems to add a lot of extra load especially in internet/mrt tests
-'''.format(self.conf['router-id'], ' sorted' if self.conf['single-table'] else '')
+'''.format(self.conf['router-id'], ' sorted' if self.conf['single-table'] else '', threads)
 
         def gen_filter_assignment(n):
             if 'filter' in n:
@@ -192,10 +246,8 @@ return true;
 
 
     def get_filter_test_config(self): 
-        file = open("filters/bird.conf", mode='r')
-        filters = file.read()
-        file.close
-        return filters
+        with open(REPO_ROOT / 'filters' / 'bird.conf') as file:
+            return file.read()
 
     def get_startup_cmd(self):
         return '\n'.join(
@@ -206,18 +258,6 @@ return true;
             guest_dir=self.guest_dir,
             config_file_name=self.CONFIG_FILE_NAME)
 
-    def get_version_cmd(self):
-        return "bird --version"
-
-    def exec_version_cmd(self):
-        version = self.get_version_cmd()
-        i = dckr.exec_create(container=self.name, cmd=version, stderr=True)
-        ret =dckr.exec_start(i['Id'], stream=False, detach=False).decode('utf-8')
-        if len(ret) > 2:
-            return ret.split(' ')[2].strip('\n')
-        else:
-            return ret.strip('\n')
-
     def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}
         neighbors_received = {}
@@ -225,7 +265,7 @@ return true;
             "birdc 'show protocols all'", dckr_override=dckr_override
         ).decode('utf-8')
         
-        with open('bird.tfsm') as template:
+        with open(REPO_ROOT / 'bird.tfsm') as template:
             fsm = textfsm.TextFSM(template)
             result = fsm.ParseText(neighbor_received_output)
 

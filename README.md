@@ -8,6 +8,7 @@ bgperf2 is a performance measurement tool for BGP implementation. This was forke
 * [How bgperf2 works](https://github.com/netenglabs/bgperf2/blob/master/docs/how_bgperf_works.md)
 * [Benchmark remote target](https://github.com/netenglabs/bgperf2/blob/master/docs/benchmark_remote_target.md)
 * [MRT injection](https://github.com/netenglabs/bgperf2/blob/master/docs/mrt.md)
+* [Running on AWS EC2 spot instances](https://github.com/netenglabs/bgperf2/blob/master/docs/howto_aws.md)
 
 ## Updates from original bgperf
 I've changed bgperf to work with python 3 and work with new versions of all the NOSes. It actually works, the original version that this is a fork of does not work anymore because of newer version of python and each of the routing stacks.
@@ -41,30 +42,32 @@ is a good place to get MRT files to play back.
 ## Prerequisites
 
 * Python 3.7 or later
-* Docker
-* Sysstat
+* Docker (your user must be in the `docker` group)
+* Sysstat (`bench` shells out to `mpstat`)
 
 ##  <a name="how_to_install">How to install
 
 ```bash
-$ git clone https://github.com:jopietsch/bgperf.git
+$ git clone https://github.com/netenglabs/bgperf2.git
 $ cd bgperf2
-$ pip3 install -r pip-requirements.txt
-$ ./bgperf2.py --help
+$ python3 -m venv venv
+$ venv/bin/pip install -r pip-requirements.txt
+$ venv/bin/python bgperf2.py --help
 usage: bgperf2.py [-h] [-b BENCH_NAME] [-d DIR]
-                 {doctor,prepare,update,bench,config} ...
+                 {doctor,prepare,update,bench,config,batch} ...
 
 BGP performance measuring tool
 
 positional arguments:
-  {doctor,prepare,update,bench,config}
+  {doctor,prepare,update,bench,config,batch}
     doctor              check env
     prepare             prepare env
-    update              pull bgp docker images
+    update              rebuild bgp docker images
     bench               run benchmarks
     config              generate config
+    batch               run batch benchmarks
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   -b BENCH_NAME, --bench-name BENCH_NAME
   -d DIR, --dir DIR
@@ -75,27 +78,40 @@ bgperf2 image ... ok
 gobgp image ... ok
 bird image ... ok
 ```
+
+Activating the venv (`source venv/bin/activate`) lets you drop the `venv/bin/`
+prefix and run `./bgperf2.py` directly; the rest of this document does that.
+
+On a fresh VM, `new_vm.sh` installs the system packages, creates the venv, and
+downloads a RouteViews MRT file into `mrt/` for the MRT-based benchmarks.
+
+### Where output goes
+
+Generated graphs and CSVs are written to `results/`, overridable with
+`--results-dir`. That directory is gitignored, so runs no longer leave files
+scattered in the repo root.
 ## <a name="how_to_use">How to use
 
 Use `bench` command to start benchmark test.
-By default, `bgperf2` benchmarks [GoBGP](https://github.com/osrg/gobgp).
-`bgperf2` boots 100 BGP test peers each advertises 100 routes to `GoBGP`.
+By default, `bgperf2` benchmarks [BIRD](http://bird.network.cz/).
+`bgperf2` boots 100 BGP test peers each advertising 100 routes to it.
 
 ```bash
-$ python3 bgperf2.py bench
+$ ./bgperf2.py bench
 run monitor
-run gobgp
-Waiting 5 seconds for neighbor
-run tester tester type normal
-tester booting.. (100/100)
-elapsed: 2sec, cpu: 0.79%, mem: 42.27MB, recved: 10000
-gobgp: 2.29.0
-Max cpu: 554.03, max mem: 45.71MB
-Time since first received prefix: 2
-total time: 24.07s
+run bird
+Waiting 18 seconds for monitor
+run tester tester type bird
+launched 1 testers
+elapsed: 5sec, cpu: 1.28%, mem: 10.50MB, mon recved: 10000, neighbors_received: 100, neighbors_accepted: 100, %idle 94.7, free mem 57.15GB
+bird: 2.17.1+branch.master.fe0c22277c21
+Max cpu: 23.41, max mem: 10.50MB
+Min %idle 94.7, Min mem free 57.15GB
+Time since first received prefix: 4
+total time: 31.32s
 
-name, target, version, peers, prefixes per peer, neighbor (s), elapsed (s), prefix received (s), exabgp (s), total time, max cpu %, max mem (GB), flags, date,cores,Mem (GB)
-gobgp,gobgp,2.29.0,100,100,5,2,0,2,24.07,554,0.045,,2021-08-02,32,62.82GB
+name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date, cores, Mem (GB), tester errors, tester timeouts, failed, MSG, filters
+bird,bird,2.17.1+branch.master.fe0c22277c21,100,100,9900,10000,18,5,1,4,31.32,23,0.01,95,57.152,,2026-08-07,32,60.73GB,0,0,,,
 ```
 
 As you might notice, the interesting statistics are shown twice, once in an easy to read format and the second
@@ -108,20 +124,21 @@ because RustyBGP doesn't support all policy that Bgperf2 tries to use for policy
 do routes and neighbors then RustyBGP works.
 
 ```bash
-$ python3 bgperf2.py bench -t bird
+$ ./bgperf2.py bench -t gobgp
 run monitor
-run bird
-Waiting 4 seconds for neighbor
-run tester tester type normal
-tester booting.. (100/100)
-elapsed: 1sec, cpu: 1.79%, mem: 110.64MB, recved: 10000
-bird: v2.0.8-59-gf761be6b
-Max cpu: 1.79, max mem: 110.64MB
-Time since first received prefix: 1
-total time: 20.73s
+run gobgp
+Waiting 19 seconds for monitor
+run tester tester type bird
+launched 1 testers
+elapsed: 6sec, cpu: 5.28%, mem: 40.15MB, mon recved: 10000, neighbors_received: 100, neighbors_accepted: 100, %idle 57.0, free mem 56.04GB
+gobgp: 3.37.0
+Max cpu: 893.00, max mem: 40.15MB
+Min %idle 57.0, Min mem free 56.04GB
+Time since first received prefix: 5
+total time: 33.27s
 
-name, target, version, peers, prefixes per peer, neighbor (s), elapsed (s), prefix received (s), exabgp (s), total time, max cpu %, max mem (GB), flags, date,cores,Mem (GB)
-bird,bird,v2.0.8-59-gf761be6b,100,100,4,1,0,1,20.73,2,0.108,,2021-08-02,32,62.82GB
+name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date, cores, Mem (GB), tester errors, tester timeouts, failed, MSG, filters
+gobgp,gobgp,3.37.0,100,100,9900,10000,19,6,1,5,33.27,893,0.04,57,56.039,,2026-08-07,32,60.73GB,0,0,,,
 ```
 
 To change a load, use following options.
@@ -161,10 +178,105 @@ to compile the software ourselves or to try to download containers from the open
 When I originally forked bgperf2 it hadn't changed in 4 years, so almost none of the containers could be built
 and all of the software had changed how they interat. I'm not sure how best to make bgperf2 work over time.
 
-Right now that is demonstrated most readily with FRR. If you use bench -t FRR it will use a prebuilt FRRouting 
-container that is hardcoded to 7.5.1. However, I've also created another target called frr_c, which is a container
-that checks FRRouting out of git with the 8.0 tag and builds the container. This container is not automatically
-built when you do bgperf2 bench.
+FRR is the clearest example. There used to be an `frr` target that used a prebuilt FRRouting
+container hardcoded to 7.5.1, which meant the version you tested was whatever that image happened
+to pin. It has been removed. The `frr_c` target replaces it: it checks FRRouting out of git and
+builds the container, so you choose the version.
+
+## Testing several versions of one daemon
+
+Each buildable daemon gets one image per version, tagged `bgperf/<name>:<version>`. Build them
+with `prepare` (which builds the daemon's default list) or `update` (for anything else):
+
+```bash
+./bgperf2.py prepare -t frr_c                              # master + 8.5, 9.1, 10.0, 10.7
+./bgperf2.py prepare -t frr_c --versions 10.4,10.5         # just these two, plus master
+./bgperf2.py update frr_c --version 10.7                   # add one later
+./bgperf2.py images                                        # what is built, and from which ref
+```
+
+Then bench one directly, or list several in a batch config:
+
+```bash
+./bgperf2.py bench -t frr_c --version 10.1 -n 10 -p 100000
+```
+
+```YAML
+      -
+        name: frr_c
+        versions: [8.5, 9.1, 10.0, 10.7]
+        tester_type: bird
+```
+
+That runs once per version and labels each row `frr_c 10.1` and so on, so the CSV and the graphs
+tell them apart. Add your own `label:` to override. A target with no `versions:` uses the
+unversioned image, which tracks the daemon's default branch.
+
+Versions are named the way the project names its releases, and each daemon module translates:
+FRR `10.1` is the branch `stable/10.1`, FRR `10.1.1` is the tag `frr-10.1.1`, BIRD `2.19.2` and
+GoBGP `3.37.0` are the tags `v2.19.2` and `v3.37.0`. Anything unrecognized is passed through as a
+raw git ref, so `--version master` or a commit sha also work. `./bgperf2.py images` prints the
+mapping.
+
+A bare `prepare` builds one image per daemon, tracking its default branch. Version images are
+opt-in behind `-t`, because a daemon's whole version list is hours of compiling. Either way it
+skips what already exists, so re-running after adding a version is cheap; `-f` forces a rebuild.
+`doctor` lists which versions are built and which are not.
+
+Every version image must exist before a run starts — `bench` and `batch` both check up front and
+tell you the exact `update` command rather than failing an hour into a batch.
+
+The commercial NOSes work the same way once you tag what you downloaded (`docker tag <image>
+crpd:24.2`, then `-t junos --version 24.2`).
+
+### BIRD 3 and threads
+
+BIRD 3 is the multi-threaded rewrite; BIRD 2 does everything in one thread. But **BIRD 3 starts a
+single worker unless the config asks for more**, so a 2.x-vs-3.x comparison without `--threads`
+measures BIRD 3 pretending to be BIRD 2. Measured on 3.3.2: 2 OS threads by default, 5 with
+`threads 4`. BIRD 2.19.2 parses the keyword and ignores it, staying at 1 — so a batch config can
+set it for both.
+
+```bash
+./bgperf2.py bench -t bird --version 3.3.2 --threads 4 -n 10 -p 100000
+```
+
+```YAML
+      - name: bird
+        version: 2.19.2
+        label: bird 2 (single-threaded)
+      - name: bird
+        version: 3.3.2
+        threads: 4
+        label: bird 3 (4 threads)
+```
+
+`--threads` is ignored by daemons with no such setting.
+
+### When an old version will not build
+
+Build instructions drift: the base distro moves on, dependencies get renamed, configure flags come
+and go. Two levels of override, cheapest first.
+
+For a different *value* — base image, extra packages, configure flags — add a rule to the daemon
+class's `VERSION_BUILD_VARS`, keyed by version prefix:
+
+```python
+class FRRoutingCompiled(Container):
+    VERSION_BUILD_VARS = (
+        ('8.', {'ubuntu_version': '20.04', 'extra_setup': 'apt-get install -y libyang-dev'}),
+    )
+```
+
+For a genuinely different recipe, drop a whole Dockerfile in
+`dockerfiles/<name>/<version>.dockerfile` (see `dockerfiles/README.md`). The longest matching
+version prefix wins, so `10.dockerfile` covers the whole 10.x series.
+
+Either way, check the result without paying for a build:
+
+```bash
+./bgperf2.py dockerfile frr_c --version 8.0
+```
 
 ### Testing commercial BGP Stacks
 
@@ -265,8 +377,17 @@ you can hard code those values. If you want to see without multi-threading, dele
 A  feature called batch lets you run multiple tests, collect all the data, and produces graphs. 
 If you run a test that runs out of physical RAM on your machine, linux OOM killer will just kill the process and you'll lose the data from that experiment.
 
-There is an included file batch_example.yaml that shows how it works. You can list the targets that you want
-tested in a batch, as well as iterate through prefix count and neighbor count.
+The `benchmarks/` directory holds example batch configs that show how it works — start with
+`benchmarks/benchmark.yaml`. You can list the targets that you want tested in a batch, as well as
+iterate through prefix count and neighbor count. Run one with:
+
+```bash
+$ ./bgperf2.py batch -c benchmarks/benchmark.yaml
+```
+
+Configs that play back MRT data expect the file at `mrt/rib.20210801.0000`, which `new_vm.sh`
+downloads. Paths in a batch config may be relative or use `~`; they are resolved before being
+handed to Docker. Keep personal, unshared configs in `benchmarks/local/` — that path is gitignored.
 
 If you use a file that looks like this:
 

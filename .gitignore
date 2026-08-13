@@ -1,2 +1,14 @@
-# Created by venv; see https://docs.python.org/3/library/venv.html
-*
+venv/
+__pycache__/
+*.pyc
+
+# generated graphs and CSVs
+results/
+
+# MRT files downloaded by new_vm.sh, and out-of-band NOS images/licenses
+mrt/
+nos/
+
+# personal benchmark configs
+benchmarks/local/
+.pytest_cache/
