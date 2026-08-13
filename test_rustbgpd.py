@@ -51,6 +51,8 @@ class RustBgpdAdapterTests(unittest.TestCase):
         config = self.render_rustbgpd_config({})
 
         self.assertNotIn('[event_history]', config)
+        self.assertNotIn('[global.telemetry.grpc_' + 'tcp]', config)
+        self.assertNotIn('[security.grpc]', config)
 
     def test_event_history_can_be_selected_explicitly(self):
         enabled = self.render_rustbgpd_config({
@@ -141,6 +143,9 @@ class RustBgpdAdapterTests(unittest.TestCase):
             self.assertIn('FROM {}'.format(DEBIAN_RUNTIME_IMAGE), dockerfile)
             self.assertIn('rustbgpd-builder-provenance.txt', dockerfile)
             self.assertIn('rustbgpd-runtime-provenance.txt', dockerfile)
+            self.assertIn('COPY --from=builder /build/target/release', dockerfile)
+            self.assertIn('/rbgp /usr/local/bin/rbgp', dockerfile)
+            self.assertNotIn('rustbgp' + 'ctl', dockerfile)
 
         rendered = RustBGPd._render_dockerfile(
             DOCKERFILE_CONTENT_DHAT,
@@ -318,7 +323,7 @@ class RustBgpdAdapterTests(unittest.TestCase):
         self.assertEqual(received, expected)
         self.assertEqual(accepted, expected)
         target.local.assert_called_once_with(
-            'rustbgpctl -s http://127.0.0.1:50051 --json neighbor',
+            'rbgp --json neighbor',
             dckr_override='client',
         )
 
