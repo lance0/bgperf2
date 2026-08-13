@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import base as base_module
@@ -50,6 +51,8 @@ class RustBgpdAdapterTests(unittest.TestCase):
         config = self.render_rustbgpd_config({})
 
         self.assertNotIn('[event_history]', config)
+        self.assertNotIn('[global.telemetry.grpc_' + 'tcp]', config)
+        self.assertNotIn('[security.grpc]', config)
 
     def test_event_history_can_be_selected_explicitly(self):
         enabled = self.render_rustbgpd_config({
@@ -103,7 +106,8 @@ class RustBgpdAdapterTests(unittest.TestCase):
         with mock.patch('builtins.open', opened):
             self.assertEqual(target.get_filter_test_config(), 'filter contents')
 
-        opened.assert_called_once_with('filters/openbgp.conf', mode='r')
+        opened.assert_called_once_with(Path(bgperf2.__file__).parent / 'filters' /
+                                       'openbgp.conf')
         opened.return_value.__enter__.assert_called_once_with()
         opened.return_value.__exit__.assert_called_once()
 
@@ -139,6 +143,9 @@ class RustBgpdAdapterTests(unittest.TestCase):
             self.assertIn('FROM {}'.format(DEBIAN_RUNTIME_IMAGE), dockerfile)
             self.assertIn('rustbgpd-builder-provenance.txt', dockerfile)
             self.assertIn('rustbgpd-runtime-provenance.txt', dockerfile)
+            self.assertIn('COPY --from=builder /build/target/release', dockerfile)
+            self.assertIn('/rbgp /usr/local/bin/rbgp', dockerfile)
+            self.assertNotIn('rustbgp' + 'ctl', dockerfile)
 
         rendered = RustBGPd._render_dockerfile(
             DOCKERFILE_CONTENT_DHAT,
@@ -159,6 +166,25 @@ class RustBgpdAdapterTests(unittest.TestCase):
             ),
             rendered,
         )
+
+    def test_rustbgpd_is_registered_in_upstream_image_architecture(self):
+        self.assertIs(bgperf2.BUILDABLE_IMAGES['rustbgpd'], RustBGPd)
+        self.assertIs(bgperf2.TARGET_CLASSES['rustbgpd'], RustBGPdTarget)
+        self.assertIn('rustbgpd', bgperf2.PREPARE_IMAGES)
+        self.assertEqual(RustBGPd.IMAGE_REPO, 'bgperf/rustbgpd')
+        self.assertFalse(RustBGPd.SUPPORTS_VERSIONS)
+
+    def test_render_dockerfile_is_docker_free(self):
+        with mock.patch.object(RustBGPd, '_clean_revision',
+                               side_effect=['a' * 40, 'b' * 40]), \
+                mock.patch('rustbgpd.dckr') as docker:
+            rendered = RustBGPd.render_dockerfile()
+
+        self.assertIn('LABEL org.opencontainers.image.revision="{}"'.format(
+            'a' * 40), rendered)
+        self.assertIn('LABEL org.rustbgpd.bgperf2.revision="{}"'.format(
+            'b' * 40), rendered)
+        docker.assert_not_called()
 
     def test_monitor_fallback_is_scoped_to_rustbgpd(self):
         required = 200000
@@ -194,6 +220,27 @@ class RustBgpdAdapterTests(unittest.TestCase):
                 15,
                 target,
             )
+
+        rustbgpd_tracker = bgperf2.ConvergenceTracker(
+            no_progress_deadline_seconds=bgperf2.zero_route_failure_grace_seconds(
+                'rustbgpd'
+            ),
+            preserve_assurance_after_neighbors_checkpoint=True,
+        )
+        self.assertEqual(rustbgpd_tracker.no_progress_deadline_seconds, 120)
+
+    def test_late_neighbor_query_does_not_reset_rustbgpd_assurance(self):
+        tracker = bgperf2.ConvergenceTracker(
+            preserve_assurance_after_neighbors_checkpoint=True,
+        )
+        tracker.update(1, 100000, 0, 0, False)
+        tracker.note_neighbors_checkpoint()
+        tracker.update(2, 100000, 0, 1, False)
+        self.assertEqual(tracker.last_recved_count, 1)
+
+        tracker.update(3, 100000, 1, 1, False)
+
+        self.assertEqual(tracker.last_recved_count, 2)
 
     def test_rustbgpd_rejects_unimplemented_policy_inputs(self):
         clean = {
@@ -276,7 +323,7 @@ class RustBgpdAdapterTests(unittest.TestCase):
         self.assertEqual(received, expected)
         self.assertEqual(accepted, expected)
         target.local.assert_called_once_with(
-            'rustbgpctl -s http://127.0.0.1:50051 --json neighbor',
+            'rbgp --json neighbor',
             dckr_override='client',
         )
 
@@ -366,11 +413,11 @@ class RustBgpdAdapterTests(unittest.TestCase):
         tester_timeouts_index = 21
         failed_index = 22
 
-        self.assertEqual(len(header), 24)
-        self.assertEqual(len(row), 25)
+        self.assertEqual(len(header), 28)
+        self.assertEqual(len(row), 28)
         self.assertEqual(
-            header[tester_errors_index:24],
-            ['tester errors', 'failed', 'MSG', 'filters'],
+            header[tester_errors_index:25],
+            ['tester errors', 'tester timeouts', 'failed', 'MSG', 'filters'],
         )
         self.assertEqual(row[tester_errors_index], 7)
         self.assertEqual(row[tester_timeouts_index], 11)

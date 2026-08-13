@@ -1,7 +1,7 @@
 # rustbgpd target
 
-This integration is based on upstream bgperf2 revision
-`17216483e779f1484ef38562fb8f6b5ea6ad4d8f`. Record this repository's exact
+Fork master includes upstream bgperf2 through
+`02b31e603856601d06bb938aca8243bbe66e1b8b`. Record this repository's exact
 `git rev-parse HEAD` as the adapter identity for every published result.
 
 The target builds a local rustbgpd checkout rather than fetching a moving
@@ -58,6 +58,10 @@ Keep the same image and daemon process for the DHAT capture and bgperf2 CSV.
 
 ## Event-history mode
 
+Current rustbgpd serves gRPC on its default owner-only Unix socket at
+`/var/lib/rustbgpd/grpc.sock`; the adapter queries it with `rbgp --json neighbor`.
+It does not expose gRPC over TCP or generate roles or bearer-token configuration.
+
 rustbgpd's durable event-history outbox is opt-in and defaults off on current
 revisions. When a mode is selected, the adapter writes it explicitly into
 `config.toml` so published comparisons do not silently depend on a daemon default.
@@ -91,9 +95,9 @@ zero-route startup, only rustbgpd receives the extended 120-second grace used
 by the high-load receipt. Other targets retain bgperf2's 15-second failure
 threshold.
 
-The upstream CSV has 24 header labels but 25 row values because the
-`tester_timeouts` value is emitted without a label. `test_rustbgpd.py` uses
-different error and timeout sentinels to lock their distinct row indices and
-the following shifted fields. Receipt consumers must pin this schema or reject
-it rather than silently shifting later columns, and should archive the adapter
-revision with the CSV.
+The CSV labels `tester_errors` and `tester_timeouts` separately, and appends
+target/tester/monitor provenance columns. `test_rustbgpd.py` uses different
+error and timeout sentinels to lock their distinct row indices and the fields
+that follow. Receipt consumers must pin this schema or reject it rather than
+silently shifting later columns, and should archive the adapter revision with
+the CSV.

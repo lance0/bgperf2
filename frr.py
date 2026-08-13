@@ -18,18 +18,19 @@ import json
 import re
 
 class FRRouting(Container):
+    '''Shared base for FRR containers.
+
+    This no longer builds an image of its own. It used to wrap the prebuilt
+    frrouting/frr:v7.5.1 container as the `frr` target; that target is gone and
+    frr_c (FRR built from a git checkout, see frr_compiled.py) replaces it. The
+    class survives because FRRoutingTarget below holds all the FRR config
+    generation and CLI parsing, which FRRoutingCompiledTarget inherits.
+    '''
     CONTAINER_NAME = None
     GUEST_DIR = '/root/config'
 
-    def __init__(self, host_dir, conf, image='bgperf/frr'):
+    def __init__(self, host_dir, conf, image='bgperf/frr_c'):
         super(FRRouting, self).__init__(self.CONTAINER_NAME, image, host_dir, self.GUEST_DIR, conf)
-
-    @classmethod
-    def build_image(cls, force=False, tag='bgperf/frr', checkout='HEAD', nocache=False):
-        cls.dockerfile = '''
-FROM frrouting/frr:v7.5.1
-'''.format(checkout)
-        super(FRRouting, cls).build_image(force, tag, nocache)
 
 
 class FRRoutingTarget(FRRouting, Target):
@@ -120,10 +121,8 @@ no bgp ebgp-requires-policy
             f.write("log stdout debug\n") 
 
     def get_filter_test_config(self): 
-        file = open("filters/frr.conf", mode='r')
-        filters = file.read()
-        file.close
-        return filters
+        with open(REPO_ROOT / 'filters' / 'frr.conf') as file:
+            return file.read()
 
     def get_startup_cmd(self):
         return '\n'.join(
@@ -142,11 +141,23 @@ no bgp ebgp-requires-policy
             config_file_name=self.CONFIG_FILE_NAME)
     
     def get_version_cmd(self):
+        # The '|' and 'head -1' are argv words handed to vtysh, not a shell
+        # pipe -- there is no shell here -- so the first line still has to be
+        # taken below.
         return ['vtysh', '-c', 'show version', '|', 'head -1']
 
     def exec_version_cmd(self):
-        ret = super().exec_version_cmd()
-        return ret.split('\n')[0]
+        ret = (super().exec_version_cmd() or '').strip()
+        # Match the banner instead of trusting the first line. vtysh talks to
+        # bgpd over a socket, so before bgpd answers this command succeeds and
+        # prints 'Exiting: failed to connect to any daemons.' -- which the old
+        # split('\n')[0] recorded verbatim as the FRR version. That is how the
+        # word 'exec' became a BIRD version in the published baseline.
+        m = re.search(r'^(FRRouting \S+)', ret, re.MULTILINE)
+        if not m:
+            raise VersionUnavailable(
+                'unexpected output from `vtysh -c "show version"`: {0!r}'.format(ret))
+        return m.group(1)
     
     def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}
@@ -154,12 +165,19 @@ no bgp ebgp-requires-policy
         neighbor_received_output = self.local(
             "vtysh -c 'sh ip bgp summary json'", dckr_override=dckr_override
         )
-        if neighbor_received_output:
-            neighbor_received_output = json.loads(neighbor_received_output.decode('utf-8'))
+        if not neighbor_received_output:
+            # bgpd is not answering yet; polling starts before it is up
+            return neighbors_received, neighbors_accepted
 
-        for n in neighbor_received_output['ipv4Unicast']['peers'].keys():
-            rcd = neighbor_received_output['ipv4Unicast']['peers'][n]['pfxRcd'] 
-            neighbors_accepted[n] = rcd
+        try:
+            summary = json.loads(neighbor_received_output.decode('utf-8'))
+        except json.JSONDecodeError:
+            # vtysh emits plain-text errors when bgpd is still starting
+            return neighbors_received, neighbors_accepted
+
+        peers = summary.get('ipv4Unicast', {}).get('peers', {})
+        for n in peers:
+            neighbors_accepted[n] = peers[n]['pfxRcd']
         return neighbors_received, neighbors_accepted
 
     def _get_EOR_from_log(self, neighbors):

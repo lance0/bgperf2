@@ -45,7 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/rustbgpd /usr/local/bin/rustbgpd
-COPY --from=builder /build/target/release/rbgp /usr/local/bin/rustbgpctl
+COPY --from=builder /build/target/release/rbgp /usr/local/bin/rbgp
 COPY --from=builder /build-provenance/builder.txt /usr/local/share/rustbgpd-builder-provenance.txt
 
 RUN {{ \
@@ -83,7 +83,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release-prof/rustbgpd /usr/local/bin/rustbgpd
-COPY --from=builder /build/target/release-prof/rbgp /usr/local/bin/rustbgpctl
+COPY --from=builder /build/target/release-prof/rbgp /usr/local/bin/rbgp
 COPY --from=builder /build-provenance/builder.txt /usr/local/share/rustbgpd-builder-provenance.txt
 
 RUN {{ \
@@ -121,7 +121,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release-prof/rustbgpd /usr/local/bin/rustbgpd
-COPY --from=builder /build/target/release-prof/rbgp /usr/local/bin/rustbgpctl
+COPY --from=builder /build/target/release-prof/rbgp /usr/local/bin/rbgp
 COPY --from=builder /build-provenance/builder.txt /usr/local/share/rustbgpd-builder-provenance.txt
 
 RUN {{ \
@@ -136,12 +136,17 @@ RUN mkdir -p /var/lib/rustbgpd
 class RustBGPd(Container):
     CONTAINER_NAME = None
     GUEST_DIR = '/root/config'
+    IMAGE_REPO = 'bgperf/rustbgpd'
+    DEFAULT_REF = 'HEAD'
+    SUPPORTS_VERSIONS = False
+    DAEMON_BINARY = '/usr/local/bin/rustbgpd'
 
     def __init__(self, host_dir, conf, image='bgperf/rustbgpd'):
         super(RustBGPd, self).__init__(self.CONTAINER_NAME, image, host_dir, self.GUEST_DIR, conf)
 
     @classmethod
-    def build_image(cls, force=False, tag='bgperf/rustbgpd', checkout='', nocache=False, profile=False):
+    def build_image(cls, force=False, tag='bgperf/rustbgpd', checkout='', nocache=False,
+                    profile=False, version=None):
         """Build rustbgpd Docker image from the local source tree.
 
         Set RUSTBGPD_SOURCE env var to override the source path
@@ -207,6 +212,20 @@ class RustBGPd(Container):
             # Clean up the temp dockerfile
             if os.path.exists(dockerfile_path):
                 os.remove(dockerfile_path)
+
+    @classmethod
+    def render_dockerfile(cls, version=None):
+        """Render the release recipe without contacting Docker."""
+        if version:
+            cls.image_tag(version)
+        source_revision = cls._clean_revision(RUSTBGPD_SOURCE, 'rustbgpd source')
+        adapter_root = os.path.dirname(os.path.realpath(__file__))
+        adapter_revision = cls._clean_revision(adapter_root, 'bgperf2 adapter')
+        return cls._render_dockerfile(
+            DOCKERFILE_CONTENT,
+            source_revision,
+            adapter_revision,
+        )
 
     @staticmethod
     def _clean_revision(path, label):
@@ -365,19 +384,6 @@ class RustBGPdTarget(RustBGPd, Target):
         config += 'prometheus_addr = "0.0.0.0:9179"\n'
         config += 'log_format = "json"\n'
         config += '\n'
-        config += '[global.telemetry.grpc_tcp]\n'
-        config += 'address = "0.0.0.0:50051"\n'
-        config += '\n'
-
-        # ADR-0064 (v0.24.0+) defaults gRPC authz to enforcement = "tier",
-        # which refuses to boot without [security.grpc.roles]. bgperf2 only
-        # uses gRPC to query state (not in the data path), so opt back into
-        # legacy enforcement to restore the pre-v0.24.0 behavior the historical
-        # numbers ran under.
-        config += '[security.grpc]\n'
-        config += 'enforcement = "legacy"\n'
-        config += '\n'
-
         # The durable event-history outbox (ADR-0072) is opt-in/default-off on
         # current rustbgpd. Render explicit selections, while leaving the block
         # absent when unset so pre-v0.30 daemon revisions remain benchmarkable.
@@ -423,7 +429,7 @@ class RustBGPdTarget(RustBGPd, Target):
         return ret.strip()
 
     def get_neighbors_state(self, dckr_override=None):
-        """Query neighbor state via rustbgpctl.
+        """Query neighbor state over rustbgpd's default owner-only Unix socket.
 
         Returns (neighbors_received, neighbors_accepted) dicts keyed by
         neighbor address.  On any failure (timeout, parse error, empty
@@ -434,13 +440,13 @@ class RustBGPdTarget(RustBGPd, Target):
         t0 = _time.monotonic()
         try:
             output = self.local(
-                'rustbgpctl -s http://127.0.0.1:50051 --json neighbor',
+                'rbgp --json neighbor',
                 dckr_override=dckr_override
             )
             elapsed_ms = int((_time.monotonic() - t0) * 1000)
 
             if not output:
-                print(f'rustbgpctl: empty output ({elapsed_ms}ms)')
+                print(f'rbgp: empty output ({elapsed_ms}ms)')
                 return None, None
 
             data = json.loads(output.decode('utf-8'))
@@ -454,11 +460,11 @@ class RustBGPdTarget(RustBGPd, Target):
                 neighbors_accepted[addr] = received
 
             if elapsed_ms > 5000:
-                print(f'rustbgpctl: slow query ({elapsed_ms}ms)')
+                print(f'rbgp: slow query ({elapsed_ms}ms)')
 
             return neighbors_received, neighbors_accepted
 
         except Exception as e:
             elapsed_ms = int((_time.monotonic() - t0) * 1000)
-            print(f'rustbgpctl: error after {elapsed_ms}ms: {e}')
+            print(f'rbgp: error after {elapsed_ms}ms: {e}')
             return None, None

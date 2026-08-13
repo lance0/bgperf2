@@ -10,6 +10,10 @@ class Junos(Container):
     CONTAINER_NAME = None
     GUEST_DIR = '/config'
     LOG_DIR = '/var/log'
+    # cRPD is downloaded out of band, but versions still work the usual way:
+    # tag each import as crpd:<version> and select it with --version.
+    IMAGE_REPO = 'crpd'
+    IMAGE_BUILDABLE = False
 
     def __init__(self, host_dir, conf, image='crpd'):
         super(Junos, self).__init__(self.CONTAINER_NAME, image, host_dir, self.GUEST_DIR, conf)
@@ -23,7 +27,7 @@ class Junos(Container):
     # don't build just download 
     # assume that you do this by hand
     @classmethod
-    def build_image(cls, force=False, tag='crpd', checkout='', nocache=False):
+    def build_image(cls, force=False, tag='crpd', checkout='', nocache=False, version=None):
         cls.dockerfile = ''
         print("Can't build junos, must download yourself")
         print("https://www.juniper.net/us/en/dm/crpd-free-trial.html")
@@ -68,10 +72,8 @@ class JunosTarget(Junos, Target):
             f.flush()
 
     def get_filter_test_config(self): 
-        file = open("filters/junos.conf", mode='r')
-        filters = file.read()
-        file.close
-        return filters
+        with open(REPO_ROOT / 'filters' / 'junos.conf') as file:
+            return file.read()
 
     def get_license_key(self, license_file):
         with open(license_file) as f:
@@ -123,4 +125,3 @@ class JunosTarget(Junos, Target):
             cap_add=['NET_ADMIN']
         )
         return host_config
-
