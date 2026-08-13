@@ -16,10 +16,6 @@
 from base import Tester
 from exabgp import ExaBGP
 from bird import BIRD
-from  settings import dckr
-from subprocess import check_output, Popen, PIPE
-import glob
-import os
 
 
 class ExaBGPTester(Tester, ExaBGP):
@@ -66,7 +62,7 @@ class BIRDTester(Tester, BIRD):
     CONTAINER_NAME_PREFIX = 'bgperf_bird_tester_'
 
     def __init__(self, name, host_dir, conf, image='bgperf/bird'):
-        super(BIRDTester, self).__init__('bgperf_bird_' + name, host_dir, conf, image)
+        super(BIRDTester, self).__init__(name, host_dir, conf, image)
 
     def configure_neighbors(self, target_conf):
         peers = list(self.conf.get('neighbors', {}).values())
@@ -108,27 +104,7 @@ ulimit -n 65536
             startup.append('''bird -c {0}/{1}.conf -s {0}/{1}.ctl >>{0}/{1}.log 2>&1\n'''.format(self.guest_dir, p['router-id']))
         return '\n'.join(startup)
 
-    @staticmethod
-    def find_errors(log_dirs=()):
-        '''Count real protocol errors across the tester logs.
-
-        The target re-advertises everything it learns, including back to the
-        testers that sent it. Testers run `import none`, so they reject all of
-        it and log "Invalid route ... withdrawn" for each -- normal operation,
-        not an error, and it dwarfs anything real (10 peers x 900 reflected
-        routes = 9000). Excluded like NEXT_HOP already was.
-
-        Takes the tester host directories rather than assuming /tmp/bgperf2, so
-        it still works with -b/--bench-name and -d/--dir.
-        '''
-        errors = 0
-        for log_dir in log_dirs:
-            for log in glob.glob(os.path.join(log_dir, '*.log')):
-                with open(log, errors='replace') as f:
-                    for line in f:
-                        if '<RMT>' not in line:
-                            continue
-                        if 'NEXT_HOP' in line or 'Invalid route' in line:
-                            continue
-                        errors += 1
-        return errors
+    def find_errors(self):
+        return self.count_log_lines(
+            ('rmt',), ('collision', 'next_hop', 'invalid route'),
+        )
