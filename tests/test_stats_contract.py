@@ -3,6 +3,9 @@ position only. Nothing in the code enforces that they agree, and when they drift
 the failure is silent: the CSV mislabels its columns and the graphs plot the
 wrong series. These tests are the enforcement.
 '''
+import csv
+from pathlib import Path
+
 import bgperf2
 
 
@@ -23,6 +26,21 @@ def test_header_and_row_agree_when_failed(bench_args, bench_stats):
     bench_stats['fail_msg'] = 'FAILED: stuck received count 0'
     row = bgperf2.create_output_stats(bench_args, 'v1.2.3', bench_stats, fail=True)
     assert len(header_fields()) == len(row)
+
+
+def test_checked_in_baseline_uses_the_legacy_stats_schema():
+    baseline = Path(__file__).resolve().parents[1] / 'benchmarks' / 'baseline' / 'baseline-benchmark.csv'
+    with baseline.open(newline='', encoding='utf-8') as baseline_file:
+        records = list(csv.reader(baseline_file))
+
+    header = [field.strip() for field in records[0]]
+    data_rows = records[1:]
+    assert header == header_fields()[:25]
+    assert len(data_rows) == 51
+    assert all(len(row) == 25 for row in data_rows)
+    assert header[20:25] == [
+        'tester errors', 'tester timeouts', 'failed', 'MSG', 'filters',
+    ]
 
 
 def test_row_values_land_in_their_named_columns(bench_args, bench_stats):
