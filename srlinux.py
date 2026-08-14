@@ -113,7 +113,7 @@ set / network-instance default protocols bgp neighbor {0} peer-group neighbors
         return dckr.exec_start(i['Id'], stream=False, detach=False).decode('utf-8').strip('\n')
 
 
-    def get_neighbors_state(self):
+    def get_neighbors_state(self, dckr_override=None):
         neighbors_accepted = {}
         neighbor_received_output = json.loads(self.local("/usr/bin/SRLinuxc bgp --host 127.0.0.1 -J").decode('utf-8'))
 
