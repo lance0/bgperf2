@@ -44,6 +44,7 @@ from bird import BIRD, BIRDTarget
 from frr import FRRoutingTarget
 from frr_compiled import FRRoutingCompiled, FRRoutingCompiledTarget
 from rustybgp import RustyBGP, RustyBGPTarget
+from rustbgpd import RustBGPd, RustBGPdTarget
 from openbgp import OpenBGP, OpenBGPTarget
 from flock import Flock, FlockTarget
 from srlinux import SRLinux, SRLinuxTarget
@@ -72,6 +73,7 @@ BUILDABLE_IMAGES = {
     'gobgp': GoBGP,
     'bird': BIRD,
     'rustybgp': RustyBGP,
+    'rustbgpd': RustBGPd,
     'openbgp': OpenBGP,
     'flock': Flock,
     'frr_c': FRRoutingCompiled,
@@ -103,6 +105,7 @@ TARGET_CLASSES = {
     'bird': BIRDTarget,
     'frr_c': FRRoutingCompiledTarget,
     'rustybgp': RustyBGPTarget,
+    'rustbgpd': RustBGPdTarget,
     'openbgp': OpenBGPTarget,
     'flock': FlockTarget,
     'srlinux': SRLinuxTarget,
@@ -790,6 +793,12 @@ def bench(args):
     if not args.file:
         target_image_name = target_image(args.target, getattr(args, 'version', None), args.image)
 
+    # The monitor is the measurement instrument. Resolve its selected GoBGP
+    # image before teardown for the same reason as the target: a missing tag
+    # must not destroy the previous row's containers and diagnostic state.
+    monitor_image_name = GoBGP.require_image(
+        getattr(args, 'monitor_version', None))
+
     remove_target_containers()
 
     if not args.repeat:
@@ -842,7 +851,8 @@ def bench(args):
         print('$ echo 16384 | sudo tee /proc/sys/net/ipv4/neigh/default/gc_thresh3')
 
     print('run monitor')
-    m = Monitor(config_dir+'/monitor', conf['monitor'])
+    m = Monitor(config_dir+'/monitor', conf['monitor'],
+                image=monitor_image_name)
     m.monitor_for = args.target
     m.run(conf, dckr_net_name)
 
@@ -1166,16 +1176,17 @@ def bench(args):
 
 
 def collect_provenance(args, target, monitor, testers):
-    '''Version and image of every daemon that took part in the run.
+    '''Version, configured image and running image ID for every daemon.
 
     The target alone does not describe a result: the testers generate the load
     and the monitor is the instrument every timing is read from, so all three
     have to be recorded for anyone else to reproduce the numbers. Reading them
     is only possible while the containers are still up.
     '''
-    def describe(daemon, container):
+    def describe(daemon, container, image_id=None):
         return {'daemon': daemon,
                 'image': normalize_image_name(container.image),
+                'image_id': image_id or container.running_image_id(),
                 'version': container.version_string()}
 
     provenance = {
@@ -1183,13 +1194,16 @@ def collect_provenance(args, target, monitor, testers):
         'monitor': describe('gobgp', monitor),
         'testers': [],
     }
-    # A run can be a hundred tester containers off one image. Ask one per
-    # distinct image and record how many ran, rather than exec'ing into each.
+    # A run can be a hundred tester containers off one tag. Inspect every
+    # running identity, then ask the daemon version once per distinct
+    # (configured tag, immutable image ID) pair.
     by_image = {}
     for t in testers:
-        key = normalize_image_name(t.image)
+        image_id = t.running_image_id()
+        key = (normalize_image_name(t.image), image_id)
         if key not in by_image:
-            by_image[key] = describe(getattr(args, 'tester_type', None) or 'tester', t)
+            by_image[key] = describe(
+                getattr(args, 'tester_type', None) or 'tester', t, image_id)
             by_image[key]['count'] = 0
         by_image[key]['count'] += 1
     provenance['testers'] = list(by_image.values())
@@ -1200,7 +1214,8 @@ def write_provenance(args, provenance, prefix):
     '''Write the full build manifest beside the run's other output.
 
     The CSV carries the headline versions so runs can be compared at a glance;
-    this carries the whole set, including the image each container ran from.
+    this carries the whole set, including each configured image tag and the
+    immutable image ID Docker assigned to the running container.
     '''
     doc = dict(provenance)
     doc['run'] = {
@@ -1451,6 +1466,10 @@ def check_batch_images(targets):
     '''
     missing = []
     for t in targets:
+        try:
+            GoBGP.require_image(t.get('monitor_version'))
+        except (ImageNotBuilt, VersionNotSupported) as e:
+            missing.append('monitor: {}'.format(e))
         if t.get('file'):
             # A hand-written scenario can declare the target remote, in which
             # case there is no local image to check. bench() sorts it out once
@@ -1468,6 +1487,7 @@ def check_batch_images(targets):
         except (ImageNotBuilt, VersionNotSupported) as e:
             missing.append(str(e))
     if missing:
+        missing = list(dict.fromkeys(missing))
         sys.exit('\n'.join(['this batch cannot run:'] + ['  ' + m for m in missing]))
 
 
@@ -1524,7 +1544,7 @@ def batch(args):
                         for field in ['single_table', 'docker_network_name', 'repeat', 'file', 'target_local_address',
                                         'label', 'target_local_address', 'monitor_local_address', 'target_router_id',
                                         'monitor_router_id', 'target_config_file', 'filter_type','mrt_injector', 'mrt_file',
-                                        'tester_type', 'license_file', 'version', 'threads']:
+                                        'tester_type', 'license_file', 'version', 'monitor_version', 'threads']:
                             setattr(a, field, t[field]) if field in t else setattr(a, field, None)
 
                         for field in ['as_path_list_num', 'prefix_list_num', 'community_list_num', 'ext_community_list_num']:
@@ -1927,6 +1947,9 @@ def create_args_parser(main=True):
                               help='version of the target daemon to bench, e.g. 10.1; uses the '
                                    'image built by `prepare`/`update`. default: the unversioned '
                                    'image, which tracks the daemon\'s default branch')
+    parser_bench.add_argument('--monitor-version', type=str,
+                              help='GoBGP version used by the monitor; default: the '
+                                   'unversioned bgperf/gobgp image')
     parser_bench.add_argument('-i', '--image', help='specify custom docker image')
     parser_bench.add_argument('--mrt-file', type=str, 
                               help='mrt file, requires absolute path')

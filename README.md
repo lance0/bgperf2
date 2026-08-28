@@ -8,6 +8,7 @@ bgperf2 is a performance measurement tool for BGP implementation. This was forke
 * [How bgperf2 works](https://github.com/netenglabs/bgperf2/blob/master/docs/how_bgperf_works.md)
 * [Benchmark remote target](https://github.com/netenglabs/bgperf2/blob/master/docs/benchmark_remote_target.md)
 * [MRT injection](https://github.com/netenglabs/bgperf2/blob/master/docs/mrt.md)
+* [rustbgpd target](docs/rustbgpd.md)
 * [Running on AWS EC2 spot instances](https://github.com/netenglabs/bgperf2/blob/master/docs/howto_aws.md)
 
 ## Updates from original bgperf
@@ -348,6 +349,25 @@ skips what already exists, so re-running after adding a version is cheap; `-f` f
 
 Every version image must exist before a run starts — `bench` and `batch` both check up front and
 tell you the exact `update` command rather than failing an hour into a batch.
+
+The GoBGP monitor is version-selectable independently of the target. GoBGP
+4.8.0 uses a digest-pinned Go 1.25 Bookworm builder:
+
+```bash
+./bgperf2.py update gobgp --version 4.8.0
+./bgperf2.py bench -t bird --version 3.3.2 --monitor-version 4.8.0
+```
+
+In batch YAML, put `monitor_version: 4.8.0` on each target entry that should use
+it. The monitor image, and the target image for a generated scenario, are
+resolved before the preceding run is torn down. Each run's `*.versions.json`
+records the configured tag and the immutable running image ID for the target,
+monitor, and tester roles.
+
+The `rustbgpd` target is deliberately different from release-selected targets:
+it builds an exact, clean local `RUSTBGPD_SOURCE` worktree without changing its
+checkout. See [the rustbgpd target guide](docs/rustbgpd.md) for its revision,
+event-history, and policy-boundary contract.
 
 The commercial NOSes work the same way once you tag what you downloaded (`docker tag <image>
 crpd:24.2`, then `-t junos --version 24.2`).

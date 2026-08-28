@@ -37,6 +37,7 @@ BGPERF_PROCESSES = frozenset((
     'bgpd', 'zebra', 'staticd', 'watchfrr', 'mgmtd', 'vtysh', 'watchquagga',
     # other open-source targets and the load generators
     'gobgpd', 'gobgp', 'bird', 'birdc', 'rustybgpd', 'rustybgp',
+    'rustbgpd', 'rbgp',
     'openbgpd', 'bgpd.openbsd', 'bgpctl', 'bgplgd', 'exabgp', 'bgpdump2',
     'flockd', 'flock',
     # commercial NOSes: Junos cRPD, Arista cEOS, Nokia SR Linux

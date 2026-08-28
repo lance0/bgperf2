@@ -65,7 +65,9 @@ def test_benchmark_processes_are_not_counted_as_competition():
     assert describe_contention(before, after, 10, clock_ticks=TICKS) is None
 
 
-@pytest.mark.parametrize('daemon', ['flockd', 'rpd', 'Bgp', 'sr_bgp_mgr', 'mgmtd'])
+@pytest.mark.parametrize('daemon', [
+    'flockd', 'rpd', 'Bgp', 'sr_bgp_mgr', 'mgmtd', 'rustbgpd', 'rbgp',
+])
 def test_every_target_daemon_is_recognised_as_ours(daemon):
     '''A target whose daemon is missing from the allowlist reports its own load
     as contention, so every one of its rows looks incomparable.'''

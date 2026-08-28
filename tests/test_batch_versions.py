@@ -96,10 +96,24 @@ class TestCheckBatchImages:
             bgperf2.expand_target_versions([{'name': 'frr_c', 'versions': ['8.0']}]))
 
     def test_explicit_image_is_checked_as_given(self, fake_img_exists):
-        fake_img_exists(lambda name: name == 'my/frr:custom')
+        fake_img_exists(lambda name: name in (
+            'my/frr:custom', 'bgperf/gobgp:latest'))
         bgperf2.check_batch_images([{'name': 'frr_c', 'image': 'my/frr:custom'}])
         with pytest.raises(SystemExit):
             bgperf2.check_batch_images([{'name': 'frr_c', 'image': 'my/frr:missing'}])
+
+    def test_selected_monitor_version_is_preflighted(self, fake_img_exists):
+        seen = []
+
+        def exists(name):
+            seen.append(name)
+            return name in ('bgperf/gobgp:4.8.0', 'bgperf/bird:latest')
+
+        fake_img_exists(exists)
+        bgperf2.check_batch_images([
+            {'name': 'bird', 'monitor_version': '4.8.0'},
+        ])
+        assert 'bgperf/gobgp:4.8.0' in seen
 
     def test_unknown_target_name(self, fake_img_exists):
         fake_img_exists(lambda name: True)
@@ -144,6 +158,19 @@ def test_batch_passes_version_through_to_bench():
     import inspect
     source = inspect.getsource(bgperf2.batch)
     assert "'version'" in source, 'batch() must copy version onto the bench args'
+
+
+def test_batch_passes_monitor_version_through_to_bench():
+    import inspect
+    source = inspect.getsource(bgperf2.batch)
+    assert "'monitor_version'" in source
+
+
+def test_bench_cli_accepts_monitor_version():
+    args = bgperf2.create_args_parser().parse_args([
+        'bench', '--monitor-version', '4.8.0',
+    ])
+    assert args.monitor_version == '4.8.0'
 
 
 class TestReviewFixes:
@@ -292,21 +319,72 @@ class TestSecondRoundFixes:
                             lambda: order.append('teardown'))
         monkeypatch.setattr(bgperf2, 'remove_old_containers', lambda: order.append('teardown'))
         monkeypatch.setattr(bgperf2, 'target_image',
-                            lambda *a, **k: order.append('resolve') or 'img')
+                            lambda *a, **k: order.append('resolve-target') or 'img')
+        monkeypatch.setattr(
+            bgperf2.GoBGP, 'require_image',
+            lambda *a, **k: order.append('resolve-monitor') or 'monitor-img')
 
         args = Namespace(dir='/tmp', bench_name='x', docker_network_name=None,
                          file=None, target='bird', version='99.9', image=None, repeat=True)
         with pytest.raises(Exception):
             bgperf2.bench(args)
-        assert order and order[0] == 'resolve', \
+        assert order[:2] == ['resolve-target', 'resolve-monitor'], \
             'containers were torn down before the image was resolved: {0}'.format(order)
 
-    def test_batch_skips_image_check_for_scenario_files(self, fake_img_exists):
-        '''A -f scenario can declare the target remote, which has no local
-        image; checking one aborted the whole batch before anything ran.
+    def test_resolved_monitor_image_is_used(self, monkeypatch, tmp_path):
+        class MonitorConstructed(Exception):
+            pass
+
+        seen = {}
+
+        class FakeMonitor:
+            def __init__(self, host_dir, conf, image):
+                seen['host_dir'] = host_dir
+                seen['image'] = image
+                raise MonitorConstructed()
+
+        monkeypatch.setattr(bgperf2, 'target_image', lambda *args: 'target-image')
+        monkeypatch.setattr(
+            bgperf2.GoBGP, 'require_image',
+            lambda version: 'bgperf/gobgp:{}'.format(version))
+        monkeypatch.setattr(bgperf2, 'remove_target_containers', lambda: None)
+        monkeypatch.setattr(bgperf2, 'remove_old_containers', lambda: None)
+        monkeypatch.setattr(bgperf2, 'warn_if_machine_is_busy', lambda: None)
+        monkeypatch.setattr(bgperf2, 'warn_if_log_dir_is_in_ram', lambda path: None)
+        monkeypatch.setattr(bgperf2, 'gen_conf', lambda args: bgperf2.yaml.safe_dump({
+            'local_prefix': '10.10.0.0/24',
+            'target': {'local-address': '10.10.0.254'},
+            'monitor': {},
+            'testers': [],
+        }))
+        monkeypatch.setattr(
+            bgperf2.dckr, 'networks',
+            lambda names: [{'Name': 'row-br'}])
+        monkeypatch.setattr(bgperf2, 'Monitor', FakeMonitor)
+
+        args = Namespace(
+            dir=str(tmp_path), bench_name='row', docker_network_name='row-br',
+            file=None, target='bird', version=None, monitor_version='4.8.0',
+            image=None, repeat=True,
+        )
+        with pytest.raises(MonitorConstructed):
+            bgperf2.bench(args)
+
+        assert seen['image'] == 'bgperf/gobgp:4.8.0'
+        assert seen['host_dir'].endswith('/row/monitor')
+
+    def test_batch_skips_only_target_check_for_scenario_files(self,
+                                                               fake_img_exists):
+        '''A remote scenario has no target image, but still has a monitor.
         '''
-        fake_img_exists(lambda name: False)
+        fake_img_exists(lambda name: name == 'bgperf/gobgp:latest')
         bgperf2.check_batch_images([{'name': 'bird', 'file': 'scenario.yaml'}])
+
+        fake_img_exists(lambda name: False)
+        with pytest.raises(SystemExit, match='monitor'):
+            bgperf2.check_batch_images([
+                {'name': 'bird', 'file': 'scenario.yaml'},
+            ])
 
     def test_batch_still_checks_normal_targets(self, fake_img_exists):
         fake_img_exists(lambda name: False)

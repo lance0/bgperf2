@@ -23,7 +23,7 @@ class GoBGP(Container):
     GUEST_DIR = '/root/config'
     IMAGE_REPO = 'bgperf/gobgp'
     DAEMON_BINARY = '/go/bin/gobgpd'
-    VERSIONS = ('3.35.0', '3.37.0')
+    VERSIONS = ('3.35.0', '3.37.0', '4.8.0')
     DEFAULT_REF = 'master'
 
     def __init__(self, host_dir, conf, image='bgperf/gobgp'):
@@ -57,7 +57,14 @@ class GoBGP(Container):
     # Old GoBGP releases need the Go toolchain they were written against;
     # 'golang:latest' stops working eventually, so pin per series when it does.
     BUILD_VARS = {'base_image': 'golang:latest'}
-    VERSION_BUILD_VARS = ()
+    VERSION_BUILD_VARS = (
+        ('4.8', {
+            'base_image': (
+                'golang:1.25-bookworm@sha256:'
+                '3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437'
+            ),
+        }),
+    )
 
     @classmethod
     def build_image(cls, force=False, tag=None, checkout=None, nocache=False, version=None):

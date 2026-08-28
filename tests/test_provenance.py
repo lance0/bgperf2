@@ -18,12 +18,16 @@ import bgperf2
 
 class FakeContainer:
     '''Stands in for a running container: version_string() is what gets read.'''
-    def __init__(self, image, version):
+    def __init__(self, image, version, image_id=None):
         self.image = image
         self._version = version
+        self._image_id = image_id or 'sha256:' + image.replace('/', '-').replace(':', '-')
 
     def version_string(self):
         return self._version
+
+    def running_image_id(self):
+        return self._image_id
 
 
 @pytest.fixture
@@ -46,10 +50,13 @@ class TestCollectProvenance:
         p = collect(prov_args, [FakeContainer('bgperf/bird:2.19.2', '2.19.2')])
 
         assert p['target'] == {'daemon': 'frr_c', 'image': 'bgperf/frr_c:10.7',
+                               'image_id': 'sha256:bgperf-frr_c-10.7',
                                'version': 'FRRouting 10.7.0 (fa49f0ddc9c8)'}
         # the monitor is the measurement instrument, so its build matters too
         assert p['monitor']['version'] == '3.37.0'
+        assert p['monitor']['image_id'] == 'sha256:bgperf-gobgp'
         assert p['testers'][0]['version'] == '2.19.2'
+        assert p['testers'][0]['image_id'] == 'sha256:bgperf-bird-2.19.2'
 
     def test_image_names_are_normalized(self, prov_args):
         '''bgperf/gobgp and bgperf/gobgp:latest are the same image.'''
@@ -71,6 +78,31 @@ class TestCollectProvenance:
 
         assert {t['image'] for t in p['testers']} == {
             'bgperf/bird:2.19.2', 'bgperf/exabgp:latest'}
+
+    def test_same_tag_with_different_running_image_ids_stays_distinct(self,
+                                                                     prov_args):
+        testers = [
+            FakeContainer('bgperf/bird:latest', '2.19.2', 'sha256:old'),
+            FakeContainer('bgperf/bird:latest', '2.19.2', 'sha256:new'),
+        ]
+        p = collect(prov_args, testers)
+        assert {t['image_id'] for t in p['testers']} == {
+            'sha256:old', 'sha256:new'}
+
+    def test_running_image_id_comes_from_container_inspection(self, monkeypatch):
+        container = base.Container.__new__(base.Container)
+        container.name = 'target'
+        container.ctn_id = 'container-id'
+        monkeypatch.setattr(
+            base.dckr, 'inspect_container',
+            lambda container_id: {'Image': 'sha256:immutable'})
+        assert container.running_image_id() == 'sha256:immutable'
+
+    def test_running_image_id_requires_a_started_container(self):
+        container = base.Container.__new__(base.Container)
+        container.name = 'target'
+        with pytest.raises(RuntimeError, match='no running container ID'):
+            container.running_image_id()
 
 
 class TestVersionString:
@@ -276,6 +308,7 @@ class TestWriteProvenance:
         doc = json.loads(open(path).read())
 
         assert doc['target']['image'] == 'bgperf/frr_c:10.7'
+        assert doc['target']['image_id'] == 'sha256:bgperf-frr_c-10.7'
         assert doc['monitor']['version'] == '3.37.0'
         assert doc['testers'][0]['count'] == 1
         # the manifest has to say which run it describes, or it is unattachable

@@ -554,6 +554,18 @@ class Container(object):
         i = dckr.exec_create(container=self.name, cmd=cmd, stderr=stderr)
         return dckr.exec_start(i['Id'], stream=stream, detach=detach)
 
+    def running_image_id(self):
+        '''Immutable image ID Docker actually assigned to this container.'''
+        container_id = getattr(self, 'ctn_id', None)
+        if not container_id:
+            raise RuntimeError(
+                'container {} has no running container ID'.format(self.name))
+        image_id = dckr.inspect_container(container_id).get('Image')
+        if not image_id:
+            raise RuntimeError(
+                'container {} has no Docker-resolved image ID'.format(self.name))
+        return image_id
+
     def get_startup_cmd(self):
         raise NotImplementedError()
 

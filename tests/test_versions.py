@@ -52,6 +52,7 @@ class TestResolveRef:
 
     def test_gobgp(self):
         assert GoBGP.resolve_ref('3.37.0') == 'v3.37.0'
+        assert GoBGP.resolve_ref('4.8.0') == 'v4.8.0'
 
     @pytest.mark.parametrize('version,ref', [
         ('2026-02', '0cc685c'),   # date labels map onto the commit they name
@@ -276,6 +277,12 @@ class TestRenderDockerfile:
         placeholder, so every "version" silently built master.
         '''
         assert 'git checkout v3.37.0' in GoBGP.render_dockerfile('3.37.0')
+
+    def test_gobgp_4_8_uses_a_pinned_go_1_25_builder(self):
+        recipe = GoBGP.render_dockerfile('4.8.0')
+        assert ('FROM golang:1.25-bookworm@sha256:'
+                '3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437') in recipe
+        assert 'git checkout v4.8.0' in recipe
 
     def test_build_vars_reach_the_recipe(self):
         class Pinned(FRRoutingCompiled):
