@@ -350,6 +350,15 @@ def check_binary(container, path):
     return [(True, 'instrumentation', 'clean')]
 
 
+def versions_to_probe(buildable, built, requested):
+    """Select real benchable tags without inventing versions for fixed images."""
+    if requested:
+        return requested
+    if not buildable.VERSIONS:
+        return [None] if 'latest' in built else []
+    return [None if version == 'latest' else version for version in built]
+
+
 def verify(args):
     '''Check that every built image reports its own version correctly.
 
@@ -383,7 +392,7 @@ def verify(args):
             roles = [('image', buildable)]
 
         built = buildable.built_versions()
-        wanted = versions or [None if v == 'latest' else v for v in built]
+        wanted = versions_to_probe(buildable, built, versions)
         if not wanted:
             print('{0} ... nothing built'.format(name))
             continue

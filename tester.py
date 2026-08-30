@@ -124,7 +124,10 @@ ulimit -n 65536
         testers that sent it. Testers run `import none`, so they reject all of
         it and log "Invalid route ... withdrawn" for each -- normal operation,
         not an error, and it dwarfs anything real (10 peers x 900 reflected
-        routes = 9000). Excluded like NEXT_HOP already was.
+        routes = 9000). Excluded like NEXT_HOP already was. BIRD also reports
+        normal RFC 4271 connection-collision resolution at remote severity
+        when both peers actively open; the surviving session is healthy, so
+        that event is not a tester error either.
 
         Takes the tester host directories rather than assuming /tmp/bgperf2, so
         it still works with -b/--bench-name and -d/--dir.
@@ -141,7 +144,14 @@ ulimit -n 65536
                         for line in f:
                             if '<RMT>' not in line:
                                 continue
-                            if 'NEXT_HOP' in line or 'Invalid route' in line:
+                            if any(
+                                normal in line
+                                for normal in (
+                                    'NEXT_HOP',
+                                    'Invalid route',
+                                    'Connection collision resolution',
+                                )
+                            ):
                                 continue
                             errors += 1
                 except OSError:
