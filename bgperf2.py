@@ -1419,6 +1419,7 @@ def create_graph(stats, test_name='total time', stat_index=8, test_file='total_t
 
     plt.show()
     plt.savefig(results_path(results_dir, test_file))
+    plt.close()
 
 class BatchLoader(yaml.SafeLoader):
     '''YAML loader that leaves version-shaped scalars alone.

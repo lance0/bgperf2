@@ -84,6 +84,15 @@ def test_graph_indices_point_at_the_columns_their_labels_claim():
         assert fields[index] == name, f"index {index} is '{fields[index]}', expected '{name}'"
 
 
+def test_batch_graph_closes_its_figure(tmp_path, bench_args, bench_stats):
+    row = bgperf2.create_output_stats(bench_args, 'v1.2.3', bench_stats)
+    figures_before = set(bgperf2.plt.get_fignums())
+
+    bgperf2.create_graph([row], test_file='one.png', results_dir=tmp_path)
+
+    assert set(bgperf2.plt.get_fignums()) == figures_before
+
+
 def test_label_overrides_name_but_not_target(bench_args, bench_stats):
     bench_args.label = 'frr 8'
     row = bgperf2.create_output_stats(bench_args, 'v1', bench_stats)
