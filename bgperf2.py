@@ -354,7 +354,7 @@ def versions_to_probe(buildable, built, requested):
     """Select real benchable tags without inventing versions for fixed images."""
     if requested:
         return requested
-    if not buildable.VERSIONS:
+    if not buildable.SUPPORTS_VERSIONS:
         return [None] if 'latest' in built else []
     return [None if version == 'latest' else version for version in built]
 
