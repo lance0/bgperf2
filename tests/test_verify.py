@@ -118,6 +118,26 @@ class TestGcovPattern:
         assert not self.matches(sample)
 
 
+class TestVersionsToProbe:
+    def test_unversioned_image_ignores_unselectable_historical_tags(self):
+        rustbgpd = bgperf2.BUILDABLE_IMAGES['rustbgpd']
+        assert bgperf2.versions_to_probe(
+            rustbgpd, ['lan1344-dhat', 'latest'], []
+        ) == [None]
+
+    def test_versioned_image_keeps_latest_and_release_tags(self):
+        bird = bgperf2.BUILDABLE_IMAGES['bird']
+        assert bgperf2.versions_to_probe(
+            bird, ['2.19.2', 'latest'], []
+        ) == ['2.19.2', None]
+
+    def test_versioned_image_without_curated_versions_keeps_built_tags(self):
+        exabgp = bgperf2.BUILDABLE_IMAGES['exabgp']
+        assert bgperf2.versions_to_probe(
+            exabgp, ['4.2.21', 'latest'], []
+        ) == ['4.2.21', None]
+
+
 class TestProbeUsesTheClassBenchUses:
     def test_target_classes_are_preferred_over_daemon_bases(self):
         '''rustybgp's version parser was wrong only through RustyBGPTarget's
