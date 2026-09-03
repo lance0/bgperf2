@@ -194,7 +194,7 @@ ulimit -n 65536
         when both peers actively open; the surviving session is healthy, so
         that event is not a tester error either.
 
-        Takes the tester host directories rather than assuming /tmp/bgperf2, so
+        Takes the tester host directories rather than assuming a fixed path, so
         it still works with -b/--bench-name and -d/--dir.
         '''
         errors = 0
