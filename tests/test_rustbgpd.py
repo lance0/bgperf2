@@ -164,6 +164,17 @@ class TestWriteConfig:
             assert 'address = "{}"'.format(address) in config
         assert config.count('[[neighbors]]') == 3
 
+    def test_export_receivers_are_configured_after_the_monitor(self, tmp_path):
+        scenario = dict(SCENARIO, receivers=[
+            {'as': 1101, 'local-address': '10.10.0.101'},
+            {'as': 1102, 'local-address': '10.10.0.102'},
+        ])
+        config = write(tmp_path, scenario=scenario)
+        order = [line.split('"')[1] for line in config.splitlines()
+                 if line.startswith('address = ')]
+        assert order == ['10.10.0.3', '10.10.0.4', '10.10.0.2',
+                         '10.10.0.101', '10.10.0.102']
+
     def test_owner_only_socket_needs_no_grpc_security_block(self, tmp_path):
         config = write(tmp_path)
         assert 'security.grpc' not in config

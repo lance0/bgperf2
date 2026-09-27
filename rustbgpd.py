@@ -276,11 +276,9 @@ class RustBGPdTarget(RustBGPd, Target):
                 '',
             ])
 
-        neighbors = list(flatten(
-            list(t.get('neighbors', {}).values())
-            for t in self.scenario_global_conf['testers']))
-        neighbors.append(self.scenario_global_conf['monitor'])
-        for neighbor in neighbors:
+        # Unsorted keeps the historical tester-then-monitor order, and the
+        # shared seam adds any export-fan-out receivers.
+        for neighbor in self.scenario_neighbors(sort=False):
             lines.extend([
                 '[[neighbors]]',
                 'address = "{}"'.format(neighbor['local-address']),
