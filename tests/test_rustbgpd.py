@@ -262,19 +262,25 @@ class TestRbgpParsing:
         expected = {'10.0.0.1': 100000, '10.0.0.2': 99999}
         assert target.get_neighbors_state() == (expected, expected)
 
-    @pytest.mark.parametrize('output', [b'', b'not json', b'{}', b'[1]'])
-    def test_transient_or_malformed_output_is_empty_state(self, output):
+    def test_empty_output_before_the_socket_is_up_is_empty_state(self):
+        target = self.target_with_output(b'')
+        assert target.get_neighbors_state() == ({}, {})
+
+    @pytest.mark.parametrize('output', [
+        b'not json',
+        b'{}',
+        b'[1]',
+        b'[{"address":"10.0.0.1","prefixes_received":null}]',
+    ])
+    def test_malformed_output_is_a_failed_read(self, output):
         target = self.target_with_output(output)
-        assert target.get_neighbors_state() == ({}, {})
+        with pytest.raises((ValueError, TypeError)):
+            target.get_neighbors_state()
 
-    def test_non_numeric_prefix_count_is_empty_state(self):
-        target = self.target_with_output(
-            b'[{"address":"10.0.0.1","prefixes_received":null}]')
-        assert target.get_neighbors_state() == ({}, {})
-
-    def test_transient_exec_failure_is_empty_state(self):
-        target = self.target_with_output(RuntimeError('socket not ready'))
-        assert target.get_neighbors_state() == ({}, {})
+    def test_exec_failure_is_a_failed_read(self):
+        target = self.target_with_output(RuntimeError('exec failed'))
+        with pytest.raises(RuntimeError):
+            target.get_neighbors_state()
 
 
 class TestVersion:

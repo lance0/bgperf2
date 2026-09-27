@@ -300,26 +300,27 @@ class RustBGPdTarget(RustBGPd, Target):
             config_file_name=self.CONFIG_FILE_NAME)
 
     def get_neighbors_state(self):
-        '''Return received counts from rbgp, or empty state while unavailable.'''
-        try:
-            output = self.local('rbgp --json neighbor')
-            if not output:
-                return {}, {}
-            neighbors = json.loads(output.decode('utf-8'))
-            if not isinstance(neighbors, list):
-                return {}, {}
-            received = {}
-            for neighbor in neighbors:
-                if not isinstance(neighbor, dict):
-                    return {}, {}
-                address = neighbor.get('address')
-                if not address:
-                    continue
-                received[address] = int(neighbor.get('prefixes_received', 0))
-            return received, dict(received)
-        except Exception as error:
-            # The gRPC socket normally appears a poll or two after the daemon;
-            # this path must not turn a transient startup state into a failed
-            # benchmark thread.
-            print('rbgp neighbor query unavailable: {}'.format(error))
+        """Return received counts from rbgp, or empty state before it answers.
+
+        Empty stdout is the daemon's socket not being up yet, a poll or two
+        after start, and reads as no neighbours. Anything else that is not the
+        expected JSON raises, so the shared sampler counts it as a failed read
+        and the run's event artifact reports it instead of a silent gap.
+        """
+        output = self.local('rbgp --json neighbor')
+        if not output:
             return {}, {}
+        neighbors = json.loads(output.decode('utf-8'))
+        if not isinstance(neighbors, list):
+            raise ValueError(
+                'rbgp neighbor output is not a list: {!r}'.format(neighbors))
+        received = {}
+        for neighbor in neighbors:
+            if not isinstance(neighbor, dict):
+                raise ValueError(
+                    'rbgp neighbor entry is not an object: {!r}'.format(neighbor))
+            address = neighbor.get('address')
+            if not address:
+                continue
+            received[address] = int(neighbor.get('prefixes_received', 0))
+        return received, dict(received)
