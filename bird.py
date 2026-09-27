@@ -14,7 +14,469 @@
 # limitations under the License.
 
 from base import *
-import textfsm
+
+
+# --- birdc 'show protocols all' --------------------------------------------
+#
+# Read by column *name*, never by position. BIRD 3 inserts two columns into the
+# route-change-stats table that BIRD 2 does not have:
+#
+#   2.19  received rejected filtered ignored                accepted
+#   3.3.2 received rejected filtered ignored RX limit limit accepted
+#
+# so `fields[4]` is `accepted` on one and `RX limit` on the other. `prepare`
+# builds both series, and a positional read would not fail -- it would report a
+# plausible wrong number for half the matrix, which is the failure mode this
+# project keeps hitting. The `Routes:` line moves the same way: a channel with
+# a filter reports an extra `filtered` term between `imported` and `exported`.
+
+_PROTOCOL_HEADER = re.compile(
+    r'^(?P<name>\S+)\s+(?P<proto>\S+)\s+(?P<table>\S+)\s+(?P<state>\S+)'
+    r'\s+(?P<since>\S+)\s*(?P<info>.*?)\s*$')
+_ROUTES = re.compile(r'(\d+)\s+([a-z]+)')
+_PENDING_PREFIXES = re.compile(r'total\s+(\d+)\s+prefixes to send')
+_TX_PENDING = re.compile(r'^TX pending:\s+(\d+)\s+bytes')
+
+
+def _stat_value(token):
+    '''A route-change-stats cell: an integer, or None for BIRD\'s `---`.'''
+    return None if token == '---' else int(token)
+
+
+def parse_protocols(text):
+    '''Parse `birdc show protocols all` into {protocol name: facts}.
+
+    Each protocol carries its header fields, any BGP session detail, and a
+    `channels` dict, because a protocol can have more than one channel and only
+    the ipv4 one carries this benchmark\'s workload. Unrecognised lines are
+    skipped rather than guessed at.
+    '''
+    protocols = {}
+    protocol = None
+    channel = None
+    columns = None
+
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+
+        if not raw[:1].isspace():
+            # A new protocol header ends the previous protocol's indented
+            # block, so drop the channel/column context with it.
+            protocol = channel = columns = None
+            m = _PROTOCOL_HEADER.match(raw)
+            # The table header and the `BIRD <version> ready.` banner both sit
+            # at column 0; neither is a protocol.
+            if not m or m.group('name') == 'Name':
+                continue
+            protocol = {
+                'proto': m.group('proto'),
+                'table': m.group('table'),
+                'state': m.group('state'),
+                'info': m.group('info'),
+                'bgp_state': None,
+                'neighbor_address': None,
+                'neighbor_range': None,
+                'tx_pending_bytes': None,
+                'channels': {},
+            }
+            protocols[m.group('name')] = protocol
+            continue
+
+        if protocol is None:
+            continue
+        line = raw.strip()
+
+        if line.startswith('Channel '):
+            channel = line.split(None, 1)[1].strip()
+            protocol['channels'][channel] = {
+                'routes': {},
+                'stats': {},
+                'pending_prefixes': None,
+            }
+            columns = None
+            continue
+
+        if line.startswith('BGP state:'):
+            protocol['bgp_state'] = line.split(':', 1)[1].strip()
+            continue
+
+        if line.startswith('Neighbor address:'):
+            # BIRD appends the interface for a link-local or bound session:
+            # `10.10.255.254%eth1`.
+            protocol['neighbor_address'] = \
+                line.split(':', 1)[1].strip().split('%')[0]
+            continue
+
+        if line.startswith('Neighbor range:'):
+            # A `neighbor range` protocol is the listener for dynamic peers,
+            # not a session of its own. It sits in Passive for the whole run.
+            protocol['neighbor_range'] = line.split(':', 1)[1].strip()
+            continue
+
+        m = _TX_PENDING.match(line)
+        if m:
+            # BIRD 3 only. Its absence is what makes backpressure evidence
+            # unavailable on 2.x, and that has to be recorded, not assumed zero.
+            protocol['tx_pending_bytes'] = int(m.group(1))
+            continue
+
+        if channel is None:
+            continue
+
+        if line.startswith('Routes:'):
+            protocol['channels'][channel]['routes'] = {
+                name: int(count)
+                for count, name in _ROUTES.findall(line.split(':', 1)[1])
+            }
+            continue
+
+        if line.startswith('Route change stats:'):
+            # Column names contain spaces ('RX limit'), so split on runs of
+            # two or more spaces rather than on whitespace.
+            columns = re.split(r'\s{2,}', line.split(':', 1)[1].strip())
+            continue
+
+        if line.startswith('Pending '):
+            m = _PENDING_PREFIXES.search(line)
+            if m:
+                protocol['channels'][channel]['pending_prefixes'] = int(m.group(1))
+            continue
+
+        if columns and line.split(':', 1)[0] in (
+                'Import updates', 'Import withdraws',
+                'Export updates', 'Export withdraws'):
+            key, _, rest = line.partition(':')
+            values = rest.split()
+            if len(values) != len(columns):
+                # A row that does not line up with its own header is evidence
+                # of a format this parser has not seen; recording it under
+                # guessed names is how a wrong number gets published.
+                continue
+            protocol['channels'][channel]['stats'][key] = {
+                name: _stat_value(value)
+                for name, value in zip(columns, values)
+            }
+
+    return protocols
+
+
+# One `docker exec` per poll, not one per peer. A BIRD tester runs a separate
+# `bird` per neighbour on its own control socket, so reading N peers means N
+# `birdc` invocations -- as N docker execs that is ~50ms each, and at 50 peers a
+# 1s poll cannot keep up and the controller starts burning CPU the run then
+# reports as its own contention. They go in one shell command instead, each
+# section introduced by this marker so the reply can be split back apart.
+SESSION_MARKER = '===bgperf-session '
+
+
+def split_session_output(text):
+    '''Split a marker-separated multi-session capture into {key: text}.
+
+    A key with no section is absent rather than empty: the caller knows every
+    peer it asked about, and "the socket did not answer" has to stay distinct
+    from "the daemon answered and had nothing".
+    '''
+    sections = {}
+    key = None
+    lines = []
+    for raw in text.splitlines():
+        if raw.startswith(SESSION_MARKER):
+            if key is not None:
+                sections[key] = '\n'.join(lines)
+            key = raw[len(SESSION_MARKER):].strip()
+            lines = []
+            continue
+        if key is not None:
+            lines.append(raw)
+    if key is not None:
+        sections[key] = '\n'.join(lines)
+    return sections
+
+
+# What a churn burst is made of on the generator side: one static protocol
+# holding the block that goes away and comes back, switched with birdc's own
+# `disable`/`enable`. Reconfiguring the daemon would do it too, but that
+# re-reads the whole config -- including the several hundred thousand static
+# routes a real run holds -- so the interval measured would be BIRD parsing its
+# own file rather than the target reacting to a withdrawal.
+CHURN_PROTOCOL = 'churn'
+
+# birdc answers `disable <proto>` with exactly `<proto>: disabled` and `enable`
+# with `<proto>: enabled` -- verified on the 2.19.2 and 3.3.2 images this
+# project builds. Anything else is a command that did not run: a protocol name
+# it does not know answers `syntax error, unexpected CF_SYM_UNDEFINED`, and a
+# protocol already in the requested state answers `<proto>: already disabled`,
+# which is not success either -- the sequence alternates, so reaching a
+# `disable` on an already-disabled protocol means the previous `enable` was
+# lost, and treating it as success would measure a burst that did not happen.
+# The filter a policy reload installs on the target's import. One name, because
+# the reload rewrites the whole config file and then asks BIRD to re-read it:
+# the filter has to be found by the same name it was written under, and a
+# second one left behind from an earlier reload would be dead config that still
+# parses.
+POLICY_RELOAD_FILTER = 'bgperf_policy_reload'
+
+# What `birdc configure` says when it accepted the new configuration. Both are
+# success: BIRD answers `Reconfigured` when it applied the change outright and
+# `Reconfiguration in progress` when it accepted it and is still applying --
+# which is the reply a large table can produce, and reading it as a failure
+# would abandon exactly the reloads worth measuring.
+_RECONFIGURE_OK = ('Reconfigured', 'Reconfiguration in progress')
+
+
+def policy_reload_filter_config(reject_peer_asns):
+    """The import filter a reload installs, or nothing where none was asked for.
+
+    One `bgp_path ~ [...]` membership test over the whole rejected set rather
+    than a line per peer: it is the form `filters/bird.conf` already uses for
+    its bogon ASNs, and a fifty-block reload would otherwise write fifty
+    branches that all have to be evaluated for every route in the table --
+    turning the cost of the policy into a property of how the filter was
+    generated.
+    """
+    if not reject_peer_asns:
+        return ''
+    return '''filter {0} {{
+  if (bgp_path ~ [{1}]) then reject;
+  accept;
+}}
+'''.format(POLICY_RELOAD_FILTER,
+           ', '.join(str(int(asn)) for asn in reject_peer_asns))
+
+
+def policy_reload_failure(text):
+    """The daemon's reply where it did not report the new policy accepted.
+
+    Returns None when it did. The reply text is the signal because the exit
+    status is not available to us: `Container.local()` is a `docker exec` whose
+    output is all that comes back, and nothing here inspects the exec's status.
+    `birdc configure` does exit 1 on a bad config -- verified on
+    bgperf/bird:3.3.2, which answers `<file>:N:1 syntax error, unexpected
+    CF_SYM_UNDEFINED` and exits 1 -- so the two signals agree; it is simply the
+    one we can read, exactly as it is for a churn burst.
+
+    Reading it matters because a rejected configuration leaves the *running*
+    one untouched (verified: the previous protocols are still there
+    afterwards). A failure taken for success would mean the run went on
+    measuring the old policy while the artifact recorded the new one.
+    """
+    text = (text or '').strip()
+    if any(ok in text for ok in _RECONFIGURE_OK):
+        return None
+    return text or 'no reply from birdc configure'
+
+
+def churn_reply_ok(text, action, protocol=CHURN_PROTOCOL):
+    '''Whether one session\'s reply says the churn command was carried out.'''
+    wanted = '{0}: {1}d'.format(protocol, action)
+    return any(line.strip() == wanted for line in text.splitlines())
+
+
+def churn_failures(text, sessions, action, protocol=CHURN_PROTOCOL):
+    '''Sessions whose reply did not report the churn command carried out.
+
+    Keyed by the sessions the caller asked about rather than by the sections
+    that came back, on the same rule `get_offerings()` uses: a peer whose
+    socket did not answer at all has to stay distinct from one that answered,
+    or the peers that did reply would satisfy "the burst was issued" on their
+    own. That matters more here than for a poll -- a missed withdrawal is a
+    burst nothing withdrew, and its only other symptom is a stall five minutes
+    later that reads as a stuck target.
+    '''
+    parsed = split_session_output(text)
+    failures = {}
+    for key in sessions:
+        section = parsed.get(key)
+        if section is None:
+            failures[key] = 'no reply'
+        elif not churn_reply_ok(section, action, protocol):
+            failures[key] = section.strip() or 'empty reply'
+    return failures
+
+
+def neighbors_state(text):
+    '''Prefixes each neighbor has sent, from the target\'s own `Import
+    updates` counters.
+
+    Pure over the CLI text so one `birdc show protocols all` read can serve
+    both this and table_witness(), and so both can be tested without Docker.
+
+    This used to run a TextFSM template that took the fifth field of the row.
+    That is `accepted` on BIRD 2 and `RX limit` on BIRD 3, so every BIRD 3
+    target reported accepted=0 for every neighbor: `neighbors_checked` never
+    went all-True, and that route to the convergence checkpoint was dead for
+    half the BIRD matrix. Runs still finished, via `neighbors_received_full`,
+    which is why it stayed hidden -- only the progress line looked wrong.
+    parse_protocols() reads the row against its own header instead.
+    '''
+    neighbors_received = {}
+    neighbors_accepted = {}
+    for protocol in parse_protocols(text).values():
+        # A `neighbor range` listener has no address and is not a peering.
+        if protocol['proto'] != 'BGP' or not protocol['neighbor_address']:
+            continue
+        imported = protocol['channels'].get(
+            'ipv4', {}).get('stats', {}).get('Import updates', {})
+        address = protocol['neighbor_address']
+        # A counter BIRD prints as '---' does not apply to this row; the
+        # caller compares these against configured counts, so absent reads
+        # as none received rather than as a missing neighbor.
+        neighbors_received[address] = imported.get('received') or 0
+        neighbors_accepted[address] = imported.get('accepted') or 0
+
+    return neighbors_received, neighbors_accepted
+
+
+def table_witness(text, monitor_address=None, expected_peerings=None,
+                  channel='ipv4'):
+    '''What the target itself says about the table it is holding right now.
+
+    The monitor is one BGP session\'s view of the target and it is the only
+    instrument every published timing is read from, so when its count moves in
+    a direction the convergence rules treat as route loss there is nothing to
+    check it against. This is that second witness.
+
+    It is deliberately a *gauge* and not a counter. `Import updates accepted`
+    -- what neighbors_state() reads -- only ever rises, so it cannot witness a
+    loss at all, which is why the counters already on the queue were not
+    enough. `Routes:` is a gauge of the table as it stands.
+
+    `best_paths` sums each peering\'s `preferred`: one best route per prefix,
+    so it is the count of distinct prefixes the target holds, which is the
+    quantity the monitor\'s `accepted` is supposed to track.
+    `imported_paths` sums `imported`: every path held, losers included, so it
+    moves with delivery rather than with selection -- the two separate an
+    overshoot in selection from routes actually going away.
+    `exported_to_monitor` is what the target believes it has sent the monitor,
+    read off the monitor\'s own session, and is the closest thing there is to
+    the monitor\'s own number measured at the other end of the same session.
+
+    A sum is published only when every peering the *run configured* contributed
+    to it, on tester_offering()\'s rule: a channel that is DOWN prints no
+    `Routes:` line at all, so a session still coming up would drop out of a
+    total that still claims to cover it -- a partial read that looks exactly
+    like a table shrinking, which is the one thing this witness exists to rule
+    on.
+
+    `expected_peerings` is that configured count, and comparing against the
+    protocols BIRD is *showing* instead would be vacuous here.
+    `BIRDTarget.DYNAMIC_NEIGHBORS` is True, so a peer that has not connected is
+    not a protocol at all and one whose session drops takes its `dynbgp`
+    protocol away with it: the denominator would shrink with the numerator and
+    the guard would always be satisfied, so a flapping tester would publish a
+    `best_paths` decline of exactly the shape real route loss has. Omitting it
+    withholds the sums rather than falling back to that -- a guard that quietly
+    weakens is worse than one that refuses. `peerings`, `peerings_expected` and
+    `peerings_measured` are all published, so a reader can see what was
+    compared.
+    '''
+    protocols = parse_protocols(text)
+    # A `neighbor range` template is a listener rather than a peering; it holds
+    # no routes and stays Passive for the whole run.
+    bgp = {name: p for name, p in protocols.items()
+           if p['proto'] == 'BGP' and p['neighbor_range'] is None}
+
+    best_total = imported_total = 0
+    measured = 0
+    exported_to_monitor = None
+    for p in bgp.values():
+        c = p['channels'].get(channel)
+        routes = (c or {}).get('routes') or {}
+        if 'preferred' in routes and 'imported' in routes:
+            measured += 1
+            best_total += routes['preferred']
+            imported_total += routes['imported']
+        if monitor_address and p['neighbor_address'] == monitor_address:
+            exported_to_monitor = routes.get('exported')
+
+    complete = expected_peerings is not None and measured == expected_peerings
+    return {
+        'peerings': len(bgp),
+        'peerings_expected': expected_peerings,
+        'peerings_measured': measured,
+        'best_paths': best_total if complete else None,
+        'imported_paths': imported_total if complete else None,
+        'exported_to_monitor': exported_to_monitor,
+    }
+
+
+def tester_offering(text, channel='ipv4'):
+    '''What a BIRD load generator has offered its peer, from its own CLI.
+
+    `offered` is the cumulative count of export updates BIRD accepted for the
+    session -- the generator\'s own account of what it put on the wire, which is
+    the point: it is measured at the tester, independently of what the monitor
+    later sees. `configured` is the size of the static table it was given, so
+    expected and observed workload can be compared without trusting the config.
+
+    Returns counts of None when the evidence is not present rather than 0, so a
+    parse that found nothing cannot be mistaken for a generator that sent
+    nothing.
+    '''
+    protocols = parse_protocols(text)
+
+    # A `neighbor range` template is a listener, not a peering: it stays
+    # Passive for the whole run, so counting it would mean a generator using
+    # dynamic neighbors never reported itself ready. Sessions that have not
+    # come up yet are still counted -- BIRD prints `Neighbor address` for those
+    # too -- because dropping them is how a slow peer gets hidden.
+    bgp = {name: p for name, p in protocols.items()
+           if p['proto'] == 'BGP' and p['neighbor_range'] is None}
+    # A sum is published only when every session contributed to it. A channel
+    # that is DOWN prints no `Routes:` and no route-change stats at all, so a
+    # peer still coming up would otherwise drop out of the numerator while the
+    # caller's `expected` still covers it -- a failed read that looks exactly
+    # like a generator falling behind. `sessions_measured` says how many
+    # answered, so a partial read stays visible instead of averaging away.
+    offered_total = exported_total = 0
+    offered_seen = exported_seen = 0
+    tx_pending = None
+    pending_prefixes = None
+    for p in bgp.values():
+        # Session-level, so it is read before the channel guard: a session that
+        # reports a queue depth but whose channel block could not be read is
+        # still a session we have blocked-write evidence for.
+        if p['tx_pending_bytes'] is not None:
+            tx_pending = p['tx_pending_bytes'] if tx_pending is None \
+                else tx_pending + p['tx_pending_bytes']
+        c = p['channels'].get(channel)
+        if c is None:
+            continue
+        accepted = c['stats'].get('Export updates', {}).get('accepted')
+        if accepted is not None:
+            offered_seen += 1
+            offered_total += accepted
+        if 'exported' in c['routes']:
+            exported_seen += 1
+            exported_total += c['routes']['exported']
+        if c['pending_prefixes'] is not None:
+            pending_prefixes = c['pending_prefixes'] if pending_prefixes is None \
+                else pending_prefixes + c['pending_prefixes']
+
+    offered = offered_total if bgp and offered_seen == len(bgp) else None
+    exported = exported_total if bgp and exported_seen == len(bgp) else None
+
+    statics = [p for p in protocols.values() if p['proto'] == 'Static']
+    loaded = [p['channels'].get(channel, {}).get('routes', {}).get('imported')
+              for p in statics]
+    loaded = [count for count in loaded if count is not None]
+    configured = sum(loaded) if statics and len(loaded) == len(statics) else None
+
+    return {
+        # Every BGP session this generator runs must be up. One established
+        # session out of two is not a generator that is ready to send.
+        'established': bool(bgp) and all(
+            p['bgp_state'] == 'Established' for p in bgp.values()),
+        'sessions': len(bgp),
+        'sessions_measured': offered_seen,
+        'offered': offered,
+        'exported': exported,
+        'configured': configured,
+        'tx_pending_bytes': tx_pending,
+        'pending_prefixes': pending_prefixes,
+    }
+
 
 class BIRD(Container):
 
@@ -89,8 +551,55 @@ class BIRDTarget(BIRD, Target):
     CONTAINER_NAME = 'bgperf_bird_target'
     CONFIG_FILE_NAME = 'bird.conf'
     DYNAMIC_NEIGHBORS = True
+    SUPPORTS_POLICY_RELOAD = True
+    POLICY_RELOAD_MECHANISM = 'birdc configure'
+    # Verified on bgperf/bird:2.19.2 and bgperf/bird:3.3.2, two peers each: the
+    # sessions' `Since` is unchanged across the reconfigure and both stay
+    # Established, so this belongs in the session-preserving comparison. What
+    # it is *not* is a purely local re-evaluation: both series answer a changed
+    # import filter by asking their peers for a route refresh -- each
+    # generator's `Export updates` doubled -- so the interval covers re-import
+    # as well as re-decision. That is what an operator changing policy on BIRD
+    # actually pays, and it is recorded rather than hidden.
+    POLICY_RELOAD_SESSION_PRESERVING = True
 
-    def write_config(self):
+    def policy_reload(self, reject_peer_asns):
+        """Reject these peers' routes on import, and re-read the config.
+
+        The config file is rewritten whole rather than patched: it is generated
+        from the scenario every run, so writing it again with the filter in it
+        is the same code path that produced the one BIRD is already running,
+        and there is no second renderer to drift.
+        """
+        self.write_config(reject_peer_asns=reject_peer_asns)
+        output = self.local('birdc configure').decode('utf-8', 'replace')
+        return policy_reload_failure(output)
+
+    def import_filter_clause(self, reject_peer_asns=None):
+        '''What a session's `import` says, in one place rather than two.
+
+        Both config paths read it -- the dynamic `neighbor range` protocol that
+        every BIRD target actually runs, and the per-neighbour one behind
+        `DYNAMIC_NEIGHBORS = False`. Nothing sets that today and the
+        per-neighbour path does not currently run at all (its format string
+        mixes manual and automatic field numbering and raises), so this serves
+        one live caller and one dormant one; it is written for both so that
+        fixing the dormant path does not also mean remembering this.
+
+        A policy reload and `--filter_test` are refused together at every entry
+        point -- the target's import filter is the policy under test, and a
+        reload that replaced it would change two things at once -- so this
+        never has to compose them. It takes the reload first all the same: if
+        that refusal is ever lifted, a run whose config quietly dropped the
+        reload it recorded would be the worse of the two failures.
+        '''
+        if reject_peer_asns:
+            return 'filter {0}'.format(POLICY_RELOAD_FILTER)
+        if 'filter_test' in self.conf:
+            return 'filter {0}'.format(self.conf['filter_test'])
+        return 'all'
+
+    def write_config(self, reject_peer_asns=None):
         # BIRD 3 is the multi-threaded rewrite, but it starts a single worker
         # unless told otherwise -- benchmarked without this it looks like 2.x.
         # BIRD 2 parses the keyword and ignores it, so a shared batch config
@@ -127,9 +636,7 @@ export all;
 '''
 
         def gen_neighbor_config(n):
-            filter = 'all'
-            if 'filter_test' in self.conf:
-                filter = f"filter {self.conf['filter_test']}"
+            filter = self.import_filter_clause(reject_peer_asns)
             return ('''ipv4 table table_{0};
 protocol pipe pipe_{0} {{
     table master4;
@@ -202,6 +709,10 @@ return true;
             f.write(config)
             if 'filter_test' in self.conf:
                 f.write(self.get_filter_test_config())
+            # Written only for a reload, so a run that asked for none renders
+            # exactly the config it always has -- the same rule the churn
+            # protocol and the diversity block follow.
+            f.write(policy_reload_filter_config(reject_peer_asns))
 
             if 'policy' in self.scenario_global_conf:
                 for k, v in self.scenario_global_conf['policy'].items():
@@ -219,19 +730,17 @@ return true;
                         match_info.append((match['type'], n))
                     f.write(gen_filter(k, match_info))
             if self.DYNAMIC_NEIGHBORS:
-                config = self.get_dynamic_neighbor_config()
+                config = self.get_dynamic_neighbor_config(reject_peer_asns)
                 f.write(config)
                 f.flush()
 
             else:
-                for n in sorted(list(flatten(list(t.get('neighbors', {}).values()) for t in self.scenario_global_conf['testers'])) + [self.scenario_global_conf['monitor']], key=lambda n: n['as']):
+                for n in self.scenario_neighbors():
                     f.write(gen_neighbor_config(n))
 
             
-    def get_dynamic_neighbor_config(self):
-        filter = 'all'
-        if 'filter_test' in self.conf:
-            filter = f"filter {self.conf['filter_test']}"
+    def get_dynamic_neighbor_config(self, reject_peer_asns=None):
+        filter = self.import_filter_clause(reject_peer_asns)
         config = '''protocol bgp everything {{
     local as {};
     neighbor range 10.0.0.0/8 external;
@@ -258,20 +767,44 @@ return true;
             guest_dir=self.guest_dir,
             config_file_name=self.CONFIG_FILE_NAME)
 
+    # On the target rather than on `BIRD`, which `BIRDTester` also inherits: a
+    # generator is never asked this, and a flag that claimed otherwise would be
+    # a capability nothing reads and nothing tests.
+    REPORTS_TABLE_WITNESS = True
+
+    def show_protocols(self):
+        '''One `birdc show protocols all` read.
+
+        Kept apart from the parsers so a single CLI read can serve both the
+        per-neighbour counters and the table witness. Two reads would be two
+        execs a second into the very container being measured, and -- worse for
+        a witness whose only job is to be compared against another number --
+        they would describe two different instants.
+        '''
+        return self.local("birdc 'show protocols all'").decode('utf-8')
+
     def get_neighbors_state(self):
-        neighbors_accepted = {}
-        neighbors_received = {}
-        neighbor_received_output = self.local("birdc 'show protocols all'").decode('utf-8')
-        
-        with open(REPO_ROOT / 'bird.tfsm') as template:
-            fsm = textfsm.TextFSM(template)
-            result = fsm.ParseText(neighbor_received_output)
+        '''Prefixes each neighbor has sent, from the target's own counters.
 
-        for r in result:
-            if r[0] == '' :
-                continue
-            else:
-                neighbors_accepted[r[0]] = int(r[2]) if r[2] != '' else 0
-                neighbors_received[r[0]] = int(r[1]) if r[1] != '' else 0
+        The parsing is `neighbors_state()`, which is pure over the CLI text;
+        this is the one call that talks to the container.
+        '''
+        return neighbors_state(self.show_protocols())
 
-        return neighbors_received, neighbors_accepted
+    def sample_target_state(self):
+        '''The neighbour verdicts and the table gauge, off one CLI read.
+
+        Both halves describe the same instant, which is the point: the witness
+        exists to be read beside the counters and beside one monitor poll.
+        '''
+        output = self.show_protocols()
+        received, accepted = neighbors_state(output)
+        full, checked = self.classify_neighbor_counts(received, accepted)
+        return full, checked, table_witness(
+            output, self.monitor_neighbor_address(),
+            # Every session the scenario configured -- generators, monitor and
+            # receivers alike -- because BIRD spawns one protocol per connected
+            # peer here, so the count of protocols it shows is not the count of
+            # sessions the run is supposed to have. `sort=False` because only
+            # the length is wanted and the ordering costs a sort per poll.
+            expected_peerings=len(self.scenario_neighbors(sort=False)))

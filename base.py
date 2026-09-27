@@ -15,9 +15,12 @@
 
 from settings import dckr
 import glob
+import hashlib
 import io
+import json
 import os
 import re
+from docker.utils import version_gte
 from itertools import chain
 from pathlib import Path
 from threading import Thread
@@ -27,8 +30,10 @@ import time
 import datetime
 from jinja2 import Environment, FileSystemLoader, PackageLoader, StrictUndefined, make_logging_undefined
 
+from measurements import offering_poll_can_stop
 
-# Resource files (filters/, nos_templates/, bird.tfsm) live next to the source,
+
+# Resource files (filters/, nos_templates/) live next to the source,
 # so anchor them to the source directory rather than the working directory.
 # Without this, bgperf2 can only be run from the repo root.
 REPO_ROOT = Path(__file__).resolve().parent
@@ -53,7 +58,28 @@ def normalize_image_name(name):
     return name if ':' in name.rsplit('/', 1)[-1] else name + ':latest'
 
 
-def img_exists(name):
+def _find_image(name, images=None):
+    '''The local image dict carrying exactly this repository:tag, or None.
+
+    The one scan img_exists() and img_recipe_label() both need -- kept in one
+    place so a future fix to the matching itself (this already replaced one
+    bug, comparing only RepoTags[0]) cannot be made in one and not the other.
+
+    `images` takes a pre-fetched dckr.images() listing, for a caller (doctor,
+    images) about to ask this question many times in one command -- each
+    dckr.images() call is a full local-image listing, and asking it once per
+    daemon per version otherwise turns one health check into dozens of Docker
+    API round trips. Fetched fresh here when omitted, as every caller before
+    this parameter existed already got.
+    '''
+    name = normalize_image_name(name)
+    for img in (dckr.images() if images is None else images):
+        if name in (img.get('RepoTags') or []):
+            return img
+    return None
+
+
+def img_exists(name, images=None):
     '''True if a local image carries exactly this repository:tag.
 
     This used to compare only the repository half of RepoTags[0], so
@@ -62,11 +88,60 @@ def img_exists(name):
     builds had to fake them with path-like names ('bgperf/frr_c/stable_8').
     Reading every RepoTag also fixes images that carry more than one tag.
     '''
-    name = normalize_image_name(name)
-    for img in dckr.images():
-        if name in (img.get('RepoTags') or []):
-            return True
-    return False
+    return _find_image(name, images) is not None
+
+
+# `prepare`/`build_dockerfile()` skip a tag that already exists, so a recipe
+# changed after that point -- a new apt package, a fixed ENTRYPOINT, a
+# resolve_ref() that now maps a version to a different checkout -- is
+# invisible until someone thinks to force a rebuild. That has happened three
+# times over (FRR's gcov flags, exabgp/bgpdump2's base image and autoreconf)
+# and each was closed by a hand-written, date-stamped paragraph telling the
+# operator to rebuild -- exactly the kind of prose this label replaces with
+# something checkable.
+#
+# It is not a substitute for PULL_BASE: OpenBGPD's `FROM openbgpd/openbgpd:
+# latest` is the same text before and after upstream republishes new content
+# under that tag, so the rendered recipe -- and this hash -- do not change
+# when only the *content behind a moving tag* drifts. That is what pulls_base()
+# forces a fresh `pull` for; this label answers a different question, whether
+# the recipe bgperf2 owns has moved on since the image was built.
+RECIPE_LABEL_KEY = 'bgperf2.recipe_hash'
+
+
+def recipe_hash(dockerfile_text, buildargs=None):
+    '''A short content hash of a rendered Dockerfile plus its buildargs.
+
+    Hashed rather than written into the image as a `LABEL` line in the
+    Dockerfile text itself, so the hash plays no part in what it is a hash
+    of -- passed to `docker build` as an image label instead, which is read
+    back by img_recipe_label().
+
+    `buildargs` matters for an override Dockerfile (dockerfile_override()):
+    its text is the same for every version routed through it, and only
+    BGPERF_REF/BGPERF_VERSION -- passed as buildargs, not baked into the
+    file -- vary per version. Hashing the text alone would be blind to a
+    resolve_ref() change for any such version, exactly the "recipe changed"
+    case this mechanism exists to catch.
+    '''
+    # A structured encoding of the pair, not a bare concatenation -- text
+    # plus buildargs with no delimiter between them could in principle be
+    # split two different ways to the same string.
+    fingerprint = json.dumps([dockerfile_text, buildargs or {}], sort_keys=True)
+    return hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:12]
+
+
+def img_recipe_label(name, images=None):
+    '''The recipe hash a local image was built with, or None.
+
+    None covers two cases that must read the same way to a caller: the tag
+    does not exist, or it was built before this label existed. Either way
+    there is nothing to compare against, which is the same shape as
+    bgpdump2's "commit unknown" for a pruned clone -- said explicitly rather
+    than guessed. See _find_image() for `images`.
+    '''
+    img = _find_image(name, images)
+    return (img.get('Labels') or {}).get(RECIPE_LABEL_KEY) if img else None
 
 
 def sanitize_tag(version):
@@ -78,6 +153,12 @@ def sanitize_tag(version):
     '''
     tag = re.sub(r'[^A-Za-z0-9_.-]', '_', str(version).strip())
     return tag.lstrip('.-')[:128] or 'latest'
+
+
+# Sentinel for an optional parameter whose real values include None --
+# render_dockerfile()'s `_override` is None both when unset and when a
+# version genuinely has no override file, and those must not be confused.
+_UNSET = object()
 
 
 class _RenderOnly:
@@ -287,10 +368,20 @@ class Container(object):
             ' using {0}'.format(override.relative_to(REPO_ROOT)) if override is not None else ''))
         if override is not None:
             cls.build_dockerfile(override.read_text(), force, tag, nocache=nocache,
-                                 buildargs={'BGPERF_REF': ref, 'BGPERF_VERSION': str(version)})
+                                 buildargs=cls.override_buildargs(version))
         else:
             cls.build_image(force=force, tag=tag, checkout=ref, nocache=nocache, version=version)
         return tag
+
+    @classmethod
+    def override_buildargs(cls, version):
+        '''The buildargs an override Dockerfile is built with for this version.
+
+        Shared by build_version() (which builds it) and current_recipe_hash()
+        (which has to fingerprint the identical shape) so the two cannot
+        drift apart from each other.
+        '''
+        return {'BGPERF_REF': cls.resolve_ref(version), 'BGPERF_VERSION': str(version)}
 
     @classmethod
     def require_image(cls, version=None):
@@ -305,13 +396,16 @@ class Container(object):
         return tag
 
     @classmethod
-    def built_versions(cls):
-        '''Version tags of this daemon that exist locally, for `doctor`.'''
+    def built_versions(cls, images=None):
+        '''Version tags of this daemon that exist locally, for `doctor`.
+
+        See _find_image() for `images`.
+        '''
         if cls.IMAGE_REPO is None:
             return []
         prefix = cls.IMAGE_REPO + ':'
         tags = set()
-        for img in dckr.images():
+        for img in (dckr.images() if images is None else images):
             for repo_tag in img.get('RepoTags') or []:
                 if repo_tag.startswith(prefix):
                     tags.add(repo_tag[len(prefix):])
@@ -348,13 +442,21 @@ class Container(object):
         cls.build_dockerfile(cls.dockerfile, force, tag, nocache=nocache, buildargs=buildargs)
 
     @classmethod
-    def render_dockerfile(cls, version=None):
+    def render_dockerfile(cls, version=None, _override=_UNSET):
         '''The Dockerfile a version would build, without building it.
 
         Debugging a failed build by running it is a compile-length round trip
         per attempt, so let the recipe be read directly instead.
+
+        `_override` lets a caller that has already resolved
+        dockerfile_override() (current_recipe_hash(), which also needs it to
+        decide the buildargs) pass it straight in rather than probing the
+        filesystem for the same version a second time; every other caller
+        leaves it unset and this resolves it itself as before. A sentinel,
+        not None -- a version with no override resolves to None too, and
+        that is a real answer this must not re-probe for.
         '''
-        override = cls.dockerfile_override(version)
+        override = cls.dockerfile_override(version) if _override is _UNSET else _override
         if override is not None:
             return override.read_text()
         _RenderOnly.active = True
@@ -364,6 +466,38 @@ class Container(object):
         finally:
             _RenderOnly.active = False
         return cls.dockerfile
+
+    @classmethod
+    def current_recipe_hash(cls, version=None):
+        '''The hash a build of this version would carry right now.
+
+        Mirrors build_version() via override_buildargs(): an override
+        Dockerfile is built with BGPERF_REF/BGPERF_VERSION as buildargs,
+        which have to be part of the fingerprint the same way
+        build_dockerfile() folds them in at build time, or a resolve_ref()
+        change for a version routed through an override would leave this
+        hash unchanged.
+        '''
+        override = cls.dockerfile_override(version)
+        buildargs = cls.override_buildargs(version) if override is not None else None
+        return recipe_hash(cls.render_dockerfile(version, _override=override), buildargs)
+
+    @classmethod
+    def recipe_status(cls, version=None, images=None):
+        '''('ok' | 'stale' | 'unknown', current_hash) for a built tag.
+
+        Only meaningful once the tag is known to exist -- an unbuilt tag has
+        no label to compare and callers check built_versions()/img_exists()
+        first. 'unknown' is what an image built before this label existed
+        reports, on purpose: that is not the same claim as 'ok', and treating
+        it as one would call an unrebuildable image current. See
+        _find_image() for `images`.
+        '''
+        current = cls.current_recipe_hash(version)
+        stored = img_recipe_label(cls.image_tag(version), images)
+        if stored is None:
+            return 'unknown', current
+        return ('ok' if stored == current else 'stale'), current
 
     @classmethod
     def build_dockerfile(cls, dockerfile, force, tag, nocache=False, buildargs=None):
@@ -395,9 +529,26 @@ class Container(object):
         f = io.BytesIO(dockerfile.encode('utf-8'))
         if force or not img_exists(tag):
             print('build {0}...'.format(tag))
+            # Hashed before the proxy ENV line above was spliced in, so an
+            # operator's http_proxy/https_proxy cannot change the hash and
+            # manufacture staleness that has nothing to do with the recipe.
+            # buildargs is folded in too -- current_recipe_hash() mirrors
+            # this exactly so an override Dockerfile's BGPERF_REF is
+            # covered. Computed only here, not above: `prepare` re-asks this
+            # for every already-built tag it plans to skip, and hashing a
+            # multi-hundred-line rendered Dockerfile just to throw the
+            # result away is pure waste on that path.
+            label_hash = recipe_hash(cls.dockerfile, buildargs)
+            build_kwargs = dict(fileobj=f, rm=False, tag=tag, decode=True, nocache=nocache,
+                                pull=cls.pulls_base(tag), buildargs=buildargs or {})
+            # docker-py raises InvalidVersion for `labels` below API 1.23
+            # (~Engine 1.11), older than the 1.9.0 doctor()'s own version
+            # check still accepts -- the label is an enhancement, not
+            # something a build on an old daemon should fail over.
+            if version_gte(dckr.api_version, '1.23'):
+                build_kwargs['labels'] = {RECIPE_LABEL_KEY: label_hash}
             error = None
-            for line in dckr.build(fileobj=f, rm=False, tag=tag, decode=True, nocache=nocache,
-                                   pull=cls.pulls_base(tag), buildargs=buildargs or {}):
+            for line in dckr.build(**build_kwargs):
                 if 'stream' in line:
                     print(line['stream'].strip())
 
@@ -536,14 +687,82 @@ class Container(object):
         t.daemon = True
         t.start()
 
+    # How many consecutive failed reads before the sampler says so a second
+    # time. The first is always reported; after that a target that is simply
+    # unreachable would otherwise write a line a second for the rest of the run.
+    NEIGHBOR_SAMPLE_REPORT_EVERY = 60
+
+    # Class attributes so they exist on every Container however it was built --
+    # `+=` rebinds onto the instance, so nothing is shared. A run reads these to
+    # say whether the neighbour evidence it converged on was complete.
+    neighbor_sample_failures = 0
+    neighbor_sample_consecutive_failures = 0
+    neighbor_sample_last_error = None
+
     def neighbor_stats(self, queue):
         def stats():
             while True:
                 if self.stop_monitoring:
                     return
-                neighbors_received_full, neighbors_checked = self.get_neighbor_received_routes()
-                queue.put({'who': self.name, 'neighbors_checked': neighbors_checked})
-                queue.put({'who': self.name, 'neighbors_received_full': neighbors_received_full})
+                try:
+                    # Stamped before the read, on the rule both poll loops
+                    # already follow: a sample dated to when its read finished
+                    # is dated late by the cost of a docker exec, and this one
+                    # is compared against a monitor sample stamped the same way.
+                    sampled_s = time.monotonic()
+                    neighbors_received_full, neighbors_checked, witness = \
+                        self.sample_target_state()
+                    # The witness rides on the neighbours message rather than
+                    # travelling as one of its own: bench()'s dispatch reads any
+                    # message from this producer carrying neither neighbour key
+                    # as a cpu/mem sample, so a third shape would be read as one.
+                    queue.put({'who': self.name,
+                               'neighbors_checked': neighbors_checked,
+                               'table_witness': witness,
+                               'monotonic_s': sampled_s})
+                    queue.put({'who': self.name,
+                               'neighbors_received_full': neighbors_received_full})
+                    self.neighbor_sample_consecutive_failures = 0
+                except Exception as exc:
+                    # This loop used to have no guard at all, and one bad read
+                    # ended the thread for the rest of the run -- silently.
+                    # What that costs is not a missing sample: `neighbors_checked`
+                    # freezes at its last value and `note_neighbors_checkpoint()`
+                    # never fires. That used to cost the whole convergence
+                    # verdict, because the CONVERGED gate *required* that
+                    # checkpoint -- so the run had no terminating path except
+                    # STUCK_SAMPLES and was published FAILED with a complete,
+                    # stable table in hand. Measured: the 2026-timing-validation
+                    # campaign's `rustybgp default` cell at 50 x 100,000 burned
+                    # 2194s that way while the target held all 5,000,000 routes
+                    # and the monitor had every one of them.
+                    #
+                    # The gate now takes either checkpoint (see
+                    # `docs/invariants/convergence.md`), so a frozen counter
+                    # costs the full assurance window instead of the run. It is
+                    # still worth avoiding: that window is 20 samples rather
+                    # than 5, and the run is decided on one account of itself
+                    # rather than two, which it has to publish.
+                    #
+                    # So the thread survives the read, and -- the other half of
+                    # the same lesson -- it is never quiet about it. A sampler
+                    # that fails every time still produces no checkpoint, and
+                    # the only thing that distinguishes that run from a slow
+                    # daemon is this saying so.
+                    self.neighbor_sample_failures += 1
+                    self.neighbor_sample_consecutive_failures += 1
+                    self.neighbor_sample_last_error = '{0}: {1}'.format(
+                        type(exc).__name__, exc)
+                    if (self.neighbor_sample_consecutive_failures == 1
+                            or self.neighbor_sample_consecutive_failures
+                            % self.NEIGHBOR_SAMPLE_REPORT_EVERY == 0):
+                        print('WARNING: {0}: neighbour sample failed '
+                              '({1} consecutive, {2} total): {3}'.format(
+                                  self.name,
+                                  self.neighbor_sample_consecutive_failures,
+                                  self.neighbor_sample_failures,
+                                  self.neighbor_sample_last_error),
+                              file=sys.stderr, flush=True)
                 time.sleep(1)
 
         t = Thread(target=stats)
@@ -640,12 +859,59 @@ class Container(object):
                 neighbors_checked[n] = False
         return tester_count, neighbors_checked
 
+    # Whether this daemon can be asked for a gauge of the table it holds. Read
+    # so that a target that *can* answer and did not -- a poll thread that died
+    # on its first read, a run that converged before the first target poll --
+    # is reported by name instead of producing an artifact byte-identical to a
+    # daemon that was never able to answer. Same rule as the export section's
+    # `unmeasured_reason`: absent is what an older build wrote, so silence
+    # cannot be told from a build that took no such measurement.
+    REPORTS_TABLE_WITNESS = False
+
+    def get_table_witness(self):
+        '''The target's own account of the table it holds, or None.
+
+        None means the daemon has no gauge this project knows how to read, and
+        that absence is recorded rather than filled in with a zero: a target
+        that could not be asked and a target holding nothing must not produce
+        the same document.
+
+        Two daemons answer, and they answer with different halves. BIRD
+        publishes all three sums. FRR publishes `exported_to_monitor` and
+        `imported_paths` and withholds `best_paths` deliberately -- see
+        `frr.table_witness()` -- so it cross-checks the two ends of the
+        monitor's session and bounds the table's size without attesting to
+        anything the convergence rule reads, which is `best_paths` alone. A
+        daemon that answers partially is not a daemon that answers wrongly;
+        each key stands or falls on its own.
+        '''
+        return None
+
+    def sample_target_state(self):
+        '''One sample of everything the target can be asked about itself.
+
+        One call rather than two so a daemon that can answer both from a single
+        CLI read -- BIRD does -- is not made to exec twice a second into the
+        container it is measuring, and so the two halves describe one instant.
+        '''
+        neighbors_received_full, neighbors_checked = \
+            self.get_neighbor_received_routes()
+        return neighbors_received_full, neighbors_checked, self.get_table_witness()
+
     def get_neighbor_received_routes(self):
         ## if we ccall this before the daemon starts we will not get output
-        
+        neighbors_received, neighbors_accepted = self.get_neighbors_state()
+        return self.classify_neighbor_counts(neighbors_received,
+                                             neighbors_accepted)
+
+    def classify_neighbor_counts(self, neighbors_received, neighbors_accepted):
+        '''Turn per-neighbour counts into the two all-sent verdicts.
+
+        Split from the CLI read so a daemon that reads its counters and its
+        table gauge out of one command can reuse it.
+        '''
         tester_count, neighbors_checked = self.get_test_counts()
         neighbors_received_full = neighbors_checked.copy()
-        neighbors_received, neighbors_accepted = self.get_neighbors_state()
         for n in neighbors_accepted.keys():
 
             #this will include the monitor, we don't want to check that
@@ -664,6 +930,76 @@ class Container(object):
 class Target(Container):
 
     CONFIG_FILE_NAME = None
+
+    # Set by a target that can be told to re-evaluate its import policy
+    # against the table it already holds, without resetting its sessions.
+    # Only BIRD can so far: the mechanism is that daemon's own reconfigure
+    # command over the config file bgperf2 wrote, so there is nothing generic
+    # to fall back on -- which is why a policy reload is refused for every
+    # other target at every entry point rather than discovered here, once the
+    # run has already converged.
+    SUPPORTS_POLICY_RELOAD = False
+
+    # What the reload is carried out with, and whether it holds the BGP
+    # sessions up. Both are recorded in the artifact rather than assumed: a
+    # reload that resets its sessions measures a second table delivery and
+    # belongs in a different comparison from one that does not, and a reader
+    # cannot tell which they have without being told.
+    POLICY_RELOAD_MECHANISM = None
+    POLICY_RELOAD_SESSION_PRESERVING = None
+
+    def policy_reload(self, reject_peer_asns):
+        """Install an import policy rejecting these peers and apply it.
+
+        Returns the daemon's own reply where it did not report the change
+        carried out, and None where it did. A reload nobody performed has no
+        symptom except the monitor's count not moving, which arrives as a stall
+        minutes later and reads as a stuck target -- the same reason
+        `Tester.churn()` reports its failures rather than raising.
+        """
+        raise NotImplementedError()
+
+    def scenario_neighbors(self, sort=True):
+        """Every BGP session this target is configured with.
+
+        Three kinds, and this is the one place that knows there are three: the
+        generators' peers, the monitor, and the export-fan-out receivers. Eight
+        target modules built this list independently before receivers existed,
+        each of them `flatten(testers) + [monitor]`, and a receiver added to
+        seven of them is a target that quietly exports to fewer sessions than
+        the run says it does -- with nothing in the row, the artifact or the
+        graph to show for it.
+
+        Receivers are deliberately *not* in `conf['testers']`. That is what
+        keeps them from being route sources: `get_test_counts()` reads the
+        testers, so a receiver is never waited on for a full table it will
+        never send, and the monitor's check-point and the ingress accounting
+        are untouched by how many of them there are.
+
+        `sort=False` for the two callers that never sorted -- ordering is
+        cosmetic in a config file, and changing it would put an unrelated diff
+        in front of anyone comparing a generated config against an older run's.
+        """
+        conf = self.scenario_global_conf
+        neighbors = list(flatten(list(t.get('neighbors', {}).values())
+                                 for t in conf['testers']))
+        neighbors.append(conf['monitor'])
+        neighbors.extend(conf.get('receivers') or [])
+        if not sort:
+            return neighbors
+        return sorted(neighbors, key=lambda n: n['as'])
+
+    def monitor_neighbor_address(self):
+        '''The address this target peers with the monitor on, or None.
+
+        The monitor's `local-address` is, from the target's side, the monitor's
+        neighbour address. Scenario addresses carry a prefix length and BIRD
+        prints the bare address, so it is stripped here rather than at each
+        reader.
+        '''
+        monitor = (self.scenario_global_conf or {}).get('monitor') or {}
+        address = monitor.get('local-address')
+        return address.split('/')[0] if address else None
 
     def write_config(self):
         raise NotImplementedError()
@@ -698,6 +1034,29 @@ class Target(Container):
 class Tester(Container):
 
     CONTAINER_NAME_PREFIX = None
+    # Set by a generator that can be asked what it has put on the wire.
+    # bench() polls only those; a generator that cannot answer records its
+    # injection interval as unavailable rather than having one inferred from
+    # the monitor, which would measure the target and call it the tester.
+    REPORTS_OFFERING = False
+
+    # Set by a generator that can be told to withdraw and re-announce a bounded
+    # block of what it offers, which is what a churn burst is. Only the
+    # synthetic BIRD generator can: it is configured from prefixes bgperf2
+    # generated, so a block of them can be put in a protocol of its own and
+    # switched off. An MRT injector plays a file back once and has no such
+    # handle, which is why churn is refused for one at every entry point rather
+    # than discovered here.
+    SUPPORTS_CHURN = False
+
+    def churn(self, action):
+        '''Withdraw or re-announce this generator's churn block.
+
+        Returns the sessions whose reply did not say the command was carried
+        out, so a burst that was never issued fails the sequence immediately
+        instead of being found as a stall five minutes later.
+        '''
+        raise NotImplementedError()
 
     def __init__(self, name, host_dir, conf, image):
         Container.__init__(self, self.CONTAINER_NAME_PREFIX + name, image, host_dir, self.GUEST_DIR, conf)
@@ -711,6 +1070,98 @@ class Tester(Container):
 
     def configure_neighbors(self, target_conf):
         raise NotImplementedError()
+
+    def get_offerings(self):
+        '''One measurements.TesterOffering per configured peer, keyed by
+        session name.
+
+        Every configured peer must appear in every poll, with offered=None
+        where the read failed: TesterEventRecorder rejects a poll whose session
+        keys differ from the first one, because a peer that quietly dropped out
+        would let the peers that remain satisfy 'the whole table was offered'.
+        '''
+        raise NotImplementedError()
+
+    def offering_stats(self, queue, stop, interval=1):
+        '''Poll this generator's own counters into the run's stats queue.
+
+        `stop` is the controller's stop Event rather than a sleep, for the
+        reason the other samplers use it: batch() runs every cell in this
+        process, so a poll loop that outlives its run keeps exec'ing into
+        containers for every later cell and becomes contention the benchmark
+        then reports as someone else's.
+
+        The loop also ends itself once the generator has reported the whole
+        workload offered -- see measurements.offering_poll_can_stop() for what
+        that requires and why nothing observable is lost by stopping there.
+        '''
+        def poll():
+            while not stop.is_set() and not self.stop_monitoring:
+                # Stamped before the read, not after. One poll is a single exec
+                # running a `birdc` per peer, which at 50-100 peers takes long
+                # enough to matter: timestamping on return would date every
+                # counter to when the read *finished* and silently inflate
+                # tester_startup_s by up to a whole read, while each event still
+                # claims the nominal cadence. Before the read is a lower bound
+                # on when the counters were true, which is the honest end of the
+                # interval to report.
+                sampled_at = time.monotonic()
+                try:
+                    sessions = self.get_offerings()
+                except Exception as e:
+                    # A poll that could not be read is missing evidence, not a
+                    # reason to end a run that is otherwise producing a result --
+                    # but it has to be *said*. Swallowing it silently leaves an
+                    # artifact whose null injection interval cannot be told
+                    # apart from a generator that was read fine and never
+                    # finished, which is the one ambiguity this section exists
+                    # to remove.
+                    queue.put({'who': self.name,
+                               'tester_offering_error': repr(e),
+                               'monotonic_s': sampled_at,
+                               'time': datetime.datetime.now()})
+                    sessions = None
+                if sessions:
+                    queue.put({'who': self.name,
+                               'tester_offering': sessions,
+                               'monotonic_s': sampled_at,
+                               'time': datetime.datetime.now()})
+                    # A generator that has finished has nothing further to
+                    # say, and asking it anyway is the instrument charging the
+                    # run for its own overhead: one poll of a BIRD tester is a
+                    # `docker exec` running a `birdc` per configured peer, so a
+                    # 50-100 peer run keeps spawning that many short-lived
+                    # processes a second until the monitor converges. `birdc`
+                    # is in contention.BGPERF_PROCESSES, which means it is the
+                    # one load `max foreign cpu %` deliberately cannot see.
+                    #
+                    # The sample above is queued first: the poll that ends the
+                    # loop is the poll that carries the completion evidence.
+                    if offering_poll_can_stop(sessions):
+                        return
+                # Wait to a deadline measured from the sample, not a fixed
+                # interval piled on top of the read. The read is the expensive
+                # half -- one exec running a birdc per peer -- so sleeping a
+                # whole `interval` after it makes the achieved cadence
+                # `read + interval` while every event still claims the nominal
+                # one, and that claim is exactly what qualifies an injection of
+                # 0.0s as unresolved rather than instant.
+                #
+                # A read that overruns the interval keeps the full sleep
+                # instead of polling back-to-back: chasing the deadline there
+                # would put the controller in a container continuously, which
+                # is the contention the run would then report as someone
+                # else's. It is recorded rather than hidden -- the recorder
+                # derives each event's resolution from the sample timestamps,
+                # so a cadence this loop could not keep is published as the
+                # cadence it did keep.
+                remaining = sampled_at + interval - time.monotonic()
+                if stop.wait(remaining if remaining > 0 else interval):
+                    return
+
+        t = Thread(target=poll)
+        t.daemon = True
+        t.start()
 
     def run(self, target_conf, dckr_net_name):
         self.ctn = super(Tester, self).run(dckr_net_name)
@@ -748,38 +1199,165 @@ class Tester(Container):
         return None
 
     @staticmethod
-    def find_errors(log_dirs=()):
+    def find_errors(log_dirs=(), samples=None):
         return 0
 
     @staticmethod
-    def find_timeouts(log_dirs=()):
+    def find_timeouts(log_dirs=(), samples=None):
         return 0
 
 
-def count_matching_lines(log_dirs, needle):
-    '''Count lines containing `needle` (case-insensitively) in each *.log
-    directly inside each of `log_dirs` -- not recursively, which is all the
-    testers need since they write their logs straight into guest_dir.
+# What a captured sample costs, and why all three numbers are small.
+#
+# The capture runs after `bench_stop` and after the events artifact is on disk,
+# so it is billed to neither `total time` nor the atomic write -- but it still
+# runs in the controller process, whose own RSS feeds the recorded
+# `min free mem` column. A tester log reaches hundreds of MB on an MRT run and
+# a pathological line (a BGP attribute dump) is unbounded, so a capture that
+# kept every match could hold more than the run it is describing. Twenty lines
+# of at most 300 characters is 6 KB, and errors and timeouts are separate walks
+# with separate lists, so a run carrying both holds at most 12 KB -- which
+# cannot move that column either way, and is enough to say what a count of one
+# or two was. A truncated capture says so rather than looking complete --
+# `sampled` against `count` is the difference, and the limit is published
+# beside them (as `sample_limit_per_list`, because that is what it bounds) so a
+# reader need not know this constant.
+#
+# ERROR_SAMPLE_PER_LOG is the second bound and it exists because the first one
+# alone is spent in `glob` order. A generator writes one log per session -- a
+# BIRD tester one per peer, an MRT fleet one `bgpdump2.log` per injector -- so
+# a global cap can be exhausted by the first session walked while the other
+# forty-nine contribute nothing and the capture still looks complete. Three per
+# log spreads the budget across at least seven sessions before the global cap
+# binds, which is what makes a capture evidence about the *fleet* rather than
+# about whichever file `glob` happened to return first.
+ERROR_SAMPLE_LIMIT = 20
+ERROR_SAMPLE_PER_LOG = 3
+ERROR_SAMPLE_LINE_CHARS = 300
+
+
+def note_error_sample(samples, log_dir, log, lineno, line, taken=0):
+    '''Record one matched line, bounded, if the caller asked for samples.
+
+    `samples is None` is the default everywhere and captures nothing, so a
+    caller that only wants the count -- which is every caller that existed
+    before this -- walks the logs exactly as it did.
+
+    The line is trimmed rather than dropped when it is long: what makes a
+    `tester_health` rejection diagnosable is the shape of the message, and the
+    first 300 characters carry it.
+
+    `taken` is how many this log has already contributed, and the caller keeps
+    it. Returns whether the line was recorded, which is what lets the caller
+    keep that count without this function rescanning `samples` -- it used to,
+    once per matched line, and a log whose needle is the bare substring
+    `error` can match millions of times. That scan sat between `bench_stop()`
+    and `collect_provenance()`, which still has to reach containers that are
+    about to go away, and in a batch it delays the next cell.
+
+    **Both the tester and the log file are recorded, and the basename alone is
+    not enough.** Every MRT injector writes the same `bgpdump2.log` inside its
+    own host directory, so ten injectors produce ten samples reading
+    `bgpdump2.log:1234` with nothing saying which container each came from --
+    and the host directory that would have said is deleted at the start of the
+    next cell, which is the whole reason this record exists. `source` is the
+    tester's own directory name, which is what distinguishes them.
+    '''
+    if samples is None or taken >= ERROR_SAMPLE_PER_LOG:
+        return False
+    if len(samples) >= ERROR_SAMPLE_LIMIT:
+        return False
+    source = os.path.basename(os.path.normpath(log_dir))
+    name = os.path.basename(log)
+    text = line.rstrip('\n')
+    truncated = len(text) > ERROR_SAMPLE_LINE_CHARS
+    if truncated:
+        text = text[:ERROR_SAMPLE_LINE_CHARS]
+    samples.append({
+        'source': source,
+        'log': name,
+        'line': lineno,
+        'text': text,
+        'truncated': truncated,
+    })
+    return True
+
+
+def scan_log_lines(log_dirs, matches, samples=None):
+    '''Count the lines of each *.log directly inside each of `log_dirs` for
+    which `matches(line)` is true, capturing bounded samples of them.
+
+    Not recursive, which is all the testers need since they write their logs
+    straight into guest_dir.
+
+    **A final line with no trailing newline is not read.** Every caller runs
+    while the generator container is still up and its daemon is still writing,
+    so the last line of a log can be half a line -- and half a line is not the
+    line it came from. A BIRD tester logs `<RMT> ... Invalid route ...
+    withdrawn` once per route the target reflects back at it, millions of times
+    on a full table, and `BIRDTester.find_errors()` excludes exactly that text;
+    cut mid-word it fails the exclusion and is counted as a real protocol error.
+    That is not hypothetical -- it is the whole of the `tester_health` rejection
+    that cost the 64 GB campaign's Block 8 its `bird 3.3.2 (4 threads)` 500-peer
+    row, a run that had converged with exact counts (1,000,000 of 1,000,000).
+    The captured line, verbatim from that row's `tester-health.json`, is
+    `2026-09-12 01:51:01.260 <RMT> bgp1: Invalid ro` at `tester`'s
+    `10.10.0.241.log:709953`. Note it still carries `<RMT>`: the truncation
+    landed inside `Invalid route`, past everything the predicate needs to reach
+    the exclusion and short of the exclusion itself, which is the only place a
+    cut does damage. The likelihood grows with the table, since the
+    reflected-route log grows with it.
+
+    This is the rule the FRR End-of-RIB reader and `BlasterLogReader` already
+    follow, for the same reason and against the same kind of writer. They stop
+    at the last complete line because they resume from a byte offset and would
+    otherwise consume half a line and lose it; here nothing resumes, so the
+    partial line is dropped rather than held.
+
+    **What that costs, stated rather than discovered later:** a real error
+    written as a generator died, with no trailing newline and nothing after it,
+    is not counted. One line per log at most, and only ever the last. The
+    asymmetry is deliberate -- the alternative spends a whole qualified row on
+    a line whose text nobody can read -- and a generator that died that way is
+    not silent elsewhere: session counts, `find_timeouts()` and the offering
+    all still speak.
+
+    An unreadable log is skipped rather than raised: this runs at the moment a
+    run has just converged but not yet written its stats row, so letting an
+    OSError out would throw away the whole run over a log file. The `grep`
+    these scans replaced also returned 0 in that case.
+    '''
+    count = 0
+    for log_dir in log_dirs:
+        # Sorted so that which sessions a bounded capture drew from is a
+        # property of the run rather than of the filesystem's `glob` order.
+        for log in sorted(glob.glob(os.path.join(log_dir, '*.log'))):
+            taken = 0
+            try:
+                with open(log, errors='replace') as f:
+                    for lineno, line in enumerate(f, 1):
+                        if not line.endswith('\n'):
+                            break
+                        if not matches(line):
+                            continue
+                        count += 1
+                        if note_error_sample(samples, log_dir, log, lineno,
+                                             line, taken):
+                            taken += 1
+            except OSError:
+                continue
+    return count
+
+
+def count_matching_lines(log_dirs, needle, samples=None):
+    '''Count lines containing `needle` (case-insensitively), by the rules in
+    `scan_log_lines()` -- the partial last line among them.
 
     The MRT testers used to shell out to `grep ... /tmp/bgperf2/...  | wc -l`,
     which hardcoded the bench directory and returned a *string*, so the stats
     row got '0\\n' where every other tester wrote an int. Reading the
     directories bench() actually passes keeps -b/--bench-name working.
-
-    An unreadable log is skipped rather than raised: this runs at the moment a
-    run has just converged but not yet written its stats row, so letting an
-    OSError out would throw away the whole run over a log file. The grep this
-    replaced also returned 0 in that case.
     '''
     needle = needle.lower()
-    count = 0
-    for log_dir in log_dirs:
-        for log in glob.glob(os.path.join(log_dir, '*.log')):
-            try:
-                with open(log, errors='replace') as f:
-                    for line in f:
-                        if needle in line.lower():
-                            count += 1
-            except OSError:
-                continue
-    return count
+    return scan_log_lines(log_dirs, lambda line: needle in line.lower(),
+                          samples)

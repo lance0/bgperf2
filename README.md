@@ -162,20 +162,28 @@ a target, add its process names there** or that target reports its own load as
 contention and all of its rows look incomparable. The cEOS and SR Linux entries
 are the main agents, not the complete set.
 
-### Keep the bench directory off tmpfs
+### Where the bench directory lives
 
-`-d/--dir` defaults to `/tmp`, and systemd mounts `/tmp` as tmpfs on many
-distros — so every tester and target log is written into **RAM**. That is not a
-small effect. A 50-peer × 100k-prefix BIRD run wrote **31 GB** of tester logs,
-half the machine's memory, and dragged the recorded `min free mem` from 56 GB
-down to **28.5 GB** on a run whose target daemon used **0.56 GB**. The column
-was measuring log volume, not the daemon; on a smaller box it is an
-out-of-memory failure instead of a misleading number.
+`-d/--dir` defaults to `/var/tmp`, and it holds every tester and target log,
+bind-mounted. It defaulted to `/tmp` for years, which systemd mounts as tmpfs on
+many distros — so those logs were written into **RAM**. That is not a small
+effect. A 50-peer × 100k-prefix BIRD run wrote **31 GB** of tester logs, half
+the machine's memory, and dragged the recorded `min free mem` from 56 GB down to
+**28.5 GB** on a run whose target daemon used **0.56 GB**. The column was
+measuring log volume, not the daemon; on a smaller box it is an out-of-memory
+failure instead of a misleading number.
 
-`bench` warns when it detects this. Pass a disk-backed path:
+`bench` still warns if the directory it is given turns out to be memory-backed,
+because `/var/tmp` is a symlink to `/tmp` on some images and `-d` can name a
+tmpfs path outright.
+
+It also warns when that filesystem has less than 10 GB free. `/var/tmp` is on
+the **root** filesystem on most hosts, and a run that fills it takes Docker and
+journald with it — hours into a batch, losing the artifacts of the cells that
+already finished. Point `-d` at the larger filesystem when there is one:
 
 ```bash
-./bgperf2.py bench -d /var/tmp -t bird ...
+./bgperf2.py bench -d /data/bgperf-work -t bird ...
 ```
 
 The BIRD tester's logging was also `log ... all`, which includes `trace` and
@@ -185,25 +193,51 @@ is almost entirely `<RMT> Invalid route ... withdrawn` — the target reflecting
 routes back to testers that reject them, which is normal and which
 `find_errors()` already discards.
 
-### Reading a result: `testers (s)` tells you what you measured
+### Reading the legacy timing fields
 
-`elapsed (s)` is how long the monitor took to see the full table; `testers (s)`
-is how long the generators took to send it. **When those two are close, the run
-measured injection throughput, not the daemon** — the target kept pace with
-everything thrown at it, and the number would not improve if the daemon got
-faster.
+The complete field-by-field contract is in the
+[legacy CSV measurement dictionary](docs/measurement-dictionary.md).
 
-A 10-peer × 1.05M-prefix MRT run is injection-bound for most of FRR: 8.5, 9.1
-and 10.0 all converge about 3s behind the last route in, with total times
-within 0.11s of each other. What separates them there is memory (4.88 / 5.26 /
-5.15 GB), not time. FRR 10.7 is the exception and shows what a real difference
-looks like: its testers took 97s instead of 67s on identical input because it
-could not drain its input as fast, and its peak CPU *fell* from 205% to 141%
-while doing so — slower, not busier.
+`elapsed (s)` is the monitor-observed convergence boundary after trailing
+assurance samples are removed; it is not necessarily a literal full-table time.
+`prefix received (s)` is the time until its first monitor-visible prefix. The
+historical `testers (s)` field is calculated as `elapsed - prefix received`;
+despite its name, it is not the generators' runtime and does not say when they
+finished sending routes.
 
-To measure the daemon rather than the generators, raise the peer count or use
-the synthetic BIRD tester, which can outrun a target more easily than MRT
-playback does.
+Consequently, a `testers (s)` value close to `elapsed (s)` cannot establish
+that a run was injection-bound. That conclusion requires an explicit tester
+completion event and comparison of injection time with the post-injection
+convergence tail, both of which are in `<prefix>.events.json` rather than the
+CSV. `post_injection_tail_s` is the second of those: the interval from the
+last generator finishing to the monitor reaching the required count, printed
+at the end of a run and published per generator and for the fleet.
+
+It is **signed**, and a negative value is an ordinary result rather than a
+fault — the monitor reaches the check-point (99% of the configured table)
+while the generators are still finishing, which is what a run looks like when
+the target was never the thing being waited for. Both ends come from 1s poll
+loops, so a tail whose magnitude is at or under
+`post_injection_tail_resolution_s` says the two events landed within one look
+of each other, in either direction, and says nothing about which side was
+slower.
+
+`post_injection_tail_s` is not the only measurement outside the CSV. A run
+also publishes what each generator offered and when (`testers`,
+`tester_fleet`), what the target itself held (`target_table`), what the export
+fan-out received (`export`), what a churn sequence or a policy reload cost
+(`churn`, `policy_reload`), and a `findings` section naming what the run was
+waiting for — or, more often, saying which measurement forbids naming it. All
+of them are in `<prefix>.events.json`, and each run records the bgperf2
+revision and schema versions that produced them.
+
+The measurement implementation and 64 GB validation plans
+([implementation](docs/bgperf2-measurement-implementation-plan.md),
+[validation](docs/2026-64gb-timing-validation-plan.md)) add the remaining
+evidence before drawing new bottleneck or fine version-ranking conclusions.
+Why each piece of that measurement work was built the way it was, and what was
+measured to decide it, is in the
+[decision log](docs/bgperf2-measurement-decision-log.md).
 
 ### IPv4 only
 
@@ -396,6 +430,89 @@ set it for both.
 
 `--threads` is ignored by daemons with no such setting.
 
+### Workload controls beyond peers and prefixes
+
+`-n` and `-p` scale one axis: each peer gets its own disjoint prefix block, so
+session count and table size move together and the target holds `n * p`
+routes, each learned over exactly one path. Five flags separate the things
+that hides. Each is also a batch key -- a *test* key, beside `neighbors` and
+`prefixes`, not a target key -- and each is refused rather than approximated
+where it cannot be honoured.
+
+| flag | batch key | what it adds |
+|---|---|---|
+| `--prefix-scope total` | `prefix_scope: total` | reads `-p` as the whole table and splits it across the peers, so peer count can rise without the table rising with it |
+| `--path-diversity D` | `path_diversity: D` | deals the peers into groups of `D` sharing one prefix block, so the target has competing paths to choose between |
+| `--receivers N` | `receivers: N` | `N` extra sessions the target exports its whole table to and which announce nothing back |
+| `--churn-prefixes C --churn-bursts B` | `churn_prefixes` / `churn_bursts` | after convergence, withdraws and re-announces the last `C` prefixes of every peer, `B` times |
+| `--policy-reload-blocks N` | `policy_reload_blocks: N` | after convergence, installs an import policy rejecting `N` prefix blocks and applies it with the daemon's own reload command |
+
+```bash
+# 50 sessions holding the same 100,000 routes, not 5,000,000
+./bgperf2.py bench -t bird -n 50 -p 100000 --prefix-scope total
+
+# 10 peers in pairs, so 500,000 paths compete for 250,000 prefixes
+./bgperf2.py bench -t bird -n 10 -p 50000 --path-diversity 2
+
+# one table, twelve export sessions
+./bgperf2.py bench -t bird -n 10 -p 100000 --receivers 11
+
+# move a converged table: withdraw 1,000 prefixes per peer and put them back, 3 times
+./bgperf2.py bench -t bird -n 10 -p 100000 --churn-prefixes 1000 --churn-bursts 3
+
+# change the policy over a converged table
+./bgperf2.py bench -t bird -n 10 -p 100000 --policy-reload-blocks 2
+```
+
+What each refuses, and why, is worth knowing before a batch fails at cell
+three: `--prefix-scope total` needs the peer count to divide the table exactly
+and is refused for the MRT generators (whose check-point is already the whole
+table); `--path-diversity` needs the diversity to divide the peer count
+exactly and is refused for MRT playback and beside `--prefix-scope total`;
+churn works only with the synthetic BIRD generator (the burst is `birdc`
+switching a static protocol) and is refused under `-r/--repeat` and
+`--filter_test`; the policy reload needs a target with a reload mechanism
+(only BIRD today), and is refused for MRT playback, under `-r`, under
+`--filter_test`, and beside churn. Every one of them is also refused for a `-f` scenario file,
+which states its own paths. A batch is checked against **every** combination
+on its axes before the first container starts, not just the first.
+
+**None of these appear in the CSV.** `elapsed (s)` keeps meaning the monitor's
+convergence in every row. What a workload was is in the artifact filename
+(`pd2`, `rx11`, `ch1000x3`, `pr2`) and in the `run` block of both
+`<prefix>.events.json` and `<prefix>.versions.json`; what it cost is in that
+artifact's own section — `export`, `churn`, `policy_reload`. The
+[measurement dictionary](docs/measurement-dictionary.md) lists the fields.
+
+### Asking whether the generator was blocked
+
+`--tester-trace-io` turns on the generator's own blocked-write reporting. Only bgpdump2 has any:
+it logs `Partial write` when the socket took part of a buffer and refused the rest, and `Write
+buffer full` when an encode pass found no room in its 256KB session buffer — which is also the
+only place a `write()` that returned `EAGAIN` ever appears, since bgpdump2 logs nothing for one.
+The counts reach `<prefix>.events.json` as `max_blocked_writes` and `max_send_stalls` under each
+generator's `backpressure`; without the flag that section says `available: false` with a reason,
+because reporting 0 would claim the generator was never blocked on the strength of lines it was
+never told to write.
+
+**It costs the measurement beside it, so leave it off for timing runs.** bgpdump2's IO log class
+also logs every BGP message the injector *receives*, and the target re-advertises to each tester
+what it learns from the others. Those lines land in the blaster's event loop while it is still
+walking, so they lengthen the walk it is timing — and that walk time is published as
+`reported_injection_s`, the only number that resolves an injection shorter than one poll. Measured
+over three runs each, 2 injectors x 10,000 prefixes: the injector whose walk overlapped the echo
+reported 0.01122 / 0.01128 / 0.01125s without the flag and 0.01763 / 0.01756 / 0.01751s with it,
+and its log grew from 947 bytes to 350 KB. That growth scales with the table, so on a large run
+keep `-d` off tmpfs — a bench directory in RAM is already measured by the `min free mem` column.
+
+It also costs the *polled* injection interval. The log reader consumes at most 4 MB per poll, sized
+for the ~1 KB an untraced injector writes, so a traced injector can write its `End-of-RIB` several
+polls before the controller reads it and `tester_complete` is stamped late. Measured on a traced
+2 x 500,000-prefix run: one injector wrote 22.5 MB before its `End-of-RIB`, and `injection_s` read
+5.0s against the generator's own 1.4996s. **`injection_s` is not comparable across this flag** —
+read `reported_injection_s` for a traced run, and do not put traced and untraced runs in the same
+comparison.
+
 ### When an old version will not build
 
 Build instructions drift: the base distro moves on, dependencies get renamed, configure flags come
@@ -427,15 +544,15 @@ bgperf2 was originally created to test open source bgp software, so for most con
 and creates a container. For commerical NOSes this doesn't make sense. For those you will need to download
 the container images manually and then use bgperf2.
 
-For most of these images, bgperf2 mounts a local directory (usually in /tmp/bgperf2) to the container. These
+For most of these images, bgperf2 mounts a local directory (usually in /var/tmp/bgperf2) to the container. These
 commerical stacks then write back data as root, and set the privleges so that a regular user cannot delete these
 files and directories.
 
-bgperf2 tries to delete /tmp/bgperf2 before it runs, but it can't with data from these stacks, so you
+bgperf2 tries to delete /var/tmp/bgperf2 before it runs, but it can't with data from these stacks, so you
 might need to remove them yourself. The other option is to run bgperf2 as root \<shrugs\>, that's not a good idea.
 
 ```
-sudo rm -rf /tmp/bpgperf2
+sudo rm -rf /var/tmp/bgperf2
 ```
 
 I have setup multi-threaded support by default in both of these. If you want to do uni-threaded performance
@@ -486,7 +603,7 @@ $ docker tag crpd:21.3R1-S1.1 crpd:latest
 
 Be sure you tag the image or bgperf2 cannot find the image and everything will fail.
 
-bgperf2 mounts the log directory as /tmp/bgperf2/junos/logs, however there are a lot there and most of it
+bgperf2 mounts the log directory as /var/tmp/bgperf2/junos/logs, however there are a lot there and most of it
 is not relevant. To see if your config worked correctly on startup:
 
 ``` bash
@@ -531,6 +648,34 @@ $ ./bgperf2.py batch -c benchmarks/benchmark.yaml
 Configs that play back MRT data expect the file at `mrt/rib.20210801.0000`, which `new_vm.sh`
 downloads. Paths in a batch config may be relative or use `~`; they are resolved before being
 handed to Docker. Keep personal, unshared configs in `benchmarks/local/` — that path is gitignored.
+
+### Repeating a matrix
+
+One run of a cell tells you nothing about how much that number moves between runs. Add
+`repetitions` to a test to run the whole matrix more than once:
+
+```YAML
+tests:
+  - name: variance
+    repetitions: 3
+    neighbors: [10]
+    prefixes: [100_000]
+    filter_test: [None]
+    targets:
+      - {name: bird, version: 2.19.2, label: bird 2.19.2, tester_type: bird}
+```
+
+The matrix is repeated as a block — every cell once, then every cell again — rather than each cell
+three times in a row, so consecutive runs of the same cell do not share a warm page cache and the
+same thermal state, and an interrupted batch has one observation of everything rather than every
+observation of the first few cells.
+
+Each pass gets its own run name (`bird 2.19.2 #1`, `#2`, `#3`), so its CSV row, its graph bar and
+its `.events.json` / `.versions.json` are its own; a shared name would have the second pass
+overwrite the first one's files. `--resume` skips exactly the passes that finished, including an
+interruption part way through one. A test without `repetitions` runs once and is named exactly as
+before — and adding `repetitions` to a config that has already run re-runs it, rather than leaving
+one unnamed row beside `#2` and `#3`.
 
 If you use a file that looks like this:
 
@@ -595,7 +740,7 @@ And some graphs. These are some of the important ones
 
 ## Debugging
 
-If you try to change the config, it's a little tricky to debug what's going on since there are so many containers. What bgperf is doing is creating configs and startup scripts in 2 and then it copies those to the containers before launching them. It creates three containers: bgperf_exabgp_tester_tester, bgperf_\<target\>_target, and bgperf2_monitor. If things aren't working, it's probably because the config for the target is not correct. bgperf2 puts all the log output in /tmp/bgperf2/*.log, but what it doesn't do is capture the output of the startup script.
+If you try to change the config, it's a little tricky to debug what's going on since there are so many containers. What bgperf is doing is creating configs and startup scripts in 2 and then it copies those to the containers before launching them. It creates three containers: bgperf_exabgp_tester_tester, bgperf_\<target\>_target, and bgperf2_monitor. If things aren't working, it's probably because the config for the target is not correct. bgperf2 puts all the log output in /var/tmp/bgperf2/*.log, but what it doesn't do is capture the output of the startup script.
 
 If it doesn't seem to be working, try with 1 peer and 1 route (-n1 -p1) and make sure
 that it connecting. If it's just stuck at waiting to connect to the neighbor, then probably the config is wrong and neighbors are not being established between the monitor (gobgp) and the NOS being tested
@@ -610,7 +755,7 @@ to clean up any existing docker containers
 
 ```$ docker kill `docker ps -q`; docker rm `docker ps -aq` ```
 
-The startup script is in /tmp/bgperf/\<target\>/start.sh and gets copied to the target as /root/config/start.sh.
+The startup script is in /var/tmp/bgperf2/\<target\>/start.sh and gets copied to the target as /root/config/start.sh.
 
 In other words, to launch the start.sh and see the output you can run this docker command:
 

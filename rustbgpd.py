@@ -1,8 +1,11 @@
 '''rustbgpd target built from an exact local source revision.'''
 
+import io
 import json
 import os
 import subprocess
+import sys
+import tarfile
 
 from base import *
 from settings import dckr
@@ -25,7 +28,17 @@ DEBIAN_RUNTIME_IMAGE = (
     '60eac759739651111db372c07be67863818726f754804b8707c90979bda511df'
 )
 
-DOCKERFILE_CONTENT = '''\
+# One recipe for every build profile; only the cargo invocation and the output
+# directory differ. `dhat` is the heap-profiling build: the daemon writes
+# `dhat-heap.json` into its working directory when it exits cleanly.
+BUILD_PROFILES = {
+    'release': ('--release', 'release'),
+    'dhat': ('--profile release-prof --features dhat-heap', 'release-prof'),
+}
+DHAT_PROFILE_PATH = '/root/dhat-heap.json'
+PROFILE_LABEL = 'org.rustbgpd.bgperf2.profile'
+
+DOCKERFILE_TEMPLATE = '''\
 FROM {builder_image} AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -34,7 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY . .
-RUN cargo build --workspace --release --locked
+RUN cargo build --workspace {cargo_args} --locked
 RUN mkdir -p /build-provenance \
     && {{ \
         echo 'builder_base={builder_image}'; \
@@ -51,8 +64,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/rustbgpd /usr/local/bin/rustbgpd
-COPY --from=builder /build/target/release/rbgp /usr/local/bin/rbgp
+COPY --from=builder /build/target/{target_dir}/rustbgpd /usr/local/bin/rustbgpd
+COPY --from=builder /build/target/{target_dir}/rbgp /usr/local/bin/rbgp
 COPY --from=builder /build-provenance/builder.txt /usr/local/share/rustbgpd-builder-provenance.txt
 
 RUN {{ \
@@ -61,7 +74,21 @@ RUN {{ \
     }} > /usr/local/share/rustbgpd-runtime-provenance.txt
 
 RUN mkdir -p /var/lib/rustbgpd
-'''.format(builder_image=RUST_BUILDER_IMAGE, runtime_image=DEBIAN_RUNTIME_IMAGE)
+'''
+
+
+def dockerfile_content(profile='release'):
+    '''The build recipe for one profile, before revision labels are added.'''
+    if profile not in BUILD_PROFILES:
+        raise ValueError('unknown rustbgpd build profile {!r}; expected one of {}'.format(
+            profile, ', '.join(sorted(BUILD_PROFILES))))
+    cargo_args, target_dir = BUILD_PROFILES[profile]
+    return DOCKERFILE_TEMPLATE.format(
+        builder_image=RUST_BUILDER_IMAGE, runtime_image=DEBIAN_RUNTIME_IMAGE,
+        cargo_args=cargo_args, target_dir=target_dir)
+
+
+DOCKERFILE_CONTENT = dockerfile_content('release')
 
 
 class RustBGPd(Container):
@@ -78,9 +105,10 @@ class RustBGPd(Container):
 
     @classmethod
     def build_image(cls, force=False, tag=None, checkout=None, nocache=False,
-                    version=None):
+                    version=None, profile='release'):
         '''Build from a clean local rustbgpd worktree without mutating it.'''
         tag = tag or cls.image_tag()
+        content = dockerfile_content(profile)
         source = RUSTBGPD_SOURCE
         if not os.path.isdir(source):
             raise RuntimeError(
@@ -95,15 +123,15 @@ class RustBGPd(Container):
         cls._require_tracked_file(adapter_root, __file__, 'rustbgpd adapter')
         adapter_revision = cls._clean_revision(adapter_root, 'bgperf2 adapter')
         content = cls._render_dockerfile(
-            DOCKERFILE_CONTENT, source_revision, adapter_revision)
+            content, source_revision, adapter_revision, profile)
 
         dockerfile_path = os.path.join(source, 'Dockerfile.bgperf')
         try:
             with open(dockerfile_path, 'w') as dockerfile:
                 dockerfile.write(content)
 
-            print('build {0} from clean source {1} at {2}'.format(
-                tag, source, source_revision))
+            print('build {0} ({1} profile) from clean source {2} at {3}'.format(
+                tag, profile, source, source_revision))
             for line in dckr.build(
                     path=source, dockerfile='Dockerfile.bgperf', rm=True,
                     tag=tag, decode=True, nocache=nocache):
@@ -122,7 +150,7 @@ class RustBGPd(Container):
                 os.remove(dockerfile_path)
 
     @classmethod
-    def render_dockerfile(cls, version=None):
+    def render_dockerfile(cls, version=None, profile='release'):
         '''Render the local-source recipe without contacting Docker.'''
         if version:
             cls.image_tag(version)
@@ -131,7 +159,8 @@ class RustBGPd(Container):
         adapter_root = os.path.dirname(os.path.realpath(__file__))
         adapter_revision = cls._clean_revision(adapter_root, 'bgperf2 adapter')
         return cls._render_dockerfile(
-            DOCKERFILE_CONTENT, source_revision, adapter_revision)
+            dockerfile_content(profile), source_revision, adapter_revision,
+            profile)
 
     @staticmethod
     def _clean_revision(path, label):
@@ -179,7 +208,8 @@ class RustBGPd(Container):
             raise RuntimeError('{} must be tracked by Git'.format(label)) from error
 
     @staticmethod
-    def _render_dockerfile(content, source_revision, adapter_revision):
+    def _render_dockerfile(content, source_revision, adapter_revision,
+                           profile='release'):
         runtime_preamble = (
             'FROM {}\n'
             'LABEL org.opencontainers.image.revision="{}"\n'
@@ -188,6 +218,7 @@ class RustBGPd(Container):
             'LABEL org.opencontainers.image.base.digest="sha256:{}"\n'
             'LABEL org.rustbgpd.bgperf2.builder-base.digest="sha256:{}"\n'
             'LABEL org.rustbgpd.bgperf2.rust-toolchain="1.95"\n'
+            'LABEL {}="{}"\n'
         ).format(
             DEBIAN_RUNTIME_IMAGE,
             source_revision,
@@ -195,6 +226,8 @@ class RustBGPd(Container):
             DEBIAN_RUNTIME_IMAGE,
             DEBIAN_RUNTIME_IMAGE.rsplit('sha256:', 1)[1],
             RUST_BUILDER_IMAGE.rsplit('sha256:', 1)[1],
+            PROFILE_LABEL,
+            profile,
         )
         return content.replace(
             'FROM {}\n'.format(DEBIAN_RUNTIME_IMAGE), runtime_preamble, 1)
@@ -276,11 +309,9 @@ class RustBGPdTarget(RustBGPd, Target):
                 '',
             ])
 
-        neighbors = list(flatten(
-            list(t.get('neighbors', {}).values())
-            for t in self.scenario_global_conf['testers']))
-        neighbors.append(self.scenario_global_conf['monitor'])
-        for neighbor in neighbors:
+        # Unsorted keeps the historical tester-then-monitor order, and the
+        # shared seam adds any export-fan-out receivers.
+        for neighbor in self.scenario_neighbors(sort=False):
             lines.extend([
                 '[[neighbors]]',
                 'address = "{}"'.format(neighbor['local-address']),
@@ -301,27 +332,101 @@ class RustBGPdTarget(RustBGPd, Target):
             guest_dir=self.guest_dir,
             config_file_name=self.CONFIG_FILE_NAME)
 
-    def get_neighbors_state(self):
-        '''Return received counts from rbgp, or empty state while unavailable.'''
+    # How long a graceful stop may take. DHAT serialises the heap history on
+    # exit, which takes far longer than the ten seconds `docker stop` allows
+    # before SIGKILL -- and `docker stop` signals the container's shell, not
+    # the daemon, so without this the profile is never written.
+    STOP_TIMEOUT_S = 300
+
+    # Bash only: the runtime image has no procps. Prints one final status line.
+    STOP_SCRIPT = r"""
+pid=
+for d in /proc/[0-9]*; do
+  read -r comm 2>/dev/null < "$d/comm" || continue
+  [ "$comm" = %(name)s ] && pid=${d#/proc/}
+done
+[ -n "$pid" ] || { echo "%(name)s: not running"; exit 0; }
+kill -TERM "$pid" || { echo "%(name)s: signal failed"; exit 0; }
+end=$((SECONDS + %(timeout)d))
+while [ -e "/proc/$pid" ]; do
+  state=
+  while read -r key value _; do
+    [ "$key" = State: ] && state=$value
+  done 2>/dev/null < "/proc/$pid/status"
+  [ "$state" = Z ] && break
+  [ "$SECONDS" -ge "$end" ] && { echo "%(name)s: still running"; exit 0; }
+  sleep 0.2
+done
+echo "%(name)s: exited"
+"""
+
+    def stop_daemon(self, timeout_s=None):
+        """SIGTERM the daemon and wait for it to exit.
+
+        Returns the script's status line: `rustbgpd: exited` on success.
+        """
+        timeout_s = self.STOP_TIMEOUT_S if timeout_s is None else timeout_s
+        script = self.STOP_SCRIPT % {'name': 'rustbgpd', 'timeout': int(timeout_s)}
+        output = self.local(['bash', '-c', script])
+        lines = (output or b'').decode('utf-8', 'replace').strip().splitlines()
+        return lines[-1] if lines else 'rustbgpd: no status'
+
+    def build_profile(self):
+        """The profile label of the image this container runs, or None."""
+        labels = dckr.inspect_container(self.name)['Config'].get('Labels') or {}
+        return labels.get(PROFILE_LABEL)
+
+    def collect_run_artifacts(self, output_prefix):
+        """After the run is recorded, stop a DHAT build and keep its profile.
+
+        A no-op for every other build, so a release run keeps its daemon up
+        for investigation exactly as before. `output_prefix` is the run's
+        results-directory stem; returns the paths written.
+        """
+        if self.build_profile() != 'dhat':
+            return []
+        status = self.stop_daemon()
+        print(status)
+        if status != 'rustbgpd: exited':
+            print('WARNING: rustbgpd did not exit cleanly, so DHAT wrote no '
+                  'profile for this run', file=sys.stderr)
+            return []
         try:
-            output = self.local('rbgp --json neighbor')
-            if not output:
-                return {}, {}
-            neighbors = json.loads(output.decode('utf-8'))
-            if not isinstance(neighbors, list):
-                return {}, {}
-            received = {}
-            for neighbor in neighbors:
-                if not isinstance(neighbor, dict):
-                    return {}, {}
-                address = neighbor.get('address')
-                if not address:
-                    continue
-                received[address] = int(neighbor.get('prefixes_received', 0))
-            return received, dict(received)
+            stream, _ = dckr.get_archive(self.name, DHAT_PROFILE_PATH)
         except Exception as error:
-            # The gRPC socket normally appears a poll or two after the daemon;
-            # this path must not turn a transient startup state into a failed
-            # benchmark thread.
-            print('rbgp neighbor query unavailable: {}'.format(error))
+            print('WARNING: no DHAT profile after a clean exit: {}'.format(error),
+                  file=sys.stderr)
+            return []
+        destination = output_prefix + '.dhat-heap.json'
+        with tarfile.open(fileobj=io.BytesIO(b''.join(stream))) as archive:
+            member = archive.extractfile(os.path.basename(DHAT_PROFILE_PATH))
+            with open(destination, 'wb') as out:
+                out.write(member.read())
+        print('DHAT profile: {}'.format(destination))
+        return [destination]
+
+    def get_neighbors_state(self):
+        """Return received counts from rbgp, or empty state before it answers.
+
+        Empty stdout is the daemon's socket not being up yet, a poll or two
+        after start, and reads as no neighbours. Anything else that is not the
+        expected JSON raises, so the shared sampler counts it as a failed read
+        and the run's event artifact reports it instead of a silent gap.
+        """
+        output = self.local('rbgp --json neighbor')
+        if not output:
             return {}, {}
+        neighbors = json.loads(output.decode('utf-8'))
+        if not isinstance(neighbors, list):
+            raise ValueError(
+                'rbgp neighbor output is not a list: {!r}'.format(neighbors))
+        received = {}
+        for neighbor in neighbors:
+            if not isinstance(neighbor, dict):
+                raise ValueError(
+                    'rbgp neighbor entry is not an object: {!r}'.format(neighbor))
+            address = neighbor.get('address')
+            if not address:
+                continue
+            received[address] = int(neighbor.get('prefixes_received', 0))
+        return received, dict(received)

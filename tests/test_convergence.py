@@ -11,6 +11,8 @@ from convergence import (
     DROP_SAMPLES,
     NO_PROGRESS_DEADLINE_SECONDS,
     STUCK_SAMPLES,
+    WITNESS_CARRY_SAMPLES,
+    WITNESS_EXCUSED_LIMIT,
     ConvergenceTracker,
 )
 
@@ -264,3 +266,379 @@ def test_drop_streak_accumulates_when_neighbor_count_is_steady():
     statuses = [t.update(2 + i, 50000, 5, 5, False) for i in range(DROP_SAMPLES)]
     assert statuses[-1] == ConvergenceTracker.FAILED
     assert ConvergenceTracker.FAILED not in statuses[:-1]
+
+
+# --- the target's own table as a second witness ---------------------------
+#
+# The monitor is one BGP session's view of the target, so when its count falls
+# there is nothing to check it against. These pin the rule that reads the
+# target's own gauge beside it: a decline in what the target *exports* is not
+# a decline in what it *holds*.
+
+def feed_witness(tracker, count, recved, best_paths, first_at=1.0,
+                 neighbors_checked=10, checked=True, frozen_at=None):
+    '''Push `count` samples carrying a witness, returning the last status.
+
+    `frozen_at` pins every reading to one timestamp, which is what a target
+    poll thread that died looks like from the monitor loop.
+    '''
+    status = None
+    for i in range(count):
+        at = frozen_at if frozen_at is not None else first_at + i
+        status = tracker.update(int(first_at) + i, recved, neighbors_checked,
+                                neighbors_checked, checked,
+                                table_witness={'best_paths': best_paths},
+                                witness_monotonic_s=at)
+    return status
+
+
+def test_a_settled_decline_the_target_did_not_follow_is_not_a_loss():
+    '''The Phase 6 MRT shape: the monitor settles 1.5% below its own peak while
+    the target's table is at its peak and stays there. What fell is what the
+    target exports, not what it holds, so this converges rather than failing on
+    the drop streak.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000)
+    status = feed_witness(t, ASSURANCE_SAMPLES_AFTER_CHECKPOINT + 1,
+                          985000, 1020000, first_at=2.0)
+    assert status == ConvergenceTracker.CONVERGED
+    rule = t.witness_rule()
+    assert rule['converged_below_monitor_peak'] is True
+    assert rule['excused_samples'] >= 1
+    assert round(rule['max_excused_monitor_decline'], 3) == 0.015
+    assert rule['max_witness_decline_while_excusing'] == 0.0
+
+
+def test_a_decline_the_target_followed_still_fails():
+    '''A genuine loss takes the target's own count down with it, by a
+    comparable amount, so it is past the same threshold and is not excused.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000)
+    status = feed_witness(t, DROP_SAMPLES, 985000, 1004000, first_at=2.0)
+    assert status == ConvergenceTracker.FAILED
+    assert t.witness_rule() is None
+
+
+def test_a_withheld_witness_decides_nothing():
+    '''best_paths is None whenever a peering did not report, which is what a
+    session still coming up or a partial CLI read produces. A withheld sum is
+    not evidence that the table is intact.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000)
+    status = feed_witness(t, DROP_SAMPLES, 985000, None, first_at=2.0)
+    assert status == ConvergenceTracker.FAILED
+
+
+def test_an_undated_witness_decides_nothing():
+    '''A reading with no timestamp cannot be shown to be current, and a
+    reading that cannot be shown to be current is exactly what a dead poll
+    thread supplies.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    t.update(1, 1000000, 10, 10, True,
+             table_witness={'best_paths': 1020000}, witness_monotonic_s=None)
+    status = None
+    for i in range(DROP_SAMPLES):
+        status = t.update(2 + i, 985000, 10, 10, True,
+                          table_witness={'best_paths': 1020000},
+                          witness_monotonic_s=None)
+    assert status == ConvergenceTracker.FAILED
+
+
+def test_a_frozen_witness_cannot_carry_a_run():
+    '''One reading may not decide a verdict by itself. A target poll that dies
+    as the count falls leaves the monitor loop repeating its last reading
+    forever; the run still fails, later than it would have.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000)
+    status = feed_witness(t, DROP_SAMPLES + WITNESS_CARRY_SAMPLES + 2,
+                          985000, 1020000, first_at=2.0, frozen_at=2.0)
+    assert status == ConvergenceTracker.FAILED
+
+
+def test_the_witness_is_judged_against_its_own_peak():
+    '''The target's gauge gets the high-water treatment the monitor's count
+    gets: a table that grew and then shrank has lost routes, however steady it
+    looks afterwards.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000)
+    status = feed_witness(t, DROP_SAMPLES, 985000, 1000000, first_at=2.0)
+    assert status == ConvergenceTracker.FAILED
+
+
+def test_a_target_that_holds_nothing_attests_to_nothing():
+    '''A gauge of 0 with no peak behind it is a target that has not started
+    receiving, not a table that survived intact.'''
+    t = ConvergenceTracker()
+    holds, declined = t._witness_holds_table({'best_paths': 0}, 1.0)
+    assert holds is False
+    assert declined is None
+
+
+def test_the_witness_rule_is_absent_when_it_changed_nothing():
+    '''A run whose count never fell far enough to need the witness writes the
+    document it always wrote.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    status = feed_witness(t, ASSURANCE_SAMPLES_AFTER_CHECKPOINT + 1,
+                          1000000, 1020000)
+    assert status == ConvergenceTracker.CONVERGED
+    assert t.witness_rule() is None
+
+
+def test_a_run_with_no_witness_is_decided_exactly_as_before():
+    '''Every daemon but BIRD reports no gauge at all, and those runs must keep
+    the verdicts they had.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    t.update(1, 1000000, 10, 10, True)
+    status = None
+    for i in range(DROP_SAMPLES):
+        status = t.update(2 + i, 985000, 10, 10, True)
+    assert status == ConvergenceTracker.FAILED
+    assert t.witness_rule() is None
+
+
+def test_the_witness_cannot_converge_a_run_the_monitor_stopped_seeing():
+    '''A monitor session that lost most of the table while the target kept it
+    looks, from the target's side, exactly like the export change this rule
+    excuses. The sample's own check-point flag is what separates them, so a
+    count parked far below the check-point is not converged however intact the
+    target is. Deliberately not a count of zero: that is refused a step
+    earlier, and testing this gate through it would test the other guard.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000, checked=True)
+    status = feed_witness(t, ASSURANCE_SAMPLES + 5, 500000, 1020000,
+                          first_at=2.0, checked=False)
+    assert status != ConvergenceTracker.CONVERGED
+
+    # The control: the same samples with the monitor at or above the
+    # check-point are exactly what the rule is for, and do converge.
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000, checked=True)
+    assert feed_witness(t, ASSURANCE_SAMPLES_AFTER_CHECKPOINT + 1, 500000,
+                        1020000, first_at=2.0, checked=True) \
+        == ConvergenceTracker.CONVERGED
+
+
+def test_a_monitor_count_of_zero_is_not_an_export_change():
+    '''Zero is not a decline in what the target exports -- it is the absence of
+    the session the run is measured through, which the target-side witness
+    cannot see. Observed for real: a pass whose target container went away
+    mid-run carried its last reading and excused a "100% export change".'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000)
+    # `checked` goes with it: the monitor's flag is its own answer to "am I at
+    # or above the check-point", so a sample of 0 is never a checked one.
+    status = feed_witness(t, DROP_SAMPLES, 0, 1020000, first_at=2.0,
+                          checked=False)
+    assert status == ConvergenceTracker.FAILED
+    assert t.witness_rule() is None
+
+
+def test_a_continuously_declining_monitor_still_fails():
+    '''The witness may carry a run; it may not carry it forever.
+
+    A count that declines a little on every sample resets the drop streak
+    through the excuse *and* the stability counter through changing, so before
+    WITNESS_EXCUSED_LIMIT such a run had no terminating path at all -- and
+    bench() has no run timeout, so under batch() it is the rest of the matrix.
+    '''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000)
+    # Past DROP_FRACTION and then bleeding away a little on every sample.
+    recved = 985000
+    status = None
+    for i in range(WITNESS_EXCUSED_LIMIT + 5):
+        recved -= 100
+        status = t.update(2 + i, recved, 10, 10, False,
+                          table_witness={'best_paths': 1020000},
+                          witness_monotonic_s=2.0 + i)
+        if status != ConvergenceTracker.CONTINUE:
+            break
+    assert status == ConvergenceTracker.FAILED
+    # Named for what it is: the target held its table and the session the run
+    # is measured through kept losing it. A stuck count means the opposite.
+    assert 'declining' in t.fail_msg and '1020000' in t.fail_msg
+
+
+def test_an_excused_decline_that_settles_never_approaches_the_limit():
+    '''The MRT shape: excused while it settles, then flat and converged. The
+    limit counts consecutive samples for exactly this reason.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000)
+    status = feed_witness(t, ASSURANCE_SAMPLES_AFTER_CHECKPOINT + 1,
+                          985000, 1020000, first_at=2.0)
+    assert status == ConvergenceTracker.CONVERGED
+    assert t.witness_excused_streak < WITNESS_EXCUSED_LIMIT
+
+
+def test_a_verdict_needs_a_reading_taken_on_the_sample_that_decides_it():
+    '''A witness that freezes partway through the assurance window is still
+    inside the carry bound when the window closes, so the bound alone does not
+    keep a stale reading out of the verdict -- and a dead target poll is
+    exactly what freezes it.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    feed_witness(t, 1, 1000000, 1020000)
+    # Three flat samples with the witness being re-read...
+    feed_witness(t, 3, 985000, 1020000, first_at=2.0)
+    # ...then the target poll dies and the same reading is carried.
+    status = feed_witness(t, ASSURANCE_SAMPLES_AFTER_CHECKPOINT, 985000,
+                          1020000, first_at=5.0, frozen_at=5.0)
+    assert status != ConvergenceTracker.CONVERGED
+    # One fresh read is enough: the count is already flat, so nothing else is
+    # waiting on it.
+    assert t.update(20, 985000, 10, 10, True,
+                    table_witness={'best_paths': 1020000},
+                    witness_monotonic_s=99.0) == ConvergenceTracker.CONVERGED
+
+
+class TestATargetWhoseNeighbourCountersNeverFill:
+    '''The target's own counters *shorten* the assurance window; they are not
+    what makes convergence possible.
+
+    The gate required `neighbors_checkpoint`, so a target that delivered its
+    whole table -- and whose delivery the monitor confirmed -- had no
+    terminating path but STUCK_SAMPLES. Block 2 of the timing campaign:
+    `rustybgp default` at 50 x 100,000 reached the check-point at 137.34s with
+    5,000,000 of a required 4,950,000, then polled for a further ~2,000
+    seconds and was failed as `stuck received count 5000000 neighbors_checked
+    16`. It reported >= 100,000 accepted for 16 of 50 peers while holding the
+    whole table.
+
+    BIRD 3 is the same defect one layer back: it reported `accepted` 0 for
+    every neighbour, which killed one route to the checkpoint quietly, and
+    those runs still converged through `neighbors_received_full`. Here both
+    routes are dead at once.
+    '''
+
+    def test_it_converges_on_the_monitors_checkpoint_alone(self):
+        t = ConvergenceTracker()
+        # No note_neighbors_checkpoint(): this is the whole point.
+        t.update(1, 5_000_000, 16, 16, checked=True)
+        status = feed(t, ASSURANCE_SAMPLES - 1, elapsed_start=2,
+                      recved=5_000_000, neighbors_checked=16,
+                      neighbors_received_full=16, checked=True)
+        assert status == ConvergenceTracker.CONTINUE
+        assert t.update(100, 5_000_000, 16, 16, checked=True) == \
+            ConvergenceTracker.CONVERGED
+
+    def test_it_waits_the_full_window_rather_than_the_short_one(self):
+        """The second witness is what buys the short window, so a run with one
+        account of itself pays the full price for it."""
+        t = ConvergenceTracker()
+        t.update(1, 5_000_000, 16, 16, checked=True)
+        assert t.assurance_samples == ASSURANCE_SAMPLES
+        status = feed(t, ASSURANCE_SAMPLES_AFTER_CHECKPOINT + 1,
+                      elapsed_start=2, recved=5_000_000, neighbors_checked=16,
+                      neighbors_received_full=16, checked=True)
+        assert status == ConvergenceTracker.CONTINUE
+
+    def test_both_witnesses_still_buy_the_short_window(self):
+        t = ConvergenceTracker()
+        t.note_neighbors_checkpoint()
+        t.update(1, 1000, 5, 5, checked=True)
+        assert t.assurance_samples == ASSURANCE_SAMPLES_AFTER_CHECKPOINT
+
+    def test_a_target_that_never_delivered_still_fails(self):
+        """The acceptance criterion's other half. Without the monitor's
+        check-point there is no witness at all, and stability alone must never
+        converge a run -- a target sitting at a tenth of its table is exactly
+        as steady as one that finished."""
+        t = ConvergenceTracker()
+        t.update(1, 500_000, 3, 3, checked=False)
+        status = feed(t, ASSURANCE_SAMPLES + 5, elapsed_start=2,
+                      recved=500_000, neighbors_checked=3,
+                      neighbors_received_full=3, checked=False)
+        assert status == ConvergenceTracker.CONTINUE
+        assert t.convergence_rule() is None
+
+    def test_a_run_with_neither_witness_still_fails_as_stuck(self):
+        t = ConvergenceTracker()
+        status = feed(t, STUCK_SAMPLES + 2, recved=500_000,
+                      neighbors_checked=3, neighbors_received_full=3,
+                      checked=False)
+        assert status == ConvergenceTracker.FAILED
+        assert 'stuck received count' in t.fail_msg
+
+    def test_the_run_says_it_was_decided_on_one_witness(self):
+        """Nothing in the row can carry this: `elapsed (s)` is the monitor's
+        convergence either way, so a run decided on one account of itself is
+        otherwise indistinguishable from one decided on two."""
+        t = ConvergenceTracker()
+        t.update(1, 5_000_000, 16, 16, checked=True)
+        feed(t, ASSURANCE_SAMPLES, elapsed_start=2, recved=5_000_000,
+             neighbors_checked=16, neighbors_received_full=16, checked=True)
+        rule = t.convergence_rule()
+        assert rule is not None
+        assert rule['neighbors_checked_at_convergence'] == 16
+        assert rule['monitor_peak'] == 5_000_000
+        assert 'never all reported full' in rule['policy']
+
+    def test_an_ordinary_run_publishes_nothing_new(self):
+        """A run with both witnesses keeps exactly the document it had."""
+        t = ConvergenceTracker()
+        t.note_neighbors_checkpoint()
+        t.update(1, 1000, 5, 5, checked=True)
+        feed(t, ASSURANCE_SAMPLES_AFTER_CHECKPOINT, elapsed_start=2,
+             checked=True)
+        assert t.convergence_rule() is None
+
+    def test_a_monitor_at_zero_does_not_converge_on_stability(self):
+        """`checked` is the monitor saying it is still at or above the
+        check-point. A session that collapsed is not a table delivered, and
+        the looser gate must not make it one."""
+        t = ConvergenceTracker()
+        t.update(1, 5_000_000, 16, 16, checked=True)
+        feed(t, 3, elapsed_start=2, recved=5_000_000, neighbors_checked=16,
+             neighbors_received_full=16, checked=True)
+        status = feed(t, ASSURANCE_SAMPLES + 5, elapsed_start=10, recved=0,
+                      neighbors_checked=16, neighbors_received_full=16,
+                      checked=False)
+        assert status != ConvergenceTracker.CONVERGED
+
+    def test_a_run_with_no_neighbour_reading_at_all_still_terminates(self):
+        """The counters at 0 for the whole run, which is what a sampler that
+        fails on its *first* read leaves behind -- `bgperf2-sl1`, and a remote
+        target, whose dispatch block is skipped entirely.
+
+        The stability counter advanced only while one of the two counters was
+        above zero, and `STUCK_SAMPLES` keys on that same counter, so such a
+        run reached neither verdict and polled forever. With no bench timeout,
+        under `batch()`, that is the rest of the matrix. 16 of 50 peers
+        reporting and 0 of 50 are the same defect.
+        """
+        t = ConvergenceTracker()
+        for i in range(ASSURANCE_SAMPLES + 2):
+            status = t.update(i + 1, 5_000_000, 0, 0, checked=True)
+        assert status == ConvergenceTracker.CONVERGED
+        assert t.convergence_rule()['neighbors_checked_at_convergence'] == 0
+
+    def test_no_reading_and_no_checkpoint_fails_rather_than_hanging(self):
+        """Terminating is not the same as converging: with no checkpoint there
+        is no witness, so this run has to end as stuck."""
+        t = ConvergenceTracker()
+        status = feed(t, STUCK_SAMPLES + 2, recved=500_000,
+                      neighbors_checked=0, neighbors_received_full=0,
+                      checked=False)
+        assert status == ConvergenceTracker.FAILED
+        assert 'stuck received count' in t.fail_msg
+
+    def test_a_count_of_zero_is_still_left_to_the_no_progress_deadline(self):
+        """`recved > 0` is what was added; a run where nothing ever arrives is
+        decided exactly as it was, by NO_PROGRESS_DEADLINE_SECONDS."""
+        t = ConvergenceTracker()
+        status = t.update(NO_PROGRESS_DEADLINE_SECONDS + 1, 0, 0, 0,
+                          checked=False)
+        assert status == ConvergenceTracker.FAILED

@@ -1,5 +1,27 @@
 # 2026 BGP Performance Test Plan
 
+## Status and Successor Plans
+
+This plan produced the completed `2026-baseline` campaign. Its phases that
+assume more than 64 GB are retained below as historical design context, but
+they are not scheduled while the local 64 GB server is the only available
+host.
+
+Follow-on work is split into two execution plans:
+
+1. [`bgperf2-measurement-implementation-plan.md`](./bgperf2-measurement-implementation-plan.md)
+   adds actual tester-completion timing and the campaign controls needed for
+   defensible repeated comparisons. Continue it with:
+
+   > continue the bgperf2 measurement implementation plan
+
+2. [`2026-64gb-timing-validation-plan.md`](./2026-64gb-timing-validation-plan.md)
+   repeats the most useful synthetic and full-internet comparisons that fit
+   on the existing host. After the implementation release gate passes,
+   continue it with:
+
+   > continue the 64 GB timing validation campaign
+
 ## Purpose
 
 This document is the execution-oriented companion to [`docs/bgp-performance-history-summary.md`](./bgp-performance-history-summary.md).
@@ -126,7 +148,9 @@ The checked-in batch configs for this plan are:
 
 For every benchmark run:
 
-- use a disk-backed bench directory such as `/var/tmp/bgperf`,
+- use a disk-backed bench directory -- `/data/bgperf-work` on the current
+  host, since `/var/tmp` there is on the 29 GB root shared with journald and
+  the OS,
 - avoid a tmpfs-backed `/tmp`,
 - make sure the machine is otherwise idle,
 - record `max foreign cpu %`,
@@ -146,7 +170,7 @@ unfinished suite at a time:
 ```bash
 scripts/run_2026_suite.sh next \
   --run-id 2026-baseline \
-  --workdir /var/tmp/bgperf
+  --workdir /data/bgperf-work
 ```
 
 The batch command checkpoints every completed matrix cell. If a suite is
@@ -190,13 +214,13 @@ This is not for publication. It is only to catch broken images or obvious harnes
 Run it with:
 
 ```bash
-./bgperf2.py -d /var/tmp/bgperf batch -c benchmarks/2026-smoke.yaml
+./bgperf2.py -d /data/bgperf-work batch -c benchmarks/2026-smoke.yaml
 ```
 
 Or through the suite runner:
 
 ```bash
-scripts/run_2026_suite.sh smoke --run-id 2026-baseline --workdir /var/tmp/bgperf
+scripts/run_2026_suite.sh smoke --run-id 2026-baseline --workdir /data/bgperf-work
 ```
 
 ### Phase 1: core synthetic matrix
@@ -254,15 +278,15 @@ These are useful, but they are no longer the baseline comparison set.
 The checked-in synthetic and MRT configs are runnable as:
 
 ```bash
-./bgperf2.py -d /var/tmp/bgperf batch -c benchmarks/2026-core-synth.yaml
-./bgperf2.py -d /var/tmp/bgperf batch -c benchmarks/2026-core-mrt.yaml
+./bgperf2.py -d /data/bgperf-work batch -c benchmarks/2026-core-synth.yaml
+./bgperf2.py -d /data/bgperf-work batch -c benchmarks/2026-core-mrt.yaml
 ```
 
 Or through the suite runner:
 
 ```bash
-scripts/run_2026_suite.sh core-synth --run-id 2026-baseline --workdir /var/tmp/bgperf
-scripts/run_2026_suite.sh core-mrt --run-id 2026-baseline --workdir /var/tmp/bgperf
+scripts/run_2026_suite.sh core-synth --run-id 2026-baseline --workdir /data/bgperf-work
+scripts/run_2026_suite.sh core-mrt --run-id 2026-baseline --workdir /data/bgperf-work
 ```
 
 ## Filter Test Add-On
@@ -285,13 +309,13 @@ The point is not to produce a universal “best filter daemon” result. The poi
 Run it with:
 
 ```bash
-./bgperf2.py -d /var/tmp/bgperf batch -c benchmarks/2026-filters.yaml
+./bgperf2.py -d /data/bgperf-work batch -c benchmarks/2026-filters.yaml
 ```
 
 Or through the suite runner:
 
 ```bash
-scripts/run_2026_suite.sh filters --run-id 2026-baseline --workdir /var/tmp/bgperf
+scripts/run_2026_suite.sh filters --run-id 2026-baseline --workdir /data/bgperf-work
 ```
 
 ## Missing But Valuable Future Add-Ons

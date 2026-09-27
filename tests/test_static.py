@@ -92,3 +92,56 @@ def test_benchmark_config_versions_are_resolvable():
                     cls.image_tag(version)
                 except base.VersionNotSupported as e:
                     pytest.fail(f"{config.name}: {e}")
+
+
+def test_benchmark_configs_expand():
+    '''Every config in the tree has to survive expansion.
+
+    A missing axis used to reach `expand_batch_cells()` as a bare KeyError --
+    `benchmarks/big-tests.yaml` had no `filter_test` on any of its three tests
+    -- and a `repetitions: 0` runs nothing while `repetitions: "3"` runs once.
+    An `order` the sequencer does not recognise is the same class of typo: it
+    would name a permutation the batch never made, and two targets sharing a
+    run name overwrite each other's artifacts and break the graphs. All of them are discovered
+    when the batch starts, which may be hours away.
+    '''
+    yaml = pytest.importorskip('yaml')
+    import bgperf2
+
+    checked = 0
+    for config in sorted((REPO_ROOT / 'benchmarks').glob('*.yaml')):
+        data = yaml.load(config.read_text(), Loader=bgperf2.BatchLoader)
+        for test in data.get('tests') or []:
+            try:
+                bgperf2.check_batch_test(test)
+                bgperf2.batch_repetitions(test)
+                bgperf2.batch_order(test)
+                bgperf2.check_batch_run_names(
+                    test, bgperf2.expand_target_versions(test['targets']))
+            except SystemExit as e:
+                pytest.fail(f"{config.name}: {e}")
+            checked += 1
+    assert checked, 'this guard passes green over an empty benchmarks directory'
+
+
+def test_the_bench_dir_default_is_not_tmpfs_by_convention():
+    '''`-d/--dir` carries every role's config and logs, so a tmpfs default
+    spends RAM the run then reports as `min free mem`. It was `/tmp` for years
+    while every operator contract said to pass `/var/tmp/bgperf`.
+
+This pins the literal path, deliberately. The property it stands for --
+    "not memory-backed" -- cannot be asserted portably: `is_memory_backed()`
+    answers for the machine the suite happens to run on, so a host where
+    `/tmp` is disk-backed would pass a property check while every other host
+    regressed. The constant is the only portable statement of the intent.
+
+    It is no longer agreement with the operator contracts, which moved to
+    `/data/bgperf-work` on 2026-09-08 because `/var/tmp` is on the root
+    filesystem on most hosts and a full-table MRT suite can fill it. The
+    default stays `/var/tmp` because it must work on any machine; the gap
+    between it and the contracts is permanent, and what covers it at run time
+    is `warn_if_log_dir_is_in_ram()` for tmpfs and
+    `warn_if_log_dir_is_short_on_space()` for the space.
+    '''
+    parser = importlib.import_module('bgperf2').create_args_parser()
+    assert parser.get_default('dir') == '/var/tmp'

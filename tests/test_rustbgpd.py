@@ -164,6 +164,17 @@ class TestWriteConfig:
             assert 'address = "{}"'.format(address) in config
         assert config.count('[[neighbors]]') == 3
 
+    def test_export_receivers_are_configured_after_the_monitor(self, tmp_path):
+        scenario = dict(SCENARIO, receivers=[
+            {'as': 1101, 'local-address': '10.10.0.101'},
+            {'as': 1102, 'local-address': '10.10.0.102'},
+        ])
+        config = write(tmp_path, scenario=scenario)
+        order = [line.split('"')[1] for line in config.splitlines()
+                 if line.startswith('address = ')]
+        assert order == ['10.10.0.3', '10.10.0.4', '10.10.0.2',
+                         '10.10.0.101', '10.10.0.102']
+
     def test_owner_only_socket_needs_no_grpc_security_block(self, tmp_path):
         config = write(tmp_path)
         assert 'security.grpc' not in config
@@ -251,19 +262,25 @@ class TestRbgpParsing:
         expected = {'10.0.0.1': 100000, '10.0.0.2': 99999}
         assert target.get_neighbors_state() == (expected, expected)
 
-    @pytest.mark.parametrize('output', [b'', b'not json', b'{}', b'[1]'])
-    def test_transient_or_malformed_output_is_empty_state(self, output):
+    def test_empty_output_before_the_socket_is_up_is_empty_state(self):
+        target = self.target_with_output(b'')
+        assert target.get_neighbors_state() == ({}, {})
+
+    @pytest.mark.parametrize('output', [
+        b'not json',
+        b'{}',
+        b'[1]',
+        b'[{"address":"10.0.0.1","prefixes_received":null}]',
+    ])
+    def test_malformed_output_is_a_failed_read(self, output):
         target = self.target_with_output(output)
-        assert target.get_neighbors_state() == ({}, {})
+        with pytest.raises((ValueError, TypeError)):
+            target.get_neighbors_state()
 
-    def test_non_numeric_prefix_count_is_empty_state(self):
-        target = self.target_with_output(
-            b'[{"address":"10.0.0.1","prefixes_received":null}]')
-        assert target.get_neighbors_state() == ({}, {})
-
-    def test_transient_exec_failure_is_empty_state(self):
-        target = self.target_with_output(RuntimeError('socket not ready'))
-        assert target.get_neighbors_state() == ({}, {})
+    def test_exec_failure_is_a_failed_read(self):
+        target = self.target_with_output(RuntimeError('exec failed'))
+        with pytest.raises(RuntimeError):
+            target.get_neighbors_state()
 
 
 class TestVersion:
@@ -284,3 +301,176 @@ class TestVersion:
             lambda self, stderr=False: output)
         with pytest.raises(VersionUnavailable):
             object.__new__(RustBGPd).exec_version_cmd()
+
+
+class TestDhatProfile:
+    def test_dhat_recipe_builds_the_heap_profiler(self):
+        recipe = rustbgpd.dockerfile_content('dhat')
+        assert ('cargo build --workspace --profile release-prof '
+                '--features dhat-heap --locked') in recipe
+        assert '/target/release-prof/rustbgpd /usr/local/bin/rustbgpd' in recipe
+        assert 'FROM {} AS builder'.format(RUST_BUILDER_IMAGE) in recipe
+
+    def test_release_recipe_is_unchanged_by_the_template(self):
+        assert rustbgpd.dockerfile_content('release') == DOCKERFILE_CONTENT
+        assert 'dhat' not in DOCKERFILE_CONTENT
+
+    def test_unknown_profile_is_refused(self):
+        with pytest.raises(ValueError, match='jemalloc'):
+            rustbgpd.dockerfile_content('jemalloc')
+
+    @pytest.mark.parametrize('profile', ['release', 'dhat'])
+    def test_rendered_recipe_labels_its_profile(self, profile):
+        rendered = RustBGPd._render_dockerfile(
+            rustbgpd.dockerfile_content(profile), 'a' * 40, 'b' * 40, profile)
+        assert 'LABEL {}="{}"'.format(rustbgpd.PROFILE_LABEL, profile) in rendered
+
+    def test_dhat_config_boots_on_tier_authz(self, tmp_path):
+        # v0.63 refuses `enforcement = "legacy"`; the owner-only UDS default is
+        # tier authz with the implicit local-operator, so no block is written.
+        # One writer serves every profile, so the DHAT run's config is the
+        # release run's.
+        config = write(tmp_path)
+        assert 'legacy' not in config
+        assert '[security.grpc' not in config
+
+
+class TestUpdateProfile:
+    def parse(self, *argv):
+        return bgperf2.create_args_parser().parse_args(['update', *argv])
+
+    def test_profile_and_tag_reach_the_rustbgpd_build(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(RustBGPd, 'build_image',
+                            classmethod(lambda cls, **kw: seen.update(kw)))
+        bgperf2.update(self.parse('rustbgpd', '-n', '--profile', 'dhat',
+                                  '--tag', 'bgperf/rustbgpd:cand-dhat'))
+        assert seen['profile'] == 'dhat'
+        assert seen['tag'] == 'bgperf/rustbgpd:cand-dhat'
+        assert seen['nocache'] is True
+
+    def test_default_is_the_release_profile_and_tag(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(RustBGPd, 'build_image',
+                            classmethod(lambda cls, **kw: seen.update(kw)))
+        bgperf2.update(self.parse('rustbgpd'))
+        assert seen['profile'] == 'release'
+        assert seen['tag'] == RustBGPd.image_tag()
+
+    def test_profile_is_refused_for_other_images(self):
+        with pytest.raises(SystemExit, match='only to `update rustbgpd`'):
+            bgperf2.update(self.parse('bird', '--profile', 'dhat'))
+
+
+class FakeContainerDocker:
+    def __init__(self, profile, archive=None):
+        self.profile = profile
+        self.archive = archive
+
+    def inspect_container(self, name):
+        labels = {rustbgpd.PROFILE_LABEL: self.profile} if self.profile else {}
+        return {'Config': {'Labels': labels}}
+
+    def get_archive(self, name, path):
+        import io
+        import tarfile
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w') as archive:
+            info = tarfile.TarInfo('dhat-heap.json')
+            info.size = len(self.archive)
+            archive.addfile(info, io.BytesIO(self.archive))
+        return iter([buffer.getvalue()]), {}
+
+
+class TestCollectRunArtifacts:
+    def target(self, monkeypatch, docker, status='rustbgpd: exited'):
+        target = object.__new__(RustBGPdTarget)
+        target.name = RustBGPdTarget.CONTAINER_NAME
+        stops = []
+        monkeypatch.setattr(rustbgpd, 'dckr', docker)
+        monkeypatch.setattr(target, 'stop_daemon',
+                            lambda: stops.append(1) or status, raising=False)
+        return target, stops
+
+    @pytest.mark.parametrize('profile', ['release', None])
+    def test_other_builds_keep_the_daemon_running(self, monkeypatch, tmp_path,
+                                                  profile):
+        target, stops = self.target(monkeypatch, FakeContainerDocker(profile))
+        assert target.collect_run_artifacts(str(tmp_path / 'run')) == []
+        assert stops == []
+
+    def test_dhat_build_is_stopped_and_its_profile_kept(self, monkeypatch,
+                                                        tmp_path):
+        target, stops = self.target(
+            monkeypatch, FakeContainerDocker('dhat', b'{"dhatFileVersion":2}'))
+        written = target.collect_run_artifacts(str(tmp_path / 'run'))
+        assert stops == [1]
+        assert written == [str(tmp_path / 'run.dhat-heap.json')]
+        assert (tmp_path / 'run.dhat-heap.json').read_bytes() == \
+            b'{"dhatFileVersion":2}'
+
+    def test_a_daemon_that_did_not_exit_writes_nothing(self, monkeypatch,
+                                                       tmp_path, capsys):
+        target, _ = self.target(monkeypatch, FakeContainerDocker('dhat', b'{}'),
+                                status='rustbgpd: still running')
+        assert target.collect_run_artifacts(str(tmp_path / 'run')) == []
+        assert 'did not exit cleanly' in capsys.readouterr().err
+        assert not (tmp_path / 'run.dhat-heap.json').exists()
+
+
+class TestStopScript:
+    """Run the in-container stop script against a local stand-in process.
+
+    The stand-in has a unique name, so the script can never signal a real
+    daemon on the host.
+    """
+
+    def start(self, tmp_path, on_term):
+        import os
+        import time
+        name = 'stoptest{}'.format(os.getpid() % 1000000)
+        script = tmp_path / name
+        script.write_text('#!/bin/bash\n'
+                          'trap {} TERM\n'
+                          'while :; do sleep 0.05; done\n'.format(on_term))
+        script.chmod(0o755)
+        process = subprocess.Popen([str(script)])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                with open('/proc/{}/comm'.format(process.pid)) as comm:
+                    if comm.read().strip() == name:
+                        break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        return name, process
+
+    def run_script(self, name, timeout):
+        script = RustBGPdTarget.STOP_SCRIPT % {'name': name, 'timeout': timeout}
+        return subprocess.run(['bash', '-c', script], capture_output=True,
+                              text=True, timeout=30).stdout.strip().splitlines()
+
+    def test_waits_for_the_daemon_to_finish_exiting(self, tmp_path):
+        marker = tmp_path / 'profile-written'
+        name, process = self.start(
+            tmp_path, "'sleep 1; touch {}; exit 0'".format(marker))
+        try:
+            lines = self.run_script(name, 20)
+            assert lines[-1] == '{}: exited'.format(name)
+            # The script returned only after the handler finished its write.
+            assert marker.exists()
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_reports_a_daemon_that_outlives_the_timeout(self, tmp_path):
+        name, process = self.start(tmp_path, "''")
+        try:
+            assert self.run_script(name, 1)[-1] == '{}: still running'.format(name)
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_reports_no_daemon(self):
+        assert self.run_script('stoptestnone', 1) == ['stoptestnone: not running']

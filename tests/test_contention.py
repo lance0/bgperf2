@@ -10,18 +10,26 @@ process that finished a heavy job an hour ago still reads high, and -- the case
 that matters -- a long-lived process that starts burning four cores for the 95
 seconds of a run barely moves its average and stays invisible.
 '''
+import importlib
+import os
+
 import pytest
 
+import bgperf2
 from contention import (
+    BGPERF_PROCESSES,
     CONTENTION_PERCENT,
     describe_contention,
     filesystem_type,
+    free_space_bytes,
+    foreign_by_command,
     foreign_cpu_percent,
+    foreign_cpu_report,
+    format_foreign_load,
     is_memory_backed,
     own_process_tree,
     parse_proc_stat,
     sample_processes,
-    top_foreign,
 )
 
 
@@ -76,6 +84,30 @@ def test_every_target_daemon_is_recognised_as_ours(daemon):
     assert foreign_cpu_percent(before, after, 10, clock_ticks=TICKS) == 0
 
 
+def test_every_registered_daemon_binary_is_in_the_allowlist():
+    '''docs/invariants/host-and-environment.md: "every daemon a target can run
+    must be in BGPERF_PROCESSES ... a missing name means that target's own
+    load is reported as contention ... the failure is silent and looks like a
+    real finding." The parametrized case above only re-checks a fixed guess at
+    that list; this derives it from DAEMON_BINARY on the classes bgperf2
+    actually builds and runs, so a new compiled daemon that forgets to update
+    BGPERF_PROCESSES fails here instead of publishing quiet contention.
+
+    Commercial NOSes (junos/eos/srlinux/flock) run many daemons each and carry
+    no single DAEMON_BINARY, so they are not covered by this derivation --
+    those names in BGPERF_PROCESSES have no source of truth to check against.
+    '''
+    classes = set(bgperf2.TARGET_CLASSES.values()) | set(
+        bgperf2.TESTER_CLASSES.values())
+    binaries = {cls: cls.DAEMON_BINARY for cls in classes if cls.DAEMON_BINARY}
+    assert binaries, 'derivation found nothing -- DAEMON_BINARY moved or renamed'
+    missing = {cls.__name__: binary for cls, binary in binaries.items()
+               if os.path.basename(binary) not in BGPERF_PROCESSES}
+    assert not missing, (
+        'DAEMON_BINARY set but its basename is missing from '
+        'contention.BGPERF_PROCESSES: {}'.format(missing))
+
+
 def test_foreign_processes_are_summed_and_named():
     before = sample(p1=('julia', 0), p2=('julia', 0), p3=('bgpd', 0))
     after = sample(p1=('julia', 300 * TICKS), p2=('julia', 100 * TICKS),
@@ -128,12 +160,88 @@ def test_zero_or_negative_interval_is_not_divided_by():
     assert foreign_cpu_percent(before, after, 0, clock_ticks=TICKS) == 0
 
 
-def test_top_foreign_is_ordered_and_limited():
+def test_the_heaviest_commands_are_ordered_and_limited():
     before = sample(p1=('julia', 0), p2=('matlab', 0), p3=('R', 0))
     after = sample(p1=('julia', 300 * TICKS), p2=('matlab', 100 * TICKS),
                    p3=('R', 200 * TICKS))
-    top = top_foreign(before, after, 100, limit=2, clock_ticks=TICKS)
-    assert [comm for _, comm in top] == ['julia', 'R']
+    _total, named = foreign_cpu_report(before, after, 100, limit=2,
+                                       clock_ticks=TICKS)
+    assert [entry['command'] for entry in named] == ['julia', 'R']
+
+
+def test_a_swarm_is_named_once_with_its_size():
+    """The canonical competitor is a parallel build, not one big process.
+
+    Ranked per pid, 300 cc1 processes at 1% each are named three times at 1%
+    beside a total of 300%, which reads as though the number came from
+    somewhere the names do not cover. The count is what separates one runaway
+    process from a swarm, and they send an operator to different places.
+    """
+    before = sample(**{'p{0}'.format(i): ('cc1', 0) for i in range(300)})
+    after = sample(**{'p{0}'.format(i): ('cc1', TICKS) for i in range(300)})
+    total, named = foreign_cpu_report(before, after, 100, clock_ticks=TICKS)
+
+    assert [entry['command'] for entry in named] == ['cc1']
+    assert named[0]['process_count'] == 300
+    assert named[0]['percent'] == pytest.approx(300.0)
+    assert total == pytest.approx(300.0)
+
+
+def test_the_names_account_for_the_total_they_are_published_beside():
+    """Both come from one pass, so they cannot describe different moments."""
+    before = sample(p1=('julia', 0), p2=('julia', 0), p3=('R', 0))
+    after = sample(p1=('julia', 200 * TICKS), p2=('julia', 100 * TICKS),
+                   p3=('R', 50 * TICKS))
+    total, named = foreign_cpu_report(before, after, 100, clock_ticks=TICKS)
+
+    assert total == pytest.approx(
+        foreign_cpu_percent(before, after, 100, clock_ticks=TICKS))
+    assert sum(entry['percent'] for entry in named) == pytest.approx(total)
+
+
+def test_named_load_excludes_the_benchmark_and_its_own_tree():
+    """A name only appears if it would have counted towards the total."""
+    before = sample(p1=('bird', 0), p2=('julia', 0))
+    after = sample(p1=('bird', 400 * TICKS), p2=('julia', 100 * TICKS))
+    _total, named = foreign_cpu_report(before, after, 100, clock_ticks=TICKS)
+    assert [entry['command'] for entry in named] == ['julia']
+
+    _total, named = foreign_cpu_report(before, after, 100, clock_ticks=TICKS,
+                                       extra_allowed=('julia',))
+    assert named == []
+
+
+def test_aggregated_ranking_carries_the_count_for_every_command():
+    before = sample(p1=('cc1', 0), p2=('cc1', 0), p3=('julia', 0))
+    after = sample(p1=('cc1', 100 * TICKS), p2=('cc1', 100 * TICKS),
+                   p3=('julia', 300 * TICKS))
+    assert foreign_by_command(before, after, 100, clock_ticks=TICKS) == [
+        (pytest.approx(300.0), 'julia', 1),
+        (pytest.approx(200.0), 'cc1', 2),
+    ]
+
+
+def test_a_single_process_is_not_labelled_with_its_count():
+    """"(1 procs)" beside every name is noise on the common case."""
+    assert format_foreign_load([
+        {'command': 'python', 'percent': 101.4, 'process_count': 1},
+        {'command': 'cc1', 'percent': 780.0, 'process_count': 312},
+    ]) == 'python 101%, cc1 780% (312 procs)'
+
+
+def test_a_fraction_of_a_percent_is_not_printed_as_none():
+    """A real run named "sshd 0%", which reads as a process listed for having
+    used nothing and invites discounting the names beside it."""
+    assert format_foreign_load([
+        {'command': 'sshd', 'percent': 0.199, 'process_count': 1},
+    ]) == 'sshd <1%'
+
+
+def test_the_warning_names_a_swarm_by_its_command():
+    before = sample(**{'p{0}'.format(i): ('cc1', 0) for i in range(300)})
+    after = sample(**{'p{0}'.format(i): ('cc1', TICKS) for i in range(300)})
+    complaint = describe_contention(before, after, 100, clock_ticks=TICKS)
+    assert 'cc1 300% (300 procs)' in complaint
 
 
 def test_extra_allowed_processes_are_excluded():
@@ -235,10 +343,12 @@ class TestOwnProcessTree:
 
 
 class TestMemoryBackedLogDir:
-    '''-d/--dir defaults to /tmp, which is tmpfs on many distros, so every
-    tester and target log is written into RAM. A 50-peer 100k-prefix BIRD run
-    put 31GB there and dragged the recorded min_free from 56GB to 28.5GB on a
-    run whose daemon used 0.56GB.
+    '''-d/--dir defaults to /var/tmp now, for this reason: on /tmp, which is
+    tmpfs on many distros, every tester and target log is written into RAM. A
+    50-peer 100k-prefix BIRD run put 31GB there and dragged the recorded
+    min_free from 56GB to 28.5GB on a run whose daemon used 0.56GB. The check
+    stays because /var/tmp is a symlink to /tmp on some images, and -d can
+    name a tmpfs path outright.
     '''
     MOUNTS = (
         '/dev/sda5 / ext4 rw,relatime 0 0\n'
@@ -263,5 +373,94 @@ class TestMemoryBackedLogDir:
         '''/tmpfoo is not inside /tmp.'''
         assert not is_memory_backed('/tmpfoo/bench', self.MOUNTS)
 
+    def test_a_symlinked_bench_dir_is_resolved_before_it_is_judged(
+            self, tmp_path, monkeypatch):
+        """/var/tmp is a symlink to /tmp on some images -- the case this check
+        is kept for now that the default moved. abspath normalizes without
+        following symlinks, so the path handed to is_memory_backed() would
+        match no tmpfs mount line and the warning would be suppressed, in
+        silence, on exactly the host that needs it.
+        """
+        bgperf2 = importlib.import_module('bgperf2')
+        ram = tmp_path / 'ram'
+        ram.mkdir()
+        link = tmp_path / 'var-tmp'
+        link.symlink_to(ram)
+        judged = []
+        monkeypatch.setattr(bgperf2, 'is_memory_backed',
+                            lambda path, mounts: judged.append(path) or False)
+        bgperf2.warn_if_log_dir_is_in_ram(str(link / 'bgperf2'))
+        assert judged == [str(ram / 'bgperf2')]
+
     def test_unparsable_mounts_do_not_raise(self):
         assert filesystem_type('/tmp', 'garbage\n\nshort line\n') is None
+
+
+class FakeStatvfs:
+    """os.statvfs over a set of paths that exist, and nothing else."""
+
+    def __init__(self, known):
+        self.known = known
+        self.asked = []
+
+    def __call__(self, path):
+        self.asked.append(path)
+        if path not in self.known:
+            raise OSError(2, 'No such file or directory', path)
+        f_bavail, f_frsize, f_bfree = self.known[path]
+        return os.statvfs_result(
+            (4096, f_frsize, 100, f_bfree, f_bavail, 0, 0, 0, 0, 255))
+
+
+class TestTheBenchDirectoryHasRoom:
+    """Moving the default off tmpfs traded one failure for a smaller one: the
+    logs no longer come out of RAM, but /var/tmp is on the root filesystem on
+    most hosts, and a large run can fill it.
+    """
+
+    def test_free_space_is_what_this_user_can_write(self):
+        """f_bfree includes the reserve only root may use. bgperf2 does not run
+        as root, so counting it would promise space this process cannot have.
+        """
+        statvfs = FakeStatvfs({'/var/tmp': (1000, 4096, 2000)})
+        assert free_space_bytes('/var/tmp', statvfs) == 1000 * 4096
+
+    def test_the_nearest_existing_ancestor_is_measured(self):
+        """bench() asks before it creates the directory, so the path itself is
+        usually absent -- and its filesystem is the one the run will write to.
+        """
+        statvfs = FakeStatvfs({'/var/tmp': (1000, 4096, 1000)})
+        assert free_space_bytes('/var/tmp/bgperf2', statvfs) == 1000 * 4096
+        assert statvfs.asked == ['/var/tmp/bgperf2', '/var/tmp']
+
+    def test_an_unreadable_root_is_no_measurement_rather_than_zero(self):
+        """A zero here would print a warning about a full disk on every run."""
+        assert free_space_bytes('/var/tmp/bgperf2', FakeStatvfs({})) is None
+
+    def test_a_relative_path_is_still_measured(self):
+        statvfs = FakeStatvfs({os.getcwd(): (5, 4096, 5)})
+        assert free_space_bytes('bench-dir', statvfs) == 5 * 4096
+
+    def test_a_short_filesystem_is_named_with_what_to_do(self, capsys, monkeypatch):
+        bgperf2 = importlib.import_module('bgperf2')
+        monkeypatch.setattr(bgperf2, 'free_space_bytes',
+                            lambda path: int(0.4 * (1 << 30)))
+        bgperf2.warn_if_log_dir_is_short_on_space('/var/tmp/bgperf2')
+        out = capsys.readouterr().out
+        assert '0.4GB free' in out
+        assert '{0}GB'.format(bgperf2.LOG_SPACE_FLOOR_GB) in out
+        assert '-d/--dir' in out
+
+    def test_a_filesystem_with_room_says_nothing(self, capsys, monkeypatch):
+        bgperf2 = importlib.import_module('bgperf2')
+        monkeypatch.setattr(bgperf2, 'free_space_bytes',
+                            lambda path: bgperf2.LOG_SPACE_FLOOR_GB << 30)
+        bgperf2.warn_if_log_dir_is_short_on_space('/var/tmp/bgperf2')
+        assert capsys.readouterr().out == ''
+
+    def test_an_unmeasurable_filesystem_says_nothing(self, capsys, monkeypatch):
+        """Silence, not a warning about a disk nobody could read."""
+        bgperf2 = importlib.import_module('bgperf2')
+        monkeypatch.setattr(bgperf2, 'free_space_bytes', lambda path: None)
+        bgperf2.warn_if_log_dir_is_short_on_space('/var/tmp/bgperf2')
+        assert capsys.readouterr().out == ''

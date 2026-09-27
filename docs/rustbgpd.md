@@ -46,9 +46,32 @@ Combining it with `RUSTBGPD_EVENT_HISTORY=enabled` is rejected.
 Revisions that predate the block must leave both variables unset.
 
 The adapter configures the daemon's owner-only default Unix socket and reads
-neighbor state with `rbgp --json neighbor`. An absent socket, empty response,
-or malformed transient response produces an empty poll rather than killing the
-sampling thread.
+neighbor state with `rbgp --json neighbor`. That socket authorizes as the
+implicit `local-operator` under tier gRPC authorization, so the config carries
+no `[security.grpc]` block; rustbgpd v0.63 and later refuse the retired
+`enforcement = "legacy"`. An empty response before the socket is up is an
+empty poll. Malformed output or a failed exec is a failed read, which the
+shared sampler counts and the run's event artifact reports.
+
+## DHAT heap profiles
+
+Build the heap-profiling image with `--profile dhat`, into its own tag:
+
+```bash
+./bgperf2.py update rustbgpd --checkout "$(git -C "$RUSTBGPD_SOURCE" rev-parse HEAD)" \
+  --no-cache --profile dhat --tag bgperf/rustbgpd:candidate-dhat
+./bgperf2.py bench -t rustbgpd -i bgperf/rustbgpd:candidate-dhat -n 2 -p 100000
+```
+
+The DHAT recipe builds `--profile release-prof --features dhat-heap` and labels
+the image `org.rustbgpd.bgperf2.profile="dhat"` (release images carry
+`"release"`). DHAT writes its profile only when the daemon exits cleanly, and
+`docker stop` signals the container's shell rather than the daemon. So after a
+run on a DHAT image, once the row and versions are recorded, bench sends the
+daemon SIGTERM, waits up to 300 seconds for it to exit, and saves the profile as
+`<run>.dhat-heap.json` beside the run's other results. A daemon that does not
+exit in time produces a warning and no profile. Release images are left running
+for investigation, as before.
 
 ## Current boundary
 

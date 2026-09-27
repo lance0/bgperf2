@@ -258,8 +258,16 @@ class TestReviewFixes:
         assert 'first-result' in csv_text
         assert 'second-result' in csv_text
 
-    def test_batch_resume_keeps_duplicate_cells_distinct(
+    def test_two_targets_that_would_run_under_one_name_are_refused(
             self, fake_img_exists, tmp_path, monkeypatch):
+        """Two indistinguishable entries are not two observations.
+
+        They share a run name, so they share the stem every artifact is built
+        from: the second replaces the first's events.json, versions.json and
+        PNGs, the CSV grows two rows nothing can tell apart, and create_graph()
+        pairs one x tick with two bar heights. A second observation of one cell
+        is what `repetitions` is for, and it names its passes.
+        """
         import yaml
         config = tmp_path / 'duplicates.yaml'
         config.write_text(yaml.safe_dump({'tests': [{
@@ -270,19 +278,15 @@ class TestReviewFixes:
             'targets': [{'name': 'bird'}, {'name': 'bird'}],
         }]}))
         fake_img_exists(lambda name: True)
-        monkeypatch.setattr(bgperf2, 'create_batch_graphs', lambda *a, **k: None)
 
         calls = []
-        monkeypatch.setattr(
-            bgperf2, 'bench', lambda a: calls.append(a.target) or ['result'])
-        args = Namespace(batch_config=str(config), results_dir=str(tmp_path), resume=True)
+        monkeypatch.setattr(bgperf2, 'bench', lambda a: calls.append(a.target) or ['r'])
+        with pytest.raises(SystemExit) as e:
+            bgperf2.batch(Namespace(
+                batch_config=str(config), results_dir=str(tmp_path), resume=True))
 
-        bgperf2.batch(args)
-        assert calls == ['bird', 'bird']
-
-        calls.clear()
-        bgperf2.batch(args)
-        assert calls == []
+        assert "'bird'" in str(e.value) and 'label' in str(e.value)
+        assert calls == [], 'refused before the first container'
 
 
 class TestBuildImageKwargs:
@@ -324,8 +328,18 @@ class TestSecondRoundFixes:
             bgperf2.GoBGP, 'require_image',
             lambda *a, **k: order.append('resolve-monitor') or 'monitor-img')
 
+        # The workload fields are valid: resolution now sits *after* the
+        # guards that read only the command line, so that a mistyped -p or
+        # --path-diversity costs a message rather than a Docker call on a host
+        # that may have neither a daemon nor the image. Those guards record
+        # nothing, so `resolve` is still the first event here -- and the thing
+        # this test is about, that no teardown precedes it, is unchanged.
         args = Namespace(dir='/tmp', bench_name='x', docker_network_name=None,
-                         file=None, target='bird', version='99.9', image=None, repeat=True)
+                         file=None, target='bird', version='99.9', image=None,
+                         repeat=True, neighbor_num=1, prefix_num=1,
+                         tester_type='bird', mrt_file=None, mrt_injector=None,
+                         prefix_scope='per-peer', path_diversity=1,
+                         receivers=0)
         with pytest.raises(Exception):
             bgperf2.bench(args)
         assert order[:2] == ['resolve-target', 'resolve-monitor'], \
@@ -362,11 +376,15 @@ class TestSecondRoundFixes:
             lambda names: [{'Name': 'row-br'}])
         monkeypatch.setattr(bgperf2, 'Monitor', FakeMonitor)
 
-        args = Namespace(
-            dir=str(tmp_path), bench_name='row', docker_network_name='row-br',
-            file=None, target='bird', version=None, monitor_version='4.8.0',
-            image=None, repeat=True,
-        )
+        # Parsed rather than hand-built, so the test keeps every bench()
+        # default as upstream adds workload flags.
+        args = bgperf2.create_args_parser().parse_args(
+            ['bench', '-t', 'bird', '-n', '1', '-p', '1',
+             '--monitor-version', '4.8.0'])
+        args.dir = str(tmp_path)
+        args.bench_name = 'row'
+        args.docker_network_name = 'row-br'
+        args.repeat = True
         with pytest.raises(MonitorConstructed):
             bgperf2.bench(args)
 
