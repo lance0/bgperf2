@@ -376,11 +376,15 @@ class TestSecondRoundFixes:
             lambda names: [{'Name': 'row-br'}])
         monkeypatch.setattr(bgperf2, 'Monitor', FakeMonitor)
 
-        args = Namespace(
-            dir=str(tmp_path), bench_name='row', docker_network_name='row-br',
-            file=None, target='bird', version=None, monitor_version='4.8.0',
-            image=None, repeat=True,
-        )
+        # Parsed rather than hand-built, so the test keeps every bench()
+        # default as upstream adds workload flags.
+        args = bgperf2.create_args_parser().parse_args(
+            ['bench', '-t', 'bird', '-n', '1', '-p', '1',
+             '--monitor-version', '4.8.0'])
+        args.dir = str(tmp_path)
+        args.bench_name = 'row'
+        args.docker_network_name = 'row-br'
+        args.repeat = True
         with pytest.raises(MonitorConstructed):
             bgperf2.bench(args)
 
