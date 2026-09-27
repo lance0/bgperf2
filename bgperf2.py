@@ -1600,11 +1600,23 @@ def update(args):
         sys.exit('--checkout and --version are mutually exclusive: a version already selects '
                  'its ref (use --checkout alone to build a raw ref into the default tag)')
 
+    # rustbgpd builds from a local checkout, so its build profile and image tag
+    # are chosen here rather than by a version name.
+    profile = getattr(args, 'profile', None)
+    tag = getattr(args, 'tag', None)
+    if (profile or tag) and names != ['rustbgpd']:
+        sys.exit('--profile and --tag apply only to `update rustbgpd`')
+
     for name in names:
         cls = BUILDABLE_IMAGES[name]
         for v in versions:
             if v:
                 cls.build_version(v, force=True, nocache=args.no_cache)
+            elif name == 'rustbgpd':
+                cls.build_image(force=True, tag=tag or cls.image_tag(),
+                                checkout=args.checkout or cls.DEFAULT_REF,
+                                nocache=args.no_cache,
+                                profile=profile or 'release')
             else:
                 # No version: rebuild the default tag, honouring an explicit
                 # --checkout for a ref that has no version name (a sha, say).
@@ -4001,6 +4013,12 @@ def finish_bench(args, output_stats, bench_stats, bench_start, target, m, tester
     # moment any of them can be asked.
     provenance = collect_provenance(args, target, m, testers)
     del m
+    # A target that must be stopped to produce its evidence (a DHAT build
+    # writes its heap profile on exit) does so now: the clock has stopped and
+    # every version has been read.
+    collect_run_artifacts = getattr(target, 'collect_run_artifacts', None)
+    if collect_run_artifacts is not None:
+        collect_run_artifacts(results_path(args.results_dir, bench_prefix))
 
     target_version = provenance['target']['version']
 
@@ -6647,6 +6665,13 @@ def create_args_parser(main=True):
     parser_update.add_argument('-c', '--checkout', default=None,
                                help='raw git ref to build into the default (unversioned) tag')
     parser_update.add_argument('-n', '--no-cache', action='store_true')
+    parser_update.add_argument('--profile', choices=['release', 'dhat'],
+                               help='rustbgpd only: build profile; dhat builds the '
+                                    'heap profiler, whose profile bench saves beside '
+                                    'the run\'s results. default: release')
+    parser_update.add_argument('--tag', type=str,
+                               help='rustbgpd only: image tag to build into, e.g. '
+                                    'bgperf/rustbgpd:candidate-dhat')
     parser_update.set_defaults(func=update)
 
     def add_gen_conf_args(parser):
