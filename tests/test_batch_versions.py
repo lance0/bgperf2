@@ -374,7 +374,7 @@ class TestSecondRoundFixes:
         monkeypatch.setattr(
             bgperf2.dckr, 'networks',
             lambda names: [{'Name': 'row-br'}])
-        monkeypatch.setattr(bgperf2, 'Monitor', FakeMonitor)
+        monkeypatch.setitem(bgperf2.MONITOR_CLASSES, 'gobgp', FakeMonitor)
 
         # Parsed rather than hand-built, so the test keeps every bench()
         # default as upstream adds workload flags.
