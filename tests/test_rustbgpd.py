@@ -1,18 +1,24 @@
 '''The local-source rustbgpd adapter, without Docker or a live daemon.'''
 
+import json
+import queue
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
+import base
 import bgperf2
 import rustbgpd
 from base import VersionUnavailable
+from convergence import ASSURANCE_SAMPLES, ConvergenceTracker
 from rustbgpd import (
     DEBIAN_RUNTIME_IMAGE,
     DOCKERFILE_CONTENT,
     RUST_BUILDER_IMAGE,
     RUSTBGPD_EVENT_HISTORY_ENV,
     RUSTBGPD_EVENT_HISTORY_OFF_ENV,
+    RUSTBGPD_NEIGHBOR_POLL_MODE_ENV,
     RustBGPd,
     RustBGPdTarget,
 )
@@ -22,6 +28,7 @@ from rustbgpd import (
 def no_ambient_event_history_switch(monkeypatch):
     monkeypatch.delenv(RUSTBGPD_EVENT_HISTORY_ENV, raising=False)
     monkeypatch.delenv(RUSTBGPD_EVENT_HISTORY_OFF_ENV, raising=False)
+    monkeypatch.delenv(RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, raising=False)
 
 
 SCENARIO = {
@@ -52,6 +59,138 @@ def write(tmp_path, scenario=None, conf=None):
     target.scenario_global_conf = SCENARIO if scenario is None else scenario
     target.write_config()
     return (tmp_path / RustBGPdTarget.CONFIG_FILE_NAME).read_text()
+
+
+class TestNeighborPollMode:
+    @pytest.mark.parametrize('mode', ['poll1', 'poll5', 'off'])
+    def test_parse_explicit_mode(self, mode):
+        assert RustBGPdTarget._neighbor_poll_mode(
+            {RUSTBGPD_NEIGHBOR_POLL_MODE_ENV: mode}) == mode
+
+    @pytest.mark.parametrize('mode', ['', 'POLL1', 'poll2', ' off', 'off '])
+    def test_invalid_mode_fails_before_target_setup(self, mode, tmp_path, monkeypatch):
+        monkeypatch.setenv(RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, mode)
+        with pytest.raises(RuntimeError, match=RUSTBGPD_NEIGHBOR_POLL_MODE_ENV):
+            RustBGPdTarget(str(tmp_path / 'target'), {})
+        assert not (tmp_path / 'target').exists()
+
+    def test_invalid_mode_fails_before_bench_or_batch_side_effects(self, monkeypatch):
+        monkeypatch.setenv(RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, 'invalid')
+        monkeypatch.setattr(bgperf2, 'install_stop_handlers',
+                            lambda: pytest.fail('bench started'))
+        monkeypatch.setattr(bgperf2.GoBGP, 'require_image',
+                            lambda *a: pytest.fail('Docker queried'))
+        with pytest.raises(RuntimeError, match=RUSTBGPD_NEIGHBOR_POLL_MODE_ENV):
+            bgperf2.bench(SimpleNamespace(target='rustbgpd'))
+        with pytest.raises(RuntimeError, match=RUSTBGPD_NEIGHBOR_POLL_MODE_ENV):
+            bgperf2.check_batch_images([{'name': 'bird'}, {'name': 'rustbgpd'}])
+
+    @staticmethod
+    def target(tmp_path):
+        target = RustBGPdTarget(str(tmp_path), {})
+        target.scenario_global_conf = {'testers': [{'neighbors': {
+            '10.0.0.1': {'check-points': 100},
+        }}]}
+        return target
+
+    @pytest.mark.parametrize('mode,interval', [(None, 1), ('poll1', 1), ('poll5', 5)])
+    def test_shared_sampler_cadence_and_failed_read(self, mode, interval,
+                                                  tmp_path, monkeypatch):
+        if mode is not None:
+            monkeypatch.setenv(RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, mode)
+        target = self.target(tmp_path)
+        # Selection is frozen on the target, including what provenance reports.
+        monkeypatch.setenv(RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, 'off')
+        clock = SimpleNamespace(now=100.0)
+        reads, waits = [], []
+        q = queue.Queue()
+
+        def read(cmd):
+            assert cmd == 'rbgp --json neighbor'
+            reads.append(clock.now)
+            clock.now += 0.25
+            if len(reads) == 2:
+                return b'"rpc error"'
+            return b'[{"address":"10.0.0.1","prefixes_received":100}]'
+
+        def wait(seconds):
+            waits.append(seconds)
+            # One checked message and one received message per real good
+            # read. The bad read neither publishes nor re-dates old state.
+            assert q.qsize() == (2 if len(reads) < 3 else 4)
+            clock.now += seconds
+            if len(waits) == 3:
+                target.stop_monitoring = True
+
+        class InlineThread:
+            def __init__(self, target):
+                self.run = target
+
+            def start(self):
+                self.run()
+
+        monkeypatch.setattr(target, 'local', read)
+        monkeypatch.setattr(base, 'Thread', InlineThread)
+        monkeypatch.setattr(base, 'time', SimpleNamespace(
+            monotonic=lambda: clock.now, sleep=wait))
+        target.neighbor_stats(q)
+        assert target.neighbor_poll_mode == (mode or 'poll1')
+        assert waits == [interval] * 3
+        assert reads == [100.0, 100.25 + interval, 100.5 + 2 * interval]
+        messages = [q.get_nowait() for _ in range(q.qsize())]
+        checked = [m for m in messages if 'neighbors_checked' in m]
+        assert [m['monotonic_s'] for m in checked] == [reads[0], reads[2]]
+        assert all(m['table_witness'] is None for m in checked)
+        assert all(m['neighbors_checked'] == {'10.0.0.1': True} for m in checked)
+        assert target.neighbor_sample_failures == 1
+        assert target.neighbor_sample_consecutive_failures == 0
+        assert 'not a list' in target.neighbor_sample_last_error
+        assert base.Container.neighbor_poll_interval_s == 1
+
+    @pytest.mark.parametrize('complete', [True, False])
+    def test_off_reads_nothing_and_requires_monitor_checkpoint(
+            self, complete, tmp_path, monkeypatch):
+        monkeypatch.setenv(RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, 'off')
+        target = self.target(tmp_path)
+        monkeypatch.setattr(target, 'local', lambda *a: pytest.fail('neighbor CLI read'))
+        monkeypatch.setattr(base, 'Thread', lambda **kw: pytest.fail('sampler started'))
+        q = queue.Queue()
+        target.neighbor_stats(q)
+        assert q.empty()
+        assert target.neighbor_sample_failures == 0
+        tracker = ConvergenceTracker()
+        for second in range(ASSURANCE_SAMPLES):
+            assert tracker.update(second, 100 if complete else 10, 0, 0,
+                                  complete) == tracker.CONTINUE
+        status = tracker.update(ASSURANCE_SAMPLES, 100 if complete else 10,
+                                0, 0, complete)
+        assert status == (tracker.CONVERGED if complete else tracker.CONTINUE)
+        assert not tracker.neighbors_checkpoint
+        if complete:
+            assert tracker.convergence_rule()['assurance_samples_required'] == ASSURANCE_SAMPLES
+        assert tracker.witness_rule() is None
+
+    @pytest.mark.parametrize('mode', ['poll1', 'poll5', 'off'])
+    def test_effective_mode_reaches_csv_and_manifest(
+            self, mode, tmp_path, monkeypatch, bench_args, bench_stats):
+        monkeypatch.setenv(RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, mode)
+        target = self.target(tmp_path)
+        monkeypatch.setattr(target, 'version_string', lambda: 'rustbgpd 0.65.0')
+        monkeypatch.setattr(target, 'running_image_id', lambda: 'sha256:target')
+        monkeypatch.setenv(RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, 'different-after-start')
+        bench_args.target = 'rustbgpd'
+        bench_args.results_dir = str(tmp_path)
+        provenance = bgperf2.collect_provenance(bench_args, target, target, [])
+        assert provenance['target']['neighbor_poll_mode'] == mode
+        assert 'neighbor_poll_mode' not in provenance['monitor']
+        header = [f.strip() for f in bgperf2.stats_header().split(',')]
+        row = bgperf2.create_output_stats(bench_args, 'v1', bench_stats,
+                                          provenance=provenance)
+        assert dict(zip(header, row))['neighbor poll mode'] == mode
+        assert header[-3:] == ['target image', 'tester version', 'monitor version']
+        path = bgperf2.write_provenance(bench_args, provenance, 'mode')
+        with open(path) as saved:
+            assert json.load(saved)['target']['neighbor_poll_mode'] == mode
 
 
 class TestRegistration:

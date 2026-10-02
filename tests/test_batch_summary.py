@@ -40,6 +40,7 @@ def a_row(**overrides):
         'flags': '', 'date': '2026-09-03', 'cores': '32', 'Mem (GB)': '64.00GB',
         'tester errors': 0, 'tester timeouts': 0, 'failed': '', 'MSG': '',
         'filters': '', 'max foreign cpu %': 0, 'target image': 'bgperf/bird:2.19.2',
+        'neighbor poll mode': '',
         'tester version': '2.19.2', 'monitor version': '3.38.0',
     }
     values.update(overrides)

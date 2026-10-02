@@ -50,6 +50,7 @@ def test_row_values_land_in_their_named_columns(bench_args, bench_stats):
     named = dict(zip(header_fields(), row))
 
     assert named['target'] == 'bird'
+    assert named['neighbor poll mode'] == ''
     assert named['version'] == 'v1.2.3'
     assert named['peers'] == '10'
     assert named['prefixes per peer'] == '100'

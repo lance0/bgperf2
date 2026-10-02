@@ -698,8 +698,15 @@ class Container(object):
     neighbor_sample_failures = 0
     neighbor_sample_consecutive_failures = 0
     neighbor_sample_last_error = None
+    neighbor_poll_interval_s = 1
 
     def neighbor_stats(self, queue):
+        # None disables this instrument without publishing an empty or fresh
+        # target observation. The monitor still runs its own sampler.
+        interval = self.neighbor_poll_interval_s
+        if interval is None:
+            return
+
         def stats():
             while True:
                 if self.stop_monitoring:
@@ -763,7 +770,7 @@ class Container(object):
                                   self.neighbor_sample_failures,
                                   self.neighbor_sample_last_error),
                               file=sys.stderr, flush=True)
-                time.sleep(1)
+                time.sleep(interval)
 
         t = Thread(target=stats)
         t.daemon = True
