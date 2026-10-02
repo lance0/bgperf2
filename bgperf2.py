@@ -87,6 +87,7 @@ from mako.template import Template
 from packaging import version
 from docker.types import IPAMConfig, IPAMPool
 import re
+from copy import deepcopy
 
 # The daemons bgperf2 can build images for, keyed by the name used on the
 # command line (`update <name>`) and in batch yaml. Adding a daemon here is
@@ -2590,13 +2591,17 @@ def bench(args):
         # costs a message rather than the previous run's containers. Mako can
         # execute stateful code, so reuse exactly the object we validate.
         # Loading used to be inside `total time`; retain its actual duration
-        # in that total without executing the template a second time.
-        scenario_load_start = time.monotonic()
-        with open(args.file) as f:
-            scenario_text = f.read()
+        # in that total without executing the template a second time. A batch
+        # supplies a private copy and charges only that copy's actual cost.
         try:
-            conf = render_scenario(scenario_text)
-            scenario_load_s = time.monotonic() - scenario_load_start
+            if hasattr(args, '_batch_scenario'):
+                conf = args._batch_scenario
+                scenario_load_s = args._batch_scenario_copy_s
+            else:
+                scenario_load_start = time.monotonic()
+                with open(args.file) as f:
+                    conf = render_scenario(f.read())
+                scenario_load_s = time.monotonic() - scenario_load_start
             refuse_scenario_single_table(
                 conf, "the scenario's target `single-table`")
             # Here rather than after the parse below, for the same reason
@@ -5196,7 +5201,7 @@ def batch_target_field(target, field):
     return batch_target_defaults(target).get(field) if value is None else value
 
 
-def check_batch_test(test):
+def check_batch_test(test, scenarios=None):
     '''Reject a test that cannot be expanded, before any container starts.
 
     Same reason as `batch_repetitions()`, and it was the gap next to it:
@@ -5205,7 +5210,12 @@ def check_batch_test(test):
     axis took the whole batch down with a traceback naming neither the test nor
     the key. An axis is required rather than defaulted, because a typo that
     quietly ran the matrix unfiltered is the failure this is here to prevent.
+
+    `scenarios` shares this invocation's parsed files with expansion and the
+    eventual cells. Standalone validation uses its own temporary mapping.
     '''
+    if scenarios is None:
+        scenarios = {}
     missing = [key for key in BATCH_TEST_KEYS if key not in test]
     if missing:
         sys.exit("test '{0}': missing required {1}: {2}".format(
@@ -5339,11 +5349,13 @@ def check_batch_test(test):
             # `SystemExit` there leaves `batch()`, ending the matrix hours in.
             # A file that is not there is left to fail at its cell as it always
             # has: refusing that up front is a separate change from this one.
-            if target.get('file') and os.path.isfile(target['file']):
-                with open(target['file']) as f:
-                    scenario = render_scenario(f.read())
+            path = target.get('file')
+            if path and (path in scenarios or os.path.isfile(path)):
+                if path not in scenarios:
+                    with open(path) as f:
+                        scenarios[path] = render_scenario(f.read())
                 refuse_scenario_single_table(
-                    scenario, "test '{0}': target {1!r}'s scenario file {2!r} "
+                    scenarios[path], "test '{0}': target {1!r}'s scenario file {2!r} "
                     'sets single-table, which'.format(
                         test['name'], target.get('label') or target.get('name'),
                         target['file']))
@@ -5574,7 +5586,7 @@ def check_batch_run_names(test, targets):
         seen[name] = target
 
 
-def expand_batch_cells(test, targets):
+def expand_batch_cells(test, targets, scenarios=None):
     '''Enumerate one test's matrix into the ordered list of runs it asks for.
 
     Repetitions repeat the whole matrix, not each cell: three back-to-back runs
@@ -5596,7 +5608,7 @@ def expand_batch_cells(test, targets):
     holding `bird` beside `bird #2` and `bird #3`. Adding repetitions changes
     what every row is, so it should cost a re-run rather than a mixed table.
     '''
-    check_batch_test(test)
+    check_batch_test(test, scenarios=scenarios)
     repetitions = batch_repetitions(test)
     scope = test.get('prefix_scope')
     # Carried on the cell rather than read from the test at run time, because
@@ -5919,16 +5931,20 @@ def batch(args):
     # as it came up still let a missing image in test 3 surface only after tests
     # 1 and 2 had run, which is the multi-hour wait this is meant to prevent.
     expanded = []
+    # Freeze each file's template once for this invocation. Keep these parsed
+    # objects outside target/cell identity and give each run its own copy.
+    scenarios = {}
     for test in batch_config['tests']:
         # Before anything reads the test, including `test['targets']` itself:
         # `check_batch_test()` exists so a missing or mistyped axis is named
         # rather than arriving as a bare KeyError, and every read that comes
         # first is a way to get that KeyError anyway.
-        check_batch_test(test)
+        check_batch_test(test, scenarios=scenarios)
         targets = expand_target_versions(test['targets'])
         check_batch_run_names(test, targets)
         order, seed = batch_order(test)
-        expanded.append((test, targets, expand_batch_cells(test, targets), order, seed))
+        expanded.append((test, targets, expand_batch_cells(
+            test, targets, scenarios=scenarios), order, seed))
     # One entry per target, not per cell: a repeated matrix asks about the same
     # images every pass, and reporting a missing image once per repetition
     # buries the list this exists to print.
@@ -6079,6 +6095,10 @@ def batch(args):
 
             for field in ['as_path_list_num', 'prefix_list_num', 'community_list_num', 'ext_community_list_num']:
                 setattr(a, field, t[field]) if field in t else setattr(a, field, 0)
+            if a.file in scenarios:
+                copy_start = time.monotonic()
+                a._batch_scenario = deepcopy(scenarios[a.file])
+                a._batch_scenario_copy_s = time.monotonic() - copy_start
             completed[cell_id] = bench(a)
 
             # Checkpoint both files atomically after every cell. If the process

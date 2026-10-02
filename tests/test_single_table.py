@@ -257,3 +257,72 @@ target: {{single-table: ${{"true" if count > 1 else "false"}}}}
         args.func(args)
     assert marker.read_text() == '1'
     assert consumed == [{'target': {'single-table': False}}]
+
+
+@pytest.mark.parametrize('separate_tests', [False, True])
+def test_batch_consumes_validated_scenario_copies(
+        separate_tests, tmp_path, monkeypatch):
+    import copy
+    import yaml
+
+    marker = tmp_path / 'renders'
+    scenario = tmp_path / 'scenario.yaml'
+    scenario.write_text('''<%
+from pathlib import Path
+marker = Path({marker!r})
+count = int(marker.read_text()) + 1 if marker.exists() else 1
+marker.write_text(str(count))
+%>
+target: {{single-table: ${{"true" if count > 3 else "false"}}}}
+'''.format(marker=str(marker)))
+    matrix = tmp_path / 'batch.yaml'
+    targets = [{'name': 'bird', 'file': str(scenario)}]
+    tests = ([a_test(name='first', neighbors=[1], targets=targets),
+              a_test(name='second', neighbors=[2], targets=targets)] if separate_tests
+             else [a_test(neighbors=[1, 2], targets=targets)])
+    matrix.write_text(yaml.safe_dump({'tests': tests}))
+    consumed, effects = [], []
+
+    class ScenarioConsumed(Exception):
+        pass
+
+    def capture(args, conf):
+        consumed.append((args.neighbor_num, copy.deepcopy(conf)))
+        # A runtime mutation in one cell must not alter the next cell's input.
+        conf['target']['from_previous_cell'] = True
+        raise ScenarioConsumed
+
+    original_bench = bgperf2.bench
+
+    def run_cell(args):
+        try:
+            original_bench(args)
+        except ScenarioConsumed:
+            return [bgperf2.run_name(args)]
+
+    for name in ('install_stop_handlers', 'start_interruption_watch',
+                 'warn_if_machine_is_busy', 'warn_if_log_dir_is_in_ram',
+                 'warn_if_log_dir_is_short_on_space'):
+        monkeypatch.setattr(bgperf2, name, lambda *args: None)
+    monkeypatch.setattr(bgperf2, 'remove_target_containers',
+                        lambda: effects.append('teardown'))
+    monkeypatch.setattr(bgperf2, 'remove_old_containers', lambda: None)
+    monkeypatch.setattr(bgperf2, 'check_batch_images',
+                        lambda *args: effects.append('images'))
+    monkeypatch.setattr(bgperf2.GoBGP, 'require_image', lambda *args: 'monitor-image')
+    monkeypatch.setattr(bgperf2, 'warn_if_trace_io_reaches_no_generator', capture)
+    monkeypatch.setattr(bgperf2, 'bench', run_cell)
+    monkeypatch.setattr(bgperf2, 'create_batch_graphs', lambda *args, **kwargs: None)
+    args = bgperf2.create_args_parser().parse_args(
+        ['-d', str(tmp_path), 'batch', '-c', str(matrix),
+         '--results-dir', str(tmp_path)])
+    for invocation in (1, 2):
+        consumed.clear()
+        effects.clear()
+        args.func(args)
+        assert marker.read_text() == str(invocation)
+        assert consumed == [(1, {'target': {'single-table': False}}),
+                            (2, {'target': {'single-table': False}})]
+        assert effects == ['images', 'teardown', 'teardown']
+    for progress in tmp_path.glob('*.progress.json'):
+        assert '_batch_scenario' not in progress.read_text()

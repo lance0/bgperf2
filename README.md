@@ -649,6 +649,13 @@ Configs that play back MRT data expect the file at `mrt/rib.20210801.0000`, whic
 downloads. Paths in a batch config may be relative or use `~`; they are resolved before being
 handed to Docker. Keep personal, unshared configs in `benchmarks/local/` — that path is gitignored.
 
+Each scenario named by a target's `file:` is rendered once per path at batch startup, before image
+checks or any cell runs. Every cell uses an independent copy of that validated configuration.
+Stateful templates no longer vary on each cell; use generated scenarios with matrix axes or
+separate scenario files for different workloads. Template rendering is batch preparation outside
+cell `total time`; each cell includes its actual configuration-copy cost. Direct `bench -f` includes
+its own read/render duration as before.
+
 ### Repeating a matrix
 
 One run of a cell tells you nothing about how much that number moves between runs. Add

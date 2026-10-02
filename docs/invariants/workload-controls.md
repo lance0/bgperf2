@@ -371,6 +371,13 @@ argparse's bare `unrecognized arguments`.
   duration remains included in `total time`. A batch `file:` target's scenario is read in
   `check_batch_test()` for the same reason one level up: refused at its cell, the `SystemExit` would
   end the whole matrix.
+- **A batch renders each scenario file once per invocation**, before image checks or any cell.
+  Validation and expansion share those parsed objects; each cell receives an independent deep
+  copy so runtime mutations cannot change a later cell. The objects stay outside target/cell IDs
+  and progress files. Stateful templates no longer produce per-cell variation; use generated
+  scenarios with matrix axes or separate scenario files for distinct workloads. Preflight rendering
+  is batch preparation outside cell `total time`; each cell includes its actual copy cost, not a
+  repeated render cost.
 - `gen_conf()` no longer writes `single-table` into the scenario; the stats row keeps its `flags`
   column (always empty) for the stats contract.
 
