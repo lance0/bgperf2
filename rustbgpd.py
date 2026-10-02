@@ -15,6 +15,7 @@ RUSTBGPD_SOURCE = os.environ.get(
     'RUSTBGPD_SOURCE', '/home/lance/projects/rustbgpd')
 RUSTBGPD_EVENT_HISTORY_ENV = 'RUSTBGPD_EVENT_HISTORY'
 RUSTBGPD_EVENT_HISTORY_OFF_ENV = 'RUSTBGPD_EVENT_HISTORY_OFF'
+RUSTBGPD_NEIGHBOR_POLL_MODE_ENV = 'RUSTBGPD_NEIGHBOR_POLL_MODE'
 
 # Both bases are pinned by multi-platform OCI index digest. The rustbgpd
 # workspace declares Rust 1.95 as its MSRV; Bookworm on both stages also keeps
@@ -247,6 +248,23 @@ class RustBGPd(Container):
 class RustBGPdTarget(RustBGPd, Target):
     CONTAINER_NAME = 'bgperf_rustbgpd_target'
     CONFIG_FILE_NAME = 'config.toml'
+
+    def __init__(self, host_dir, conf, image='bgperf/rustbgpd'):
+        self.neighbor_poll_mode = self._neighbor_poll_mode()
+        self.neighbor_poll_interval_s = {
+            'poll1': 1, 'poll5': 5, 'off': None,
+        }[self.neighbor_poll_mode]
+        super().__init__(host_dir, conf, image=image)
+
+    @staticmethod
+    def _neighbor_poll_mode(environ=None):
+        environ = os.environ if environ is None else environ
+        mode = environ.get(RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, 'poll1')
+        if mode not in ('poll1', 'poll5', 'off'):
+            raise RuntimeError(
+                '{} must be "poll1", "poll5", or "off", got {!r}'.format(
+                    RUSTBGPD_NEIGHBOR_POLL_MODE_ENV, mode))
+        return mode
 
     @staticmethod
     def _event_history_mode(environ=None):

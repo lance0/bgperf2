@@ -8,6 +8,7 @@ over a column of zeros, and a distribution over passes that ran against
 different images are each a number that would read as a finding and is not one.
 '''
 from argparse import Namespace
+import json
 
 import pytest
 import yaml
@@ -40,6 +41,7 @@ def a_row(**overrides):
         'flags': '', 'date': '2026-09-03', 'cores': '32', 'Mem (GB)': '64.00GB',
         'tester errors': 0, 'tester timeouts': 0, 'failed': '', 'MSG': '',
         'filters': '', 'max foreign cpu %': 0, 'target image': 'bgperf/bird:2.19.2',
+        'neighbor poll mode': '',
         'tester version': '2.19.2', 'monitor version': '3.38.0',
     }
     values.update(overrides)
@@ -319,6 +321,36 @@ class TestSummarizeCell:
         assert cell['identity']['required'] == 10
         assert cell['metrics']['received']['median'] == 10
 
+    @pytest.mark.parametrize('mode', ['poll1', 'poll5', 'off', ''])
+    def test_matching_poll_modes_are_recorded_without_disagreement(self, mode):
+        cell = summary.summarize_cell(HEADER, a_group([
+            a_row(**{'neighbor poll mode': mode}),
+            a_row(**{'neighbor poll mode': mode})]))
+        assert cell['identity']['neighbor poll mode'] == mode
+        assert 'inconsistent' not in cell
+
+    def test_an_older_header_does_not_invent_a_poll_mode(self):
+        position = HEADER.index('neighbor poll mode')
+        header = HEADER[:position] + HEADER[position + 1:]
+        row = a_row()
+        row.pop(position)
+        document = summary.summarize_batch('old', header, [a_group([row, row])],
+                                           repetitions=2)
+        cell = document['cells'][0]
+        assert cell['observations'] == 2
+        assert cell['metrics']['elapsed (s)']['median'] == 40
+        assert 'neighbor poll mode' not in cell['identity']
+        assert 'inconsistent' not in cell
+
+    def test_a_stored_row_without_poll_mode_remains_unreadable_under_new_header(self):
+        row = a_row()
+        row.pop(HEADER.index('neighbor poll mode'))
+        cell = summary.summarize_cell(HEADER, a_group([
+            row, a_row(**{'neighbor poll mode': 'off'})]))
+        assert [p['state'] for p in cell['passes']] == [summary.UNREADABLE, summary.OBSERVED]
+        assert cell['observed_passes'] == [2]
+        assert cell['identity']['neighbor poll mode'] == 'off'
+
 
 class TestSummarizeBatch:
     def test_the_document_names_its_schema_and_its_passes(self):
@@ -462,6 +494,22 @@ class TestBatchSummaryGroups:
         completed = {bgperf2.batch_cell_id('sum', cells[1]): a_row()}
         groups = bgperf2.batch_summary_groups('sum', cells, completed)
         assert [p['row'] is None for p in groups[0]['passes']] == [True, False]
+
+    def test_resuming_with_another_poll_mode_reports_configuration_disagreement(self, tmp_path):
+        test = a_test(repetitions=2, targets=[{'name': 'rustbgpd'}])
+        cells = bgperf2.expand_batch_cells(test, test['targets'])
+        completed = {
+            bgperf2.batch_cell_id('sum', cells[0]): a_row(**{'neighbor poll mode': 'poll1'}),
+        }
+        # The same persisted cell IDs are reused after an environment change.
+        completed[bgperf2.batch_cell_id('sum', cells[1])] = a_row(**{'neighbor poll mode': 'off'})
+        path = tmp_path / 'sum.summary.json'
+        lines = bgperf2.publish_batch_summary(path, 'sum', cells, completed, 2)
+        cell = json.loads(path.read_text())['cells'][0]
+        assert cell['inconsistent']['neighbor poll mode'] == ['poll1', 'off']
+        assert cell['identity']['neighbor poll mode'] == ['poll1', 'off']
+        assert cell['observed_passes'] == [1, 2]
+        assert any('disagree on neighbor poll mode' in line for line in lines)
 
     def test_grouping_does_not_depend_on_the_order_the_cells_ran_in(self):
         '''`ordinal` is a cell's place in the matrix, which is the one field a

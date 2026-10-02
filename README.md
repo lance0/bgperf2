@@ -268,8 +268,8 @@ Min %idle 94.7, Min mem free 57.15GB
 Time since first received prefix: 4
 total time: 31.32s
 
-name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date, cores, Mem (GB), tester errors, tester timeouts, failed, MSG, filters, max foreign cpu %, target image, tester version, monitor version
-bird,bird,2.17.1+branch.master.fe0c22277c21,100,100,9900,10000,18,5,1,4,31.32,23,0.01,95,57.152,,2026-08-07,32,60.73GB,0,0,,,,0,bgperf/bird:latest,2.17.1+branch.master.fe0c22277c21,3.37.0
+name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date, cores, Mem (GB), tester errors, tester timeouts, failed, MSG, filters, max foreign cpu %, neighbor poll mode, target image, tester version, monitor version
+bird,bird,2.17.1+branch.master.fe0c22277c21,100,100,9900,10000,18,5,1,4,31.32,23,0.01,95,57.152,,2026-08-07,32,60.73GB,0,0,,,,0,,bgperf/bird:latest,2.17.1+branch.master.fe0c22277c21,3.37.0
 ```
 
 As you might notice, the interesting statistics are shown twice, once in an easy to read format and the second

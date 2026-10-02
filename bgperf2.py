@@ -2375,6 +2375,8 @@ def target_holds_suffix(witness):
 
 
 def bench(args):
+    if args.target == 'rustbgpd':
+        RustBGPdTarget._neighbor_poll_mode()
     # Here as well as in `batch()`, because a `bench` run is also a thing a
     # reclaim can take away -- `scripts/calibration_case.sh` drives one
     # directly, and so does anyone debugging a cell. Both calls are idempotent:
@@ -3345,6 +3347,8 @@ def collect_provenance(args, target, monitor, testers):
         'monitor': describe('gobgp', monitor),
         'testers': [],
     }
+    if hasattr(target, 'neighbor_poll_mode'):
+        provenance['target']['neighbor_poll_mode'] = target.neighbor_poll_mode
     # A run can be a hundred tester containers off one tag. Inspect every
     # running identity, then ask the daemon version once per distinct
     # (configured tag, immutable image ID) pair.
@@ -4796,10 +4800,9 @@ def stats_header():
     # NOTE: must stay in sync with the row built by create_output_stats();
     # tests/test_stats_contract.py enforces that they are the same length.
     #
-    # The provenance columns are appended at the END on purpose:
-    # create_batch_graphs() indexes this row positionally, so inserting a column
-    # anywhere earlier silently shifts every graph and every existing CSV.
-    return("name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date, cores, Mem (GB), tester errors, tester timeouts, failed, MSG, filters, max foreign cpu %, target image, tester version, monitor version")
+    # Keep metric positions fixed for create_batch_graphs(). New controls go
+    # after those metrics and before the final three provenance columns.
+    return("name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date, cores, Mem (GB), tester errors, tester timeouts, failed, MSG, filters, max foreign cpu %, neighbor poll mode, target image, tester version, monitor version")
 
 
 def row_message(value):
@@ -4893,6 +4896,7 @@ def create_output_stats(args, target_version, stats, fail=False, provenance=None
     # generated and measured the load.
     p = provenance or {}
     testers = p.get('testers') or []
+    out.append((p.get('target') or {}).get('neighbor_poll_mode', ''))
     out.extend([(p.get('target') or {}).get('image', ''),
                 '; '.join(sorted({t.get('version', '') for t in testers})),
                 (p.get('monitor') or {}).get('version', '')])
@@ -5783,6 +5787,8 @@ def check_batch_images(targets):
     A batch is hours of work; finding out at target number six that its image
     was never built means throwing away everything after it.
     '''
+    if any(t['name'] == 'rustbgpd' for t in targets):
+        RustBGPdTarget._neighbor_poll_mode()
     missing = []
     for t in targets:
         try:

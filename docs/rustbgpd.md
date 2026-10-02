@@ -53,6 +53,36 @@ no `[security.grpc]` block; rustbgpd v0.63 and later refuse the retired
 empty poll. Malformed output or a failed exec is a failed read, which the
 shared sampler counts and the run's event artifact reports.
 
+## Neighbor polling control
+
+Set `RUSTBGPD_NEIGHBOR_POLL_MODE` to exactly `poll1` (the default), `poll5`,
+or `off`. The first two read `rbgp --json neighbor` immediately, then wait
+one or five seconds after each read, including failed reads. `off` starts no
+target neighbor sampler and issues no neighbor CLI reads. CPU/memory and
+monitor sampling continue unchanged; other daemon targets ignore this variable.
+
+```bash
+RUSTBGPD_NEIGHBOR_POLL_MODE=poll1 ./bgperf2.py bench -t rustbgpd -n 2 -p 100000 --results-dir results/poll1-a
+RUSTBGPD_NEIGHBOR_POLL_MODE=off   ./bgperf2.py bench -t rustbgpd -n 2 -p 100000 --results-dir results/off-a
+```
+
+This measures the harness's own read overhead. With `off`, convergence uses
+the monitor's checkpoint and the full 20-sample assurance window, rather
+than the five-sample window available when both monitor and target confirm
+completion. `poll5` can delay that second confirmation. A skipped read never
+supplies a fresh target observation or a zero table witness. Monitor-only
+completion is also named in the events artifact's `convergence_rule`.
+
+The target freezes the effective mode when it is constructed. The CSV's
+`neighbor poll mode` column and `target.neighbor_poll_mode` in
+`*.versions.json` record it, including the default. The CSV column is blank
+for other targets and precedes the final three provenance columns.
+
+Use separate results directories for each mode and repetition; the mode is
+not an artifact-name or batch-resume axis. Compare alternating runs under the
+same benchmark lock and inspect convergence and target CPU together. No
+timed `poll1`/`off` comparison is implied by support for this control.
+
 ## DHAT heap profiles
 
 Build the heap-profiling image with `--profile dhat`, into its own tag:
