@@ -56,7 +56,7 @@ PROVENANCE_COLUMNS = ('target image', 'tester version', 'monitor version')
 
 # Configuration the target reported back, kept beside the metrics so a median
 # `received` can be read against what the run required.
-ROW_IDENTITY_COLUMNS = ('required',)
+ROW_IDENTITY_COLUMNS = ('required', 'neighbor poll mode')
 
 # What a run writes into a column it never sampled. Passed in by the caller
 # rather than known here, because the sentinel is a property of the controller
@@ -732,6 +732,10 @@ def summarize_cell(header, group, unavailable=None):
     identity = dict(group.get('identity') or {})
     inconsistent = {}
     for column in ROW_IDENTITY_COLUMNS:
+        # Older captures predate the control. Do not invent their mode or
+        # make an otherwise readable historical summary unavailable.
+        if column == 'neighbor poll mode' and column not in index:
+            continue
         identity[column], disagreement = _agreement(rows, index, column)
         if disagreement:
             inconsistent[column] = disagreement
@@ -777,7 +781,7 @@ def summarize_batch(test_name, header, groups, repetitions=1, unavailable=None):
     missing = [column for column in
                METRIC_COLUMNS + PROVENANCE_COLUMNS + ROW_IDENTITY_COLUMNS
                + (FAILED_COLUMN, MESSAGE_COLUMN)
-               if column not in header]
+               if column not in header and column != 'neighbor poll mode']
     if missing:
         raise ValueError(
             'the stats header does not carry {0}; summary.py reads the row by '
