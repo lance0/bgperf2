@@ -282,3 +282,69 @@ class TestAnEmptyOpenbgpReadIsNotAnEmptyFleet:
         message = str(caught.value)
         assert 'bgperf_openbgp_target' in message
         assert 'bgpctl' in message
+
+
+@pytest.mark.parametrize('payload,error', [
+    (BAD, 'CliDecodeError'),
+    (b'[{"afi_safis": [{"state": {"accepted":', 'JSONDecodeError'),
+])
+def test_monitor_skips_only_the_failed_read(payload, error, monkeypatch):
+    import queue
+    from types import SimpleNamespace
+    from test_neighbor_sampling import FlakyMonitor, GOOD_MONITOR_PAYLOAD
+
+    mon = FlakyMonitor([payload, GOOD_MONITOR_PAYLOAD])
+    samples = queue.Queue()
+    waits = []
+
+    class InlineThread:
+        def __init__(self, target):
+            self.run = target
+
+        def start(self):
+            self.run()
+
+    def wait(seconds):
+        waits.append(seconds)
+        assert samples.qsize() == mon.reads - 1
+        if mon.reads == 2:
+            mon.stop_monitoring = True
+
+    monkeypatch.setattr(monitor_module, 'Thread', InlineThread)
+    monkeypatch.setattr(monitor_module, 'time', SimpleNamespace(
+        monotonic=lambda: float(mon.reads), sleep=wait))
+    mon.stats(samples, interval=5)
+
+    assert waits == [5, 5]
+    assert mon.monitor_sample_failures == 1
+    assert mon.monitor_sample_consecutive_failures == 0
+    assert error in mon.monitor_sample_last_error
+    sample = samples.get_nowait()
+    assert sample['monotonic_s'] == 1.0
+    assert sample['afi_safis'][0]['state']['accepted'] == 50
+    assert samples.empty()
+
+
+@pytest.mark.parametrize('status', ['converged', 'failed'])
+def test_delivery_failure_still_writes_the_event_artifact(
+        status, tmp_path, monkeypatch, bench_args):
+    import bgperf2
+
+    def explode(samples):
+        raise TypeError('invalid delivery evidence')
+
+    bench_args.results_dir = str(tmp_path)
+    samples = TestTheArtifactOutlivesItsOwnDerivation().samples()
+    monkeypatch.setattr(measurements_module, 'delivery_metrics', explode)
+    doc = bgperf2.write_event_artifact(
+        bench_args, [], 'run', status, target_table=samples)
+
+    written = json.loads((tmp_path / 'run.events.json').read_text())
+    assert written == doc
+    assert written['status'] == status
+    assert written['target_table']['samples'] == samples
+    assert written['target_table']['series']
+    delivery = written['target_table']['delivery']
+    assert delivery['unresolved_reason'] == 'derivation_raised'
+    assert delivery['unresolved_detail'] == 'TypeError: invalid delivery evidence'
+    assert all(delivery[key] is None for key in measurements_module._DELIVERY_FIELDS)
