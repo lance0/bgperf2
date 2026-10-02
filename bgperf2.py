@@ -5355,10 +5355,11 @@ def check_batch_test(test, scenarios=None):
                     with open(path) as f:
                         scenarios[path] = render_scenario(f.read())
                 refuse_scenario_single_table(
-                    scenarios[path], "test '{0}': target {1!r}'s scenario file {2!r} "
+                    scenarios[path], "test '{0}': target {1!r}, scenario file {2!r} "
                     'sets single-table, which'.format(
                         test['name'], target.get('label') or target.get('name'),
                         target['file']))
+                scenario_receivers(scenarios[path])
         except ValueError as e:
             sys.exit(str(e))
         misplaced = sorted(k for k in target if k in BATCH_TEST_ONLY_KEYS)

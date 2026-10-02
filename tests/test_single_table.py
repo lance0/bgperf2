@@ -116,7 +116,7 @@ def test_a_batch_file_target_asking_for_it_is_refused_before_any_cell(tmp_path):
     test = a_test(targets=[{'name': 'bird', 'file': str(scenario)}])
     with pytest.raises(SystemExit) as raised:
         bgperf2.check_batch_test(test)
-    assert "scenario file" in str(raised.value)
+    assert "target 'bird', scenario file" in str(raised.value)
     assert 'sets single-table, which is refused' in str(raised.value)
 
 
@@ -195,6 +195,23 @@ def test_entire_batch_is_refused_before_image_checks_or_first_cell(
     args = bgperf2.create_args_parser().parse_args(
         ['batch', '-c', str(matrix), '--results-dir', str(tmp_path)])
     with pytest.raises(SystemExit, match='no target implements it'):
+        args.func(args)
+
+
+def test_later_file_receivers_are_refused_before_images_or_first_cell(
+        tmp_path, no_runtime_side_effects):
+    import yaml
+
+    scenario = tmp_path / 'bad-receivers.yaml'
+    scenario.write_text('target: {as: 1000}\nreceivers: 3\n')
+    matrix = tmp_path / 'batch.yaml'
+    matrix.write_text(yaml.safe_dump({'tests': [a_test(targets=[
+        {'name': 'bird', 'label': 'valid first'},
+        {'name': 'bird', 'label': 'invalid later', 'file': str(scenario)},
+    ])]}))
+    args = bgperf2.create_args_parser().parse_args(
+        ['batch', '-c', str(matrix), '--results-dir', str(tmp_path)])
+    with pytest.raises(SystemExit, match='must be a list of sessions'):
         args.func(args)
 
 
