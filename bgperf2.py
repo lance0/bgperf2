@@ -2426,6 +2426,7 @@ def bench(args):
     dckr_net_name = args.docker_network_name or args.bench_name + '-br'
 
     target_image_name = None
+    scenario_load_s = 0.0
     # First, and outside the `-f` branch: the flag reaches nothing on either
     # path, and it reads only the command line.
     try:
@@ -2586,24 +2587,24 @@ def bench(args):
                                          args.image)
     else:
         # A scenario file is checked before the teardown too, so a refusal
-        # costs a message rather than the previous run's containers. The file
-        # is read once, here, so the check and the run see the same text; it is
-        # rendered again below rather than reused, because that render has
-        # always sat inside `total time` and moving it out would shorten every
-        # `-f` run's column relative to the rows it is compared with.
+        # costs a message rather than the previous run's containers. Mako can
+        # execute stateful code, so reuse exactly the object we validate.
+        # Loading used to be inside `total time`; retain its actual duration
+        # in that total without executing the template a second time.
+        scenario_load_start = time.monotonic()
         with open(args.file) as f:
             scenario_text = f.read()
         try:
-            early = render_scenario(scenario_text)
+            conf = render_scenario(scenario_text)
+            scenario_load_s = time.monotonic() - scenario_load_start
             refuse_scenario_single_table(
-                early, "the scenario's target `single-table`")
+                conf, "the scenario's target `single-table`")
             # Here rather than after the parse below, for the same reason
             # (bgperf2-urp): `resolve_receivers()` guards every path that
             # builds a scenario; this guards the one path handed one.
-            scenario_receivers(early)
+            scenario_receivers(conf)
         except ValueError as e:
             sys.exit(str(e))
-        del early
     # The monitor is the measurement instrument. Resolve its selected GoBGP
     # image here too, after the command-line guards and before teardown, so a
     # missing tag cannot destroy the previous row's containers and diagnostics.
@@ -2624,10 +2625,8 @@ def bench(args):
     warn_if_log_dir_is_in_ram(config_dir)
     warn_if_log_dir_is_short_on_space(config_dir)
 
-    bench_start = time.time()
-    if args.file:
-        conf = render_scenario(scenario_text)
-    else:
+    bench_start = time.time() - scenario_load_s
+    if not args.file:
         conf = gen_conf(args)
 
         if not os.path.exists(config_dir):

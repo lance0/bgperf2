@@ -140,3 +140,120 @@ def test_a_scenarios_bad_receivers_are_refused_before_the_teardown(tmp_path, mon
         bgperf2.bench(args)
     assert 'must be a list of sessions' in str(raised.value)
     assert not torn_down
+
+
+@pytest.fixture
+def no_runtime_side_effects(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail('invalid request reached Docker or teardown')
+
+    monkeypatch.setattr(bgperf2, 'install_stop_handlers', lambda: None)
+    monkeypatch.setattr(bgperf2, 'start_interruption_watch', lambda: None)
+    for name in ('target_image', 'check_batch_images',
+                 'remove_target_containers', 'remove_old_containers'):
+        monkeypatch.setattr(bgperf2, name, unexpected)
+    monkeypatch.setattr(bgperf2.GoBGP, 'require_image', unexpected)
+
+
+@pytest.mark.parametrize('command', ['bench', 'config'])
+def test_cli_refusal_precedes_docker_and_output(
+        command, tmp_path, no_runtime_side_effects):
+    output = tmp_path / 'output'
+    args = bgperf2.create_args_parser().parse_args(
+        [command, '-s', '-o', str(output)])
+    with pytest.raises(SystemExit, match='no target implements it'):
+        args.func(args)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize('value', ['true', '"false"'])
+def test_scenario_refusal_precedes_monitor_image_preflight(
+        value, tmp_path, no_runtime_side_effects):
+    scenario = tmp_path / 'scenario.yaml'
+    scenario.write_text('target: {single-table: ' + value + '}\n')
+    args = bgperf2.create_args_parser().parse_args(['bench', '-f', str(scenario)])
+    with pytest.raises(SystemExit, match='no target implements it'):
+        args.func(args)
+
+
+@pytest.mark.parametrize('value', [True, 'false'])
+@pytest.mark.parametrize('from_file', [False, True])
+def test_entire_batch_is_refused_before_image_checks_or_first_cell(
+        value, from_file, tmp_path, no_runtime_side_effects):
+    import yaml
+
+    target = {'name': 'bird', 'single_table': value}
+    if from_file:
+        scenario = tmp_path / 'scenario.yaml'
+        scenario.write_text(yaml.safe_dump({'target': {'single-table': value}}))
+        target = {'name': 'bird', 'file': str(scenario)}
+    matrix = tmp_path / 'batch.yaml'
+    matrix.write_text(yaml.safe_dump({'tests': [
+        a_test(name='valid first'),
+        a_test(name='invalid later', targets=[target]),
+    ]}))
+    args = bgperf2.create_args_parser().parse_args(
+        ['batch', '-c', str(matrix), '--results-dir', str(tmp_path)])
+    with pytest.raises(SystemExit, match='no target implements it'):
+        args.func(args)
+
+
+@pytest.mark.parametrize('explicit_false', [False, True])
+def test_default_and_explicit_false_emit_ordinary_configuration(
+        explicit_false, tmp_path, no_runtime_side_effects):
+    output = tmp_path / 'scenario.yaml'
+    args = bgperf2.create_args_parser().parse_args(
+        ['config', '-n', '2', '-p', '3', '-o', str(output)])
+    if explicit_false:
+        args.single_table = False
+    else:
+        del args.single_table
+    args.func(args)
+    scenario = bgperf2.render_scenario(output.read_text())
+    assert 'single-table' not in scenario['target']
+    assert sum(len(tester['neighbors']) for tester in scenario['testers']) == 2
+
+
+def test_active_example_matrices_do_not_request_the_retired_mode():
+    import yaml
+    from conftest import REPO_ROOT
+
+    for name in ('bench-bird.yaml', 'big-tests.yaml'):
+        matrix = yaml.safe_load((REPO_ROOT / 'benchmarks' / name).read_text())
+        for test in matrix['tests']:
+            bgperf2.check_batch_test(test)
+            assert all(not target.get('single_table') for target in test['targets'])
+
+
+def test_bench_consumes_the_scenario_it_validated(tmp_path, monkeypatch):
+    marker = tmp_path / 'renders'
+    scenario = tmp_path / 'scenario.yaml'
+    scenario.write_text('''<%
+from pathlib import Path
+marker = Path({marker!r})
+count = int(marker.read_text()) + 1 if marker.exists() else 1
+marker.write_text(str(count))
+%>
+target: {{single-table: ${{"true" if count > 1 else "false"}}}}
+'''.format(marker=str(marker)))
+    consumed = []
+
+    class ScenarioConsumed(Exception):
+        pass
+
+    def capture(args, conf):
+        consumed.append(conf)
+        raise ScenarioConsumed
+
+    for name in ('install_stop_handlers', 'start_interruption_watch',
+                 'remove_target_containers', 'warn_if_machine_is_busy',
+                 'warn_if_log_dir_is_in_ram', 'warn_if_log_dir_is_short_on_space'):
+        monkeypatch.setattr(bgperf2, name, lambda *args: None)
+    monkeypatch.setattr(bgperf2.GoBGP, 'require_image', lambda *args: 'monitor-image')
+    monkeypatch.setattr(bgperf2, 'warn_if_trace_io_reaches_no_generator', capture)
+    args = bgperf2.create_args_parser().parse_args(
+        ['bench', '-f', str(scenario), '-r'])
+    with pytest.raises(ScenarioConsumed):
+        args.func(args)
+    assert marker.read_text() == '1'
+    assert consumed == [{'target': {'single-table': False}}]

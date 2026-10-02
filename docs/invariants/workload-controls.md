@@ -365,10 +365,12 @@ argparse's bare `unrecognized arguments`.
 - The dead path and the switch were deleted together with the flag, which is safe only because
   of the second point: the rendered BIRD config is byte-identical before and after (verified
   across threads, filter test and policy reload).
-- **The `-f` refusal reads the scenario before the teardown.** The main parse sits after it, so a
-  refusal there would already have cost the previous run's containers -- the rule every guard in
-  `bench()` follows. A batch `file:` target's scenario is read in `check_batch_test()` for the
-  same reason one level up: refused at its cell, the `SystemExit` would end the whole matrix.
+- **The `-f` refusal reads the scenario before the teardown.** Parsing used to happen after it,
+  so a refusal there would already have cost the previous run's containers -- the rule every guard
+  in `bench()` follows. The parsed object is reused because Mako can execute stateful code; its load
+  duration remains included in `total time`. A batch `file:` target's scenario is read in
+  `check_batch_test()` for the same reason one level up: refused at its cell, the `SystemExit` would
+  end the whole matrix.
 - `gen_conf()` no longer writes `single-table` into the scenario; the stats row keeps its `flags`
   column (always empty) for the stats contract.
 
