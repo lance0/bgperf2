@@ -649,6 +649,13 @@ Configs that play back MRT data expect the file at `mrt/rib.20210801.0000`, whic
 downloads. Paths in a batch config may be relative or use `~`; they are resolved before being
 handed to Docker. Keep personal, unshared configs in `benchmarks/local/` — that path is gitignored.
 
+Each scenario named by a target's `file:` is rendered once per path at batch startup, before image
+checks or any cell runs. Every cell uses an independent copy of that validated configuration.
+Stateful templates no longer vary on each cell; use generated scenarios with matrix axes or
+separate scenario files for different workloads. Template rendering is batch preparation outside
+cell `total time`; each cell includes its actual configuration-copy cost. Direct `bench -f` includes
+its own read/render duration as before.
+
 ### Repeating a matrix
 
 One run of a cell tells you nothing about how much that number moves between runs. Add
@@ -727,6 +734,13 @@ gobgp,gobgp,2.29.0,100,10000,5,661,0,661,724.83,1664,1.846,,2021-08-02,32,62.82G
 frr 8,frr_c,FRRouting 8.0-bgperf (74ac3704b034).,100,10000,1,8,1,7,70.46,103,1.116,,2021-08-02,32,62.82GB
 rustybgp,rustybgp,exec,100,10000,6,16,0,16,80.37,597,1.253,,2021-08-02,32,62.82GB
 ```
+
+That example and its output are from 2021-08-02 and are kept as they were; this config no longer
+runs. The `frr` target has since been removed, and `single_table` is now refused. On that date `-s`
+still changed BIRD's config: without it, each peer got its own table and a pipe copying the whole
+table into it. From 2021-08-13 BIRD built one shared table whether or not `-s` was given, so any
+`bird -s` row from after that date is the same configuration as a `bird` row. See
+`docs/invariants/workload-controls.md`.
 
 It will create graphs and a CSV file of the output.
 
