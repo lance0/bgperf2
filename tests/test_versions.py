@@ -44,6 +44,8 @@ class TestResolveRef:
     @pytest.mark.parametrize('version,ref', [
         ('2.19.2', 'v2.19.2'),
         ('3.3.2', 'v3.3.2'),
+        ('2.19.3', '5c6376d3075a58d1d378f6d6a7fd50fc0750a72a'),  # pinned
+        ('3.3.3', '2ed8b59333bed0f328c6804b70c09412b2f608d4'),   # pinned
         ('2.18', 'v2.18'),
         ('master', 'master'),
     ])
@@ -53,6 +55,8 @@ class TestResolveRef:
     def test_gobgp(self):
         assert GoBGP.resolve_ref('3.37.0') == 'v3.37.0'
         assert GoBGP.resolve_ref('4.8.0') == 'v4.8.0'
+        assert (GoBGP.resolve_ref('4.10.0')
+                == 'da824d99912e02124b53741245ee4186c381adcc')
 
     @pytest.mark.parametrize('version,ref', [
         ('2026-02', '0cc685c'),   # date labels map onto the commit they name
@@ -283,6 +287,25 @@ class TestRenderDockerfile:
         assert ('FROM golang:1.25-bookworm@sha256:'
                 '3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437') in recipe
         assert 'git checkout v4.8.0' in recipe
+
+    def test_gobgp_4_10_is_pinned_by_commit_and_builder_digest(self):
+        recipe = GoBGP.render_dockerfile('4.10.0')
+        assert ('FROM golang:1.25-bookworm@sha256:'
+                '3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437') in recipe
+        assert 'git checkout da824d99912e02124b53741245ee4186c381adcc' in recipe
+
+    @pytest.mark.parametrize('version,sha', [
+        ('2.19.3', '5c6376d3075a58d1d378f6d6a7fd50fc0750a72a'),
+        ('3.3.3', '2ed8b59333bed0f328c6804b70c09412b2f608d4'),
+    ])
+    def test_pinned_bird_is_pinned_by_commit_and_base_digest(self, version, sha):
+        recipe = BIRD.render_dockerfile(version)
+        assert ('FROM ubuntu:26.04@sha256:'
+                'f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7') in recipe
+        assert 'git checkout {0}'.format(sha) in recipe
+
+    def test_unpinned_bird_keeps_the_default_base(self):
+        assert 'FROM ubuntu:latest' in BIRD.render_dockerfile('2.19.2')
 
     def test_build_vars_reach_the_recipe(self):
         class Pinned(FRRoutingCompiled):

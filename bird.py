@@ -484,8 +484,15 @@ class BIRD(Container):
     GUEST_DIR = '/root/config'
     IMAGE_REPO = 'bgperf/bird'
     DAEMON_BINARY = '/usr/local/sbin/bird'
-    VERSIONS = ('2.19.2', '3.3.2')
+    VERSIONS = ('2.19.3', '3.3.3')
     DEFAULT_REF = 'master'
+    # Commit the annotated release tag peeled to when pinned
+    # (`git ls-remote ... refs/tags/v<version>^{}`), so a moved tag cannot
+    # change what a pinned version builds.
+    VERSION_REFS = {
+        '2.19.3': '5c6376d3075a58d1d378f6d6a7fd50fc0750a72a',
+        '3.3.3': '2ed8b59333bed0f328c6804b70c09412b2f608d4',
+    }
 
     def __init__(self, host_dir, conf, image='bgperf/bird', name=None):
         super(BIRD, self).__init__(name if name is not None else self.CONTAINER_NAME, image, host_dir, self.GUEST_DIR, conf)
@@ -515,6 +522,8 @@ class BIRD(Container):
         if not version:
             return cls.DEFAULT_REF
         version = str(version).strip()
+        if version in cls.VERSION_REFS:
+            return cls.VERSION_REFS[version]
         if re.fullmatch(r'\d+(\.\d+)*', version):
             return 'v{0}'.format(version)
         return version
@@ -527,7 +536,15 @@ class BIRD(Container):
     }
     # BIRD 3 has different build dependencies from BIRD 2; override per series
     # here, or drop a whole Dockerfile in dockerfiles/bird/<version>.dockerfile.
-    VERSION_BUILD_VARS = ()
+    UBUNTU_26_04 = {
+        'base_image': (
+            'ubuntu:26.04@sha256:'
+            'f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7'
+        ),
+    }
+    VERSION_BUILD_VARS = (
+        (lambda v: v in BIRD.VERSION_REFS, UBUNTU_26_04),
+    )
 
     @classmethod
     def build_image(cls, force=False, tag=None, checkout=None, nocache=False, version=None):

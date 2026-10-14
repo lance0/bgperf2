@@ -32,8 +32,15 @@ class GoBGP(Container):
     GUEST_DIR = '/root/config'
     IMAGE_REPO = 'bgperf/gobgp'
     DAEMON_BINARY = '/go/bin/gobgpd'
-    VERSIONS = ('3.35.0', '3.37.0', '4.8.0')
+    # 4.8.0 stays: it is the documented `monitor_version`, and the monitor is
+    # the instrument every column is timed by. 4.10.0 is the target comparator.
+    VERSIONS = ('3.35.0', '3.37.0', '4.8.0', '4.10.0')
     DEFAULT_REF = 'master'
+    # Commit the annotated release tag peeled to when pinned, so a moved tag
+    # cannot change what a pinned version builds.
+    VERSION_REFS = {
+        '4.10.0': 'da824d99912e02124b53741245ee4186c381adcc',
+    }
 
     def __init__(self, host_dir, conf, image='bgperf/gobgp'):
         super(GoBGP, self).__init__(self.CONTAINER_NAME, image, host_dir, self.GUEST_DIR, conf)
@@ -59,6 +66,8 @@ class GoBGP(Container):
         if not version:
             return cls.DEFAULT_REF
         version = str(version).strip()
+        if version in cls.VERSION_REFS:
+            return cls.VERSION_REFS[version]
         if re.fullmatch(r'\d+(\.\d+)*', version):
             return 'v{0}'.format(version)
         return version
@@ -66,13 +75,16 @@ class GoBGP(Container):
     # Old GoBGP releases need the Go toolchain they were written against;
     # 'golang:latest' stops working eventually, so pin per series when it does.
     BUILD_VARS = {'base_image': 'golang:latest'}
+    # go.mod at v4.8.0 and v4.10.0 both declare `go 1.25.0`.
+    GO_1_25 = {
+        'base_image': (
+            'golang:1.25-bookworm@sha256:'
+            '3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437'
+        ),
+    }
     VERSION_BUILD_VARS = (
-        ('4.8', {
-            'base_image': (
-                'golang:1.25-bookworm@sha256:'
-                '3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437'
-            ),
-        }),
+        ('4.10', GO_1_25),
+        ('4.8', GO_1_25),
     )
 
     @classmethod
