@@ -235,8 +235,9 @@ def test_active_example_matrices_do_not_request_the_retired_mode():
     import yaml
     from conftest import REPO_ROOT
 
-    for name in ('bench-bird.yaml', 'big-tests.yaml'):
-        matrix = yaml.safe_load((REPO_ROOT / 'benchmarks' / name).read_text())
+    # Every checked-in matrix at the top of benchmarks/ is an active example.
+    for path in sorted((REPO_ROOT / 'benchmarks').glob('*.yaml')):
+        matrix = yaml.safe_load(path.read_text())
         for test in matrix['tests']:
             bgperf2.check_batch_test(test)
             assert all(not target.get('single_table') for target in test['targets'])
