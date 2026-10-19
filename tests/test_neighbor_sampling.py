@@ -16,6 +16,7 @@ guarded: the same cell converged in 133s, having hit the bad payload once.
 '''
 import queue
 import sys
+import threading
 import time
 
 import pytest
@@ -309,3 +310,99 @@ def test_wait_established_treats_a_bad_payload_as_not_yet_established(payload):
     with contextlib.redirect_stdout(io.StringIO()):
         waited = monitor_module.Monitor.wait_established(mon, '10.0.0.1')
     assert waited == 2, 'a bad payload should read as "not established yet"'
+
+
+class SlowTarget(Container):
+    '''A target whose neighbour read costs what a `docker exec` does.'''
+
+    def __init__(self, read_s):
+        self.name = 'slow'
+        self.stop_monitoring = False
+        self.read_s = read_s
+
+    def sample_target_state(self):
+        time.sleep(self.read_s)
+        return {'10.0.0.1': True}, {'10.0.0.1': True}, None
+
+
+def test_a_target_read_of_the_same_tick_decides_that_tick():
+    '''The 10 x 1,000 race: the target read starts a few ms after the monitor
+    sample and lands just after it. Without the pairing, the monitor sample is
+    decided on the previous read and the target's full verdict counts one
+    poll late, for no reason but the relative cost of the two reads.'''
+    import bgperf2
+    target = SlowTarget(read_s=0.05)
+    monitor_s = time.monotonic()
+    target.neighbor_stats(queue.Queue())
+    try:
+        time.sleep(0.005)  # the read is in flight when the sample is decided
+        applied = []
+        offset = bgperf2.pair_target_read(target, monitor_s, applied.append)
+        assert offset is not None and 0 <= offset < bgperf2.PAIRED_READ_LOOKAHEAD_S
+        assert applied[0]['neighbors_checked'] == {'10.0.0.1': True}
+        assert applied[0]['monotonic_s'] >= monitor_s
+        assert 'neighbors_received_full' in applied[1]
+    finally:
+        target.stop_monitoring = True
+
+
+def test_a_read_from_another_tick_is_left_to_the_queue():
+    import bgperf2
+    target = SlowTarget(read_s=0)
+    monitor_s = time.monotonic()
+    target.neighbor_read_idle = threading.Event()
+    target.neighbor_read_idle.set()
+    target.neighbor_last_sample = (monitor_s - 0.7, ({'who': 'slow'},))
+    target.neighbor_pairings = []
+    applied = []
+    assert bgperf2.pair_target_read(target, monitor_s, applied.append) is None
+    assert applied == []
+
+
+def test_pairing_is_off_when_the_target_poll_is():
+    import bgperf2
+    target = SlowTarget(read_s=0)
+    target.neighbor_poll_interval_s = None
+    target.neighbor_stats(queue.Queue())
+    assert bgperf2.pair_target_read(target, time.monotonic(), print) is None
+    assert bgperf2.target_read_pairing(target) is None
+
+
+def test_a_read_that_started_after_the_sample_is_not_paired():
+    '''Pairing is for two reads of the same tick, not lookahead: a read that
+    started 0.3 s after the sample reflects target state the sample never saw,
+    though it is well inside half a poll. Before the window was made
+    asymmetric this read was applied.'''
+    import bgperf2
+    target = SlowTarget(read_s=0)
+    monitor_s = time.monotonic()
+    target.neighbor_read_idle = threading.Event()
+    target.neighbor_read_idle.set()
+    target.neighbor_last_sample = (monitor_s + 0.3, ({'who': 'slow'},))
+    target.neighbor_pairings = []
+    applied = []
+    assert bgperf2.pair_target_read(target, monitor_s, applied.append) is None
+    assert applied == []
+    # The same read is still paired with a sample it started before.
+    assert bgperf2.pair_target_read(target, monitor_s + 0.6,
+                                    applied.append) == pytest.approx(-0.3)
+    assert applied == [{'who': 'slow'}]
+
+
+def test_a_run_publishes_how_tightly_its_samples_were_paired():
+    import bgperf2
+    target = SlowTarget(read_s=0)
+    target.neighbor_pairings = [0.0024, None, -0.0096, 0.0011]
+    section = bgperf2.target_read_pairing(target)
+    assert section == {'paired_samples': 3, 'unpaired_samples': 1,
+                       'min_start_offset_ms': -9.6,
+                       'max_start_offset_ms': 2.4,
+                       'window_ms': [-500.0, 50.0]}
+
+    class Clean(object):
+        neighbor_sample_failures = 0
+        monitor_sample_failures = 0
+
+    doc = measurements_module.event_artifact(
+        [], 'converged', instrument=bgperf2.instrument_section(target, Clean()))
+    assert doc['instrument']['target_read_pairing']['paired_samples'] == 3

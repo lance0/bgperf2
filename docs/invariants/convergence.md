@@ -2,7 +2,8 @@
 
 When a run is CONVERGED, when it is FAILED, and the five rules that were each broken once.
 
-**Read this before editing:** `convergence.py`, `bgperf2.py` (the monitor loop that feeds `update()`)
+**Read this before editing:** `convergence.py`, `bgperf2.py` (the monitor loop that feeds `update()`,
+and `pair_target_read()`), `base.py`'s `neighbor_stats()`
 
 These are invariants, not background: every rule here was written because the obvious alternative was tried and published a wrong number quietly. `CLAUDE.md` carries the one-line index; this file carries the argument.
 
@@ -161,3 +162,33 @@ One consequence worth stating: this makes `bgperf2-sl1` — a target poll thread
 the neighbour counts — cost a longer assurance window instead of the whole run, *provided* at least
 one reading arrived. A sampler that never reads at all is the case the second change above covers.
 
+## Pairing the two polls
+
+The monitor and the target are polled by two free-running 1 s loops, each a `docker exec`, and the
+queue delivers whichever read finishes first. A monitor sample used to be decided on whatever target
+read had already been dequeued, so a target read that started in the *same* tick but finished a
+millisecond after the monitor's counted one whole poll later. Because a change in
+`neighbors_checked` restarts the stability count, that late read cost the run a poll of `total time`.
+The poll's resolution was never the reason; the relative cost of two CLI reads was.
+
+Measured at 10 x 1,000 with the reads stamped: the rustbgpd target's read (`docker exec rbgp`) and the
+monitor's (`docker exec gobgp`) finished within +/-1.1 ms of each other run to run. Whether the 1 s
+sample saw 10/10 neighbours was therefore a coin toss: lost 2 of 3 on one build and 1 of 4 on
+another, though the target's counters were complete on the very first read after delivery every
+time. BIRD's `birdc` read is a few ms cheaper and won by 2-10 ms every time.
+
+**`pair_target_read()` applies to each monitor sample the target read that started no more than
+half a poll before it and no more than `PAIRED_READ_LOOKAHEAD_S` (50 ms) after it**, waiting for
+that read if it is still in flight (bounded by one poll). The window is asymmetric on purpose: a read
+that started later than the sample reflects target state the sample never saw, and crediting it
+would be lookahead, which nothing bounds once the two loops drift out of phase. 50 ms is twice the
+worst same-tick lead measured (start offsets ran -11.4 to +24.4 ms across rustbgpd and BIRD).
+
+The rule is the same for every target, and elapsed is still dated by the monitor sample, so the only
+thing that moves is the poll the race used to cost. Applying the read again from the queue is
+idempotent. A target whose poll is off (`neighbor_poll_interval_s = None`) is not paired. Each run
+publishes how tight the pairing was, as `instrument.target_read_pairing` in its events artifact and
+one `target read pairing:` line in its log: samples paired and unpaired, and the min and max start
+offset (`target read started - monitor sample`). Pinned by
+`test_a_target_read_of_the_same_tick_decides_that_tick` (fails with the wait removed) and
+`test_a_read_that_started_after_the_sample_is_not_paired` (fails with a symmetric window).
