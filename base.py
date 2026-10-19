@@ -745,6 +745,7 @@ class Container(object):
     neighbor_read_started_s = None
     neighbor_read_idle = None
     neighbor_last_sample = None
+    neighbor_pairings = None
 
     def neighbor_stats(self, queue):
         # None disables this instrument without publishing an empty or fresh
@@ -754,6 +755,8 @@ class Container(object):
             return
         self.neighbor_read_idle = Event()
         self.neighbor_read_idle.set()
+        # One entry per monitor sample: the paired read's start offset, or None.
+        self.neighbor_pairings = []
 
         def stats():
             while True:

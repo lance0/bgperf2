@@ -177,9 +177,18 @@ sample saw 10/10 neighbours was therefore a coin toss: lost 2 of 3 on one build 
 another, though the target's counters were complete on the very first read after delivery every
 time. BIRD's `birdc` read is a few ms cheaper and won by 2-10 ms every time.
 
-**`pair_target_read()` applies to each monitor sample the target read that started within half a
-poll of it**, waiting for that read if it is still in flight (bounded by one poll). The rule is the
-same for every target, and elapsed is still dated by the monitor sample, so the only thing that
-moves is the poll the race used to cost. Applying the read again from the queue is idempotent. A
-target whose poll is off (`neighbor_poll_interval_s = None`) is not paired. Pinned by
-`test_a_target_read_of_the_same_tick_decides_that_tick`, which fails with the wait removed.
+**`pair_target_read()` applies to each monitor sample the target read that started no more than
+half a poll before it and no more than `PAIRED_READ_LOOKAHEAD_S` (50 ms) after it**, waiting for
+that read if it is still in flight (bounded by one poll). The window is asymmetric on purpose: a read
+that started later than the sample reflects target state the sample never saw, and crediting it
+would be lookahead, which nothing bounds once the two loops drift out of phase. 50 ms is twice the
+worst same-tick lead measured (start offsets ran -11.4 to +24.4 ms across rustbgpd and BIRD).
+
+The rule is the same for every target, and elapsed is still dated by the monitor sample, so the only
+thing that moves is the poll the race used to cost. Applying the read again from the queue is
+idempotent. A target whose poll is off (`neighbor_poll_interval_s = None`) is not paired. Each run
+publishes how tight the pairing was, as `instrument.target_read_pairing` in its events artifact and
+one `target read pairing:` line in its log: samples paired and unpaired, and the min and max start
+offset (`target read started - monitor sample`). Pinned by
+`test_a_target_read_of_the_same_tick_decides_that_tick` (fails with the wait removed) and
+`test_a_read_that_started_after_the_sample_is_not_paired` (fails with a symmetric window).

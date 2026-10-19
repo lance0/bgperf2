@@ -2410,6 +2410,15 @@ def target_holds_suffix(witness):
     return ', target holds: ' + ' / '.join(parts) if parts else ''
 
 
+# How far *after* a monitor sample a target read may start and still be
+# applied to it. Pairing is for two reads of the same tick, not lookahead: a
+# read that started later reflects target state the sample never saw. Same for
+# every target. Measured at 10 x 1,000 across rustbgpd and BIRD, a same-tick
+# target read started -11.4 to +24.4 ms from its monitor sample, so 50 ms is
+# twice the worst observed lead and a tenth of the half poll allowed before.
+PAIRED_READ_LOOKAHEAD_S = 0.05
+
+
 def pair_target_read(target, monitor_s, apply):
     '''Decide this monitor sample against the target read of the same tick.
 
@@ -2423,26 +2432,58 @@ def pair_target_read(target, monitor_s, apply):
     the 1 s sample saw 10/10 neighbours was a coin toss worth 1 s of
     `total time`; BIRD's cheaper `birdc` read won it by 2-10 ms every time.
 
-    The rule is the same for every target: a read that started within half
-    a poll of this monitor sample belongs to this sample. If it is still in
-    flight, wait for it (bounded by one poll); then apply it. Elapsed is
+    The rule is the same for every target: a read that started no more than
+    half a poll before this monitor sample and no more than
+    `PAIRED_READ_LOOKAHEAD_S` after it belongs to this sample. If it is still
+    in flight, wait for it (bounded by one poll); then apply it. Elapsed is
     still dated by the monitor sample, so no published timing moves except
-    by the poll the race used to cost. Returns whether a read was applied.
+    by the poll the race used to cost.
+
+    Returns the applied read's start offset from the sample in seconds
+    (`started - monitor_s`), or None if none was applied. Each sample's
+    outcome is kept on the target for `target_read_pairing()`.
     '''
     interval = getattr(target, 'neighbor_poll_interval_s', None)
     idle = getattr(target, 'neighbor_read_idle', None)
     if not interval or idle is None:
-        return False
-    window = interval / 2.0
+        return None
+
+    def in_window(started_s):
+        return -interval / 2.0 <= started_s - monitor_s <= PAIRED_READ_LOOKAHEAD_S
+
     started = target.neighbor_read_started_s
-    if started is not None and abs(started - monitor_s) <= window:
+    if started is not None and in_window(started):
         idle.wait(timeout=interval)
     last = target.neighbor_last_sample
-    if last is not None and abs(last[0] - monitor_s) <= window:
+    offset = None
+    if last is not None and in_window(last[0]):
         for message in last[1]:
             apply(message)
-        return True
-    return False
+        offset = last[0] - monitor_s
+    target.neighbor_pairings.append(offset)
+    return offset
+
+
+def target_read_pairing(target):
+    '''How tightly the run's monitor samples were paired with target reads.
+
+    None for a target that was never paired (remote, or its poll off). Start
+    offsets are `target read started - monitor sample`, in ms, so a reader can
+    see every applied read sat inside the window rather than take it on trust.
+    '''
+    pairings = getattr(target, 'neighbor_pairings', None)
+    if not pairings:
+        return None
+    offsets = [o for o in pairings if o is not None]
+    interval = target.neighbor_poll_interval_s
+    return {
+        'paired_samples': len(offsets),
+        'unpaired_samples': len(pairings) - len(offsets),
+        'min_start_offset_ms': round(min(offsets) * 1000, 1) if offsets else None,
+        'max_start_offset_ms': round(max(offsets) * 1000, 1) if offsets else None,
+        'window_ms': [round(-interval / 2.0 * 1000, 1),
+                      round(PAIRED_READ_LOOKAHEAD_S * 1000, 1)],
+    }
 
 
 def bench(args):
@@ -3744,6 +3785,15 @@ def sampler_read_failures(target, monitor):
     return section or None
 
 
+def instrument_section(target, monitor):
+    '''The artifact's `instrument` section: sampler failures and pairing.'''
+    section = sampler_read_failures(target, monitor) or {}
+    pairing = target_read_pairing(target)
+    if pairing:
+        section['target_read_pairing'] = pairing
+    return section or None
+
+
 def write_event_artifact(args, events, prefix, status, testers=None,
                          host=None, churn=None, policy_reload=None,
                          export=None, target_table=None,
@@ -4081,7 +4131,7 @@ def finish_bench(args, output_stats, bench_stats, bench_start, target, m, tester
         target_table_unmeasured_reason=target_table_unmeasured_reason,
         target_table_witness_rule=target_table_witness_rule,
         convergence_rule=convergence_rule,
-        instrument=sampler_read_failures(target, m))
+        instrument=instrument_section(target, m))
 
     # Scan the tester logs only after the clock has stopped. These used to run
     # in bench() before bench_stop, so walking every tester log line by line --
@@ -4144,6 +4194,11 @@ def finish_bench(args, output_stats, bench_stats, bench_start, target, m, tester
     target_version = provenance['target']['version']
 
     print_final_stats(args, target_version, output_stats)
+    pairing = target_read_pairing(target)
+    if pairing:
+        print('target read pairing: {paired_samples} samples paired, '
+              '{unpaired_samples} unpaired, start offset {min_start_offset_ms}'
+              '..{max_start_offset_ms} ms (window {window_ms} ms)'.format(**pairing))
     print_tester_metrics(lifecycle_events, tester_evidence)
     for line in describe_churn_metrics(artifact.get('churn')):
         print(line)
