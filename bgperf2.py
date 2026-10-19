@@ -2410,6 +2410,41 @@ def target_holds_suffix(witness):
     return ', target holds: ' + ' / '.join(parts) if parts else ''
 
 
+def pair_target_read(target, monitor_s, apply):
+    '''Decide this monitor sample against the target read of the same tick.
+
+    The monitor and the target are polled by two free-running loops, and
+    the queue delivers whichever read finishes first. So a target read
+    that started within the same tick as the monitor's could land a
+    millisecond after the monitor sample was decided, and its verdict
+    then counted a whole poll later -- for no reason but the relative cost
+    of two `docker exec`s. Measured at 10 x 1,000: rustbgpd's read and the
+    monitor's finished within +/-1 ms of each other run to run, so whether
+    the 1 s sample saw 10/10 neighbours was a coin toss worth 1 s of
+    `total time`; BIRD's cheaper `birdc` read won it by 2-10 ms every time.
+
+    The rule is the same for every target: a read that started within half
+    a poll of this monitor sample belongs to this sample. If it is still in
+    flight, wait for it (bounded by one poll); then apply it. Elapsed is
+    still dated by the monitor sample, so no published timing moves except
+    by the poll the race used to cost. Returns whether a read was applied.
+    '''
+    interval = getattr(target, 'neighbor_poll_interval_s', None)
+    idle = getattr(target, 'neighbor_read_idle', None)
+    if not interval or idle is None:
+        return False
+    window = interval / 2.0
+    started = target.neighbor_read_started_s
+    if started is not None and abs(started - monitor_s) <= window:
+        idle.wait(timeout=interval)
+    last = target.neighbor_last_sample
+    if last is not None and abs(last[0] - monitor_s) <= window:
+        for message in last[1]:
+            apply(message)
+        return True
+    return False
+
+
 def bench(args):
     if args.target == 'rustbgpd':
         RustBGPdTarget._neighbor_poll_mode()
@@ -3093,6 +3128,38 @@ def bench(args):
     latest_witness_s = None
     target_table_samples = []
     tracker = ConvergenceTracker()
+
+    def apply_target_neighbors(info):
+        '''Fold one of the target poll's two neighbour messages into the run.
+
+        Idempotent: `pair_target_read()` may apply a read before its queued
+        copy arrives, and the queued copy then changes nothing (the checkpoint
+        is a latch). No *older* read can follow it either: the sampler sleeps a
+        full poll after each read, so a read paired within half a poll of a
+        monitor sample was preceded on the queue by its predecessor more than
+        half a poll before that sample, and FIFO delivers it first.
+        '''
+        nonlocal neighbors_checked, neighbors_received_full
+        nonlocal latest_witness, latest_witness_s
+        if 'neighbors_checked' in info:
+            # Rides on this message so the dispatch below keeps reading
+            # anything with neither neighbour key as a cpu/mem sample.
+            if 'table_witness' in info:
+                latest_witness = info['table_witness']
+                latest_witness_s = info.get('monotonic_s')
+            if len(info['neighbors_checked']) > 0 and all(value == True for value in info['neighbors_checked'].values()):
+                neighbors_checked = sum(1 if value == True else 0 for value in info['neighbors_checked'].values())
+                tracker.note_neighbors_checkpoint()
+            else:
+                neighbors_checked = sum(1 if value == True else 0 for value in info['neighbors_checked'].values())
+        elif 'neighbors_received_full' in info:
+
+            if len(info['neighbors_received_full']) >= 1 and all(value == True for value in info['neighbors_received_full'].values()):
+                neighbors_received_full = sum(1 if value == True else 0 for value in info['neighbors_received_full'].values())
+                tracker.note_neighbors_checkpoint()
+            else:
+                neighbors_received_full = sum(1 if value == True else 0 for value in info['neighbors_received_full'].values())
+
     while True:
         # Checked once per queue message, which is at least once a second: a
         # cell that would otherwise run for tens of minutes past a reclaim
@@ -3102,24 +3169,9 @@ def bench(args):
         info = q.get()
 
         if not is_remote and info['who'] == target.name:
-            if 'neighbors_checked' in info:
-                # Rides on this message so the dispatch below keeps reading
-                # anything with neither neighbour key as a cpu/mem sample.
-                if 'table_witness' in info:
-                    latest_witness = info['table_witness']
-                    latest_witness_s = info.get('monotonic_s')
-                if len(info['neighbors_checked']) > 0 and all(value == True for value in info['neighbors_checked'].values()):
-                    neighbors_checked = sum(1 if value == True else 0 for value in info['neighbors_checked'].values())
-                    tracker.note_neighbors_checkpoint()
-                else:
-                    neighbors_checked = sum(1 if value == True else 0 for value in info['neighbors_checked'].values())
-            elif 'neighbors_received_full' in info:
-
-                if len(info['neighbors_received_full']) >= 1 and all(value == True for value in info['neighbors_received_full'].values()):
-                    neighbors_received_full = sum(1 if value == True else 0 for value in info['neighbors_received_full'].values())
-                    tracker.note_neighbors_checkpoint()
-                else:
-                    neighbors_received_full = sum(1 if value == True else 0 for value in info['neighbors_received_full'].values())
+            if ('neighbors_checked' in info
+                    or 'neighbors_received_full' in info):
+                apply_target_neighbors(info)
             else:
                 cpu = info['cpu']
                 mem = info['mem']
@@ -3169,6 +3221,12 @@ def bench(args):
                 output_stats['first_received_time'] = datetime.timedelta(
                     seconds=measured['first_prefix_s'])
             
+            # Decided against the target read of this same tick, not whichever
+            # read the queue happened to deliver first; see pair_target_read().
+            if not is_remote:
+                pair_target_read(target, sample_monotonic_s,
+                                 apply_target_neighbors)
+
             # The target's own reading of the table it holds goes in beside
             # the monitor's count, so a decline in what one session is served
             # can be told from a decline in what the target has. Absent for a

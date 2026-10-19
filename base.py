@@ -23,7 +23,7 @@ import re
 from docker.utils import version_gte
 from itertools import chain
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 import netaddr
 import sys
 import time
@@ -738,6 +738,13 @@ class Container(object):
     neighbor_sample_consecutive_failures = 0
     neighbor_sample_last_error = None
     neighbor_poll_interval_s = 1
+    # What bench() needs to pair a monitor sample with the target read taken in
+    # the same poll tick: when the read in flight started (None when idle), an
+    # event set whenever no read is in flight, and the last completed read as
+    # (stamp, the messages it queued). See `pair_target_read()` in bench().
+    neighbor_read_started_s = None
+    neighbor_read_idle = None
+    neighbor_last_sample = None
 
     def neighbor_stats(self, queue):
         # None disables this instrument without publishing an empty or fresh
@@ -745,6 +752,8 @@ class Container(object):
         interval = self.neighbor_poll_interval_s
         if interval is None:
             return
+        self.neighbor_read_idle = Event()
+        self.neighbor_read_idle.set()
 
         def stats():
             while True:
@@ -756,18 +765,24 @@ class Container(object):
                     # is dated late by the cost of a docker exec, and this one
                     # is compared against a monitor sample stamped the same way.
                     sampled_s = time.monotonic()
+                    self.neighbor_read_idle.clear()
+                    self.neighbor_read_started_s = sampled_s
                     neighbors_received_full, neighbors_checked, witness = \
                         self.sample_target_state()
                     # The witness rides on the neighbours message rather than
                     # travelling as one of its own: bench()'s dispatch reads any
                     # message from this producer carrying neither neighbour key
                     # as a cpu/mem sample, so a third shape would be read as one.
-                    queue.put({'who': self.name,
-                               'neighbors_checked': neighbors_checked,
-                               'table_witness': witness,
-                               'monotonic_s': sampled_s})
-                    queue.put({'who': self.name,
-                               'neighbors_received_full': neighbors_received_full})
+                    messages = (
+                        {'who': self.name,
+                         'neighbors_checked': neighbors_checked,
+                         'table_witness': witness,
+                         'monotonic_s': sampled_s},
+                        {'who': self.name,
+                         'neighbors_received_full': neighbors_received_full})
+                    self.neighbor_last_sample = (sampled_s, messages)
+                    for message in messages:
+                        queue.put(message)
                     self.neighbor_sample_consecutive_failures = 0
                 except Exception as exc:
                     # This loop used to have no guard at all, and one bad read
@@ -809,6 +824,9 @@ class Container(object):
                                   self.neighbor_sample_failures,
                                   self.neighbor_sample_last_error),
                               file=sys.stderr, flush=True)
+                finally:
+                    self.neighbor_read_started_s = None
+                    self.neighbor_read_idle.set()
                 time.sleep(interval)
 
         t = Thread(target=stats)

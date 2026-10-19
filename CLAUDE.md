@@ -338,6 +338,9 @@ loop that feeds it.
 - The target's per-neighbour counters **shorten** the assurance window; they are not what makes
   convergence possible. Either checkpoint opens the gate, neither does not, and a run decided on one
   witness says so.
+- Each monitor sample is decided against the target read that started within half a poll of it,
+  never against whichever read the queue delivered first: two `docker exec`s of near-equal cost
+  otherwise turn one poll of `total time` into a coin toss.
 
 
 ## Targets and images
