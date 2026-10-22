@@ -152,18 +152,24 @@ def test_stats_row_names_the_version(bench_args, bench_stats):
 
 
 def test_batch_passes_version_through_to_bench():
-    '''batch() builds its Namespace from a field list; a field missing from
-    that list is silently dropped at runtime.
+    '''batch_cell_args() builds its Namespace from a field list; a field missing
+    from that list is silently dropped at runtime.
     '''
-    import inspect
-    source = inspect.getsource(bgperf2.batch)
-    assert "'version'" in source, 'batch() must copy version onto the bench args'
+    from argparse import Namespace
+    test = {'name': 't', 'neighbors': [1], 'prefixes': [10], 'filter_test': ['None'],
+            'targets': [{'name': 'bird', 'version': '2.17.1'}]}
+    [cell] = bgperf2.expand_batch_cells(test, test['targets'])
+    assert bgperf2.batch_cell_args(Namespace(), cell).version == '2.17.1', \
+        'batch_cell_args() must copy version onto the bench args'
 
 
 def test_batch_passes_monitor_version_through_to_bench():
-    import inspect
-    source = inspect.getsource(bgperf2.batch)
-    assert "'monitor_version'" in source
+    from argparse import Namespace
+    test = {'name': 't', 'neighbors': [1], 'prefixes': [10], 'filter_test': ['None'],
+            'targets': [{'name': 'bird', 'monitor_version': '4.8.0'}]}
+    [cell] = bgperf2.expand_batch_cells(test, test['targets'])
+    assert bgperf2.batch_cell_args(Namespace(), cell).monitor_version == '4.8.0', \
+        'batch_cell_args() must copy monitor_version onto the bench args'
 
 
 def test_bench_cli_accepts_monitor_version():
