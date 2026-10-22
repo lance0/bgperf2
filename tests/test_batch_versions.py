@@ -387,6 +387,8 @@ class TestSecondRoundFixes:
             bgperf2.dckr, 'networks',
             lambda names: [{'Name': 'row-br'}])
         monkeypatch.setitem(bgperf2.MONITOR_CLASSES, 'gobgp', FakeMonitor)
+        # `repeat=True` asks Docker for leftover pinned testers.
+        monkeypatch.setattr(bgperf2, 'get_ctn_names', lambda: [])
 
         # Parsed rather than hand-built, so the test keeps every bench()
         # default as upstream adds workload flags.

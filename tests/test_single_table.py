@@ -148,7 +148,6 @@ def no_runtime_side_effects(monkeypatch):
         pytest.fail('invalid request reached Docker or teardown')
 
     monkeypatch.setattr(bgperf2, 'install_stop_handlers', lambda: None)
-    monkeypatch.setattr(bgperf2, 'start_interruption_watch', lambda: None)
     for name in ('target_image', 'check_batch_images',
                  'remove_target_containers', 'remove_old_containers'):
         monkeypatch.setattr(bgperf2, name, unexpected)
@@ -263,12 +262,14 @@ target: {{single-table: ${{"true" if count > 1 else "false"}}}}
         consumed.append(conf)
         raise ScenarioConsumed
 
-    for name in ('install_stop_handlers', 'start_interruption_watch',
+    for name in ('install_stop_handlers',
                  'remove_target_containers', 'warn_if_machine_is_busy',
                  'warn_if_log_dir_is_in_ram', 'warn_if_log_dir_is_short_on_space'):
         monkeypatch.setattr(bgperf2, name, lambda *args: None)
     monkeypatch.setattr(bgperf2.GoBGP, 'require_image', lambda *args: 'monitor-image')
     monkeypatch.setattr(bgperf2, 'warn_if_trace_io_reaches_no_generator', capture)
+    # `-r` asks Docker for leftover pinned testers.
+    monkeypatch.setattr(bgperf2, 'get_ctn_names', lambda: [])
     args = bgperf2.create_args_parser().parse_args(
         ['bench', '-f', str(scenario), '-r'])
     with pytest.raises(ScenarioConsumed):
@@ -318,7 +319,7 @@ target: {{single-table: ${{"true" if count > 3 else "false"}}}}
         except ScenarioConsumed:
             return [bgperf2.run_name(args)]
 
-    for name in ('install_stop_handlers', 'start_interruption_watch',
+    for name in ('install_stop_handlers',
                  'warn_if_machine_is_busy', 'warn_if_log_dir_is_in_ram',
                  'warn_if_log_dir_is_short_on_space'):
         monkeypatch.setattr(bgperf2, name, lambda *args: None)
