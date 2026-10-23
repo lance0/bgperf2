@@ -364,6 +364,10 @@ class TestSecondRoundFixes:
         seen = {}
 
         class FakeMonitor:
+            # The GoBGP monitor's image is resolved through its class, which
+            # inherits `GoBGP.require_image()`.
+            require_image = staticmethod(lambda version: bgperf2.GoBGP.require_image(version))
+
             def __init__(self, host_dir, conf, image):
                 seen['host_dir'] = host_dir
                 seen['image'] = image
