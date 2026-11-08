@@ -58,6 +58,7 @@ from frr import FRRoutingTarget
 from frr_compiled import FRRoutingCompiled, FRRoutingCompiledTarget
 from rustybgp import RustyBGP, RustyBGPTarget
 from rustbgpd import RustBGPd, RustBGPdTarget
+from holo import Holo, HoloTarget
 from openbgp import OpenBGP, OpenBGPTarget
 from flock import Flock, FlockTarget
 from srlinux import SRLinux, SRLinuxTarget
@@ -111,6 +112,7 @@ BUILDABLE_IMAGES = {
     'bird': BIRD,
     'rustybgp': RustyBGP,
     'rustbgpd': RustBGPd,
+    'holo': Holo,
     'openbgp': OpenBGP,
     'flock': Flock,
     'frr_c': FRRoutingCompiled,
@@ -124,7 +126,7 @@ BUILDABLE_IMAGES = {
 # they are downloaded rather than compiled.
 # The fork's rustbgpd image builds from a local checkout, so a bare `prepare`
 # leaves it out; `prepare -t rustbgpd` still builds it.
-PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp',
+PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp', 'holo',
                   'openbgp', 'frr_c', 'bgpdump2', 'sink']
 
 # Targets `bench -t` accepts. The class both selects the daemon's behaviour and
@@ -197,6 +199,7 @@ TARGET_CLASSES = {
     'frr_c': FRRoutingCompiledTarget,
     'rustybgp': RustyBGPTarget,
     'rustbgpd': RustBGPdTarget,
+    'holo': HoloTarget,
     'openbgp': OpenBGPTarget,
     'flock': FlockTarget,
     'srlinux': SRLinuxTarget,
@@ -6018,14 +6021,18 @@ def check_generator_matches_workload(args):
 
 
 def check_target_workload(args):
-    """Reject unsupported target controls before config writes or teardown.
-
-    Upstream's rustbgpd adapter refuses filters, thread overrides and custom
-    files here. This fork keeps its own source-built rustbgpd adapter, which
-    accepts scenario files and refuses policy itself
-    (`RustBGPdTarget.reject_unsupported_policy()`), so it has no entry here.
-    """
-    return
+    """Reject unsupported adapter controls before config writes or teardown."""
+    target = getattr(args, 'target', None)
+    # The fork's rustbgpd adapter is not listed: it accepts scenario
+    # files and refuses policy itself (RustBGPdTarget.reject_unsupported_policy()).
+    if target not in ('holo',):
+        return
+    if (getattr(args, 'filter_test', None) not in (None, 'None')
+            or getattr(args, 'threads', None) is not None
+            or getattr(args, 'file', None)
+            or getattr(args, 'target_config_file', None)):
+        sys.exit(f'{target} supports permit-all IPv4 loading without filters, '
+                 'thread overrides or custom configuration/scenario files')
 
 
 def config(args):
