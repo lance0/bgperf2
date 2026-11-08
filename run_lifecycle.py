@@ -31,6 +31,7 @@ def bench(runtime, args):
     # Here as well as in `batch()`, because a single `bench` can be stopped
     # too. Idempotent: re-installing a handler replaces it with itself.
     runtime.install_stop_handlers()
+    runtime.check_target_workload(args)
 
     output_stats = {}
     config_dir = '{0}/{1}'.format(args.dir, args.bench_name)
@@ -386,8 +387,11 @@ def bench(runtime, args):
     pin = runtime.pin_cpusets(getattr(args, 'pin', None))
 
     print('run monitor')
+    # A `--monitor-version` selects a versioned GoBGP image; without one the
+    # monitor class runs its own default image, which is what was resolved.
+    monitor_kwargs = {'image': monitor_image_name} if monitor_version else {}
     m = runtime.MONITOR_CLASSES[runtime.run_monitor(args)](config_dir+'/monitor', conf['monitor'],
-                                          image=monitor_image_name)
+                                          **monitor_kwargs)
     m.monitor_for = args.target
     m.cpuset = pin.get('monitor')
     m.run(conf, dckr_net_name)

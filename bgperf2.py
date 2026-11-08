@@ -122,6 +122,8 @@ BUILDABLE_IMAGES = {
 
 # What `prepare` builds, in order. Flock and the commercial NOSes are left out:
 # they are downloaded rather than compiled.
+# The fork's rustbgpd image builds from a local checkout, so a bare `prepare`
+# leaves it out; `prepare -t rustbgpd` still builds it.
 PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp',
                   'openbgp', 'frr_c', 'bgpdump2', 'sink']
 
@@ -4341,6 +4343,9 @@ def check_batch_test(test, scenarios=None):
         if not isinstance(target, dict) or not target.get('name'):
             sys.exit("test '{0}': every target needs a `name`, got {1!r}".format(
                 test['name'], target))
+        for selected_filter in test['filter_test']:
+            check_target_workload(argparse.Namespace(**dict(
+                target, target=target['name'], filter_test=selected_filter)))
         # Every generator check below exempts a scenario target: it never
         # reaches `gen_conf()`, so its generator is inert and none of the
         # advice these print would change what runs.
@@ -6012,7 +6017,19 @@ def check_generator_matches_workload(args):
             '--mrt-file was given'.format(tester))
 
 
+def check_target_workload(args):
+    """Reject unsupported target controls before config writes or teardown.
+
+    Upstream's rustbgpd adapter refuses filters, thread overrides and custom
+    files here. This fork keeps its own source-built rustbgpd adapter, which
+    accepts scenario files and refuses policy itself
+    (`RustBGPdTarget.reject_unsupported_policy()`), so it has no entry here.
+    """
+    return
+
+
 def config(args):
+    check_target_workload(args)
     try:
         refuse_single_table(getattr(args, 'single_table', False),
                             '-s/--single-table')
