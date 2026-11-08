@@ -61,6 +61,7 @@ from rustbgpd import RustBGPd, RustBGPdTarget
 from holo import Holo, HoloTarget
 from zebra_rs import ZebraRS, ZebraRSTarget
 from bio_routing import BioRouting, BioRoutingTarget
+from maghemite import Maghemite, MaghemiteTarget
 from openbgp import OpenBGP, OpenBGPTarget
 from flock import Flock, FlockTarget
 from srlinux import SRLinux, SRLinuxTarget
@@ -117,6 +118,7 @@ BUILDABLE_IMAGES = {
     'holo': Holo,
     'zebra-rs': ZebraRS,
     'bio-routing': BioRouting,
+    'maghemite': Maghemite,
     'openbgp': OpenBGP,
     'flock': Flock,
     'frr_c': FRRoutingCompiled,
@@ -130,7 +132,7 @@ BUILDABLE_IMAGES = {
 # they are downloaded rather than compiled.
 # The fork's rustbgpd image builds from a local checkout, so a bare `prepare`
 # leaves it out; `prepare -t rustbgpd` still builds it.
-PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp', 'holo', 'zebra-rs', 'bio-routing',
+PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp', 'holo', 'zebra-rs', 'bio-routing', 'maghemite',
                   'openbgp', 'frr_c', 'bgpdump2', 'sink']
 
 # Targets `bench -t` accepts. The class both selects the daemon's behaviour and
@@ -206,6 +208,7 @@ TARGET_CLASSES = {
     'holo': HoloTarget,
     'zebra-rs': ZebraRSTarget,
     'bio-routing': BioRoutingTarget,
+    'maghemite': MaghemiteTarget,
     'openbgp': OpenBGPTarget,
     'flock': FlockTarget,
     'srlinux': SRLinuxTarget,
@@ -6031,7 +6034,7 @@ def check_target_workload(args):
     target = getattr(args, 'target', None)
     # The fork's rustbgpd adapter is not listed: it accepts scenario
     # files and refuses policy itself (RustBGPdTarget.reject_unsupported_policy()).
-    if target not in ('holo', 'zebra-rs', 'bio-routing'):
+    if target not in ('holo', 'zebra-rs', 'bio-routing', 'maghemite'):
         return
     if (getattr(args, 'filter_test', None) not in (None, 'None')
             or getattr(args, 'threads', None) is not None
