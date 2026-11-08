@@ -60,6 +60,7 @@ from rustybgp import RustyBGP, RustyBGPTarget
 from rustbgpd import RustBGPd, RustBGPdTarget
 from holo import Holo, HoloTarget
 from zebra_rs import ZebraRS, ZebraRSTarget
+from bio_routing import BioRouting, BioRoutingTarget
 from openbgp import OpenBGP, OpenBGPTarget
 from flock import Flock, FlockTarget
 from srlinux import SRLinux, SRLinuxTarget
@@ -115,6 +116,7 @@ BUILDABLE_IMAGES = {
     'rustbgpd': RustBGPd,
     'holo': Holo,
     'zebra-rs': ZebraRS,
+    'bio-routing': BioRouting,
     'openbgp': OpenBGP,
     'flock': Flock,
     'frr_c': FRRoutingCompiled,
@@ -128,7 +130,7 @@ BUILDABLE_IMAGES = {
 # they are downloaded rather than compiled.
 # The fork's rustbgpd image builds from a local checkout, so a bare `prepare`
 # leaves it out; `prepare -t rustbgpd` still builds it.
-PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp', 'holo', 'zebra-rs',
+PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp', 'holo', 'zebra-rs', 'bio-routing',
                   'openbgp', 'frr_c', 'bgpdump2', 'sink']
 
 # Targets `bench -t` accepts. The class both selects the daemon's behaviour and
@@ -203,6 +205,7 @@ TARGET_CLASSES = {
     'rustbgpd': RustBGPdTarget,
     'holo': HoloTarget,
     'zebra-rs': ZebraRSTarget,
+    'bio-routing': BioRoutingTarget,
     'openbgp': OpenBGPTarget,
     'flock': FlockTarget,
     'srlinux': SRLinuxTarget,
@@ -6028,10 +6031,12 @@ def check_target_workload(args):
     target = getattr(args, 'target', None)
     # The fork's rustbgpd adapter is not listed: it accepts scenario
     # files and refuses policy itself (RustBGPdTarget.reject_unsupported_policy()).
-    if target not in ('holo', 'zebra-rs'):
+    if target not in ('holo', 'zebra-rs', 'bio-routing'):
         return
     if (getattr(args, 'filter_test', None) not in (None, 'None')
             or getattr(args, 'threads', None) is not None
+            or any(getattr(args, field, 0) not in (None, 0) for field in (
+                'as_path_list_num', 'prefix_list_num', 'community_list_num', 'ext_community_list_num'))
             or getattr(args, 'file', None)
             or getattr(args, 'target_config_file', None)):
         sys.exit(f'{target} supports permit-all IPv4 loading without filters, '
