@@ -59,6 +59,7 @@ from frr_compiled import FRRoutingCompiled, FRRoutingCompiledTarget
 from rustybgp import RustyBGP, RustyBGPTarget
 from rustbgpd import RustBGPd, RustBGPdTarget
 from holo import Holo, HoloTarget
+from zebra_rs import ZebraRS, ZebraRSTarget
 from openbgp import OpenBGP, OpenBGPTarget
 from flock import Flock, FlockTarget
 from srlinux import SRLinux, SRLinuxTarget
@@ -113,6 +114,7 @@ BUILDABLE_IMAGES = {
     'rustybgp': RustyBGP,
     'rustbgpd': RustBGPd,
     'holo': Holo,
+    'zebra-rs': ZebraRS,
     'openbgp': OpenBGP,
     'flock': Flock,
     'frr_c': FRRoutingCompiled,
@@ -126,7 +128,7 @@ BUILDABLE_IMAGES = {
 # they are downloaded rather than compiled.
 # The fork's rustbgpd image builds from a local checkout, so a bare `prepare`
 # leaves it out; `prepare -t rustbgpd` still builds it.
-PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp', 'holo',
+PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp', 'holo', 'zebra-rs',
                   'openbgp', 'frr_c', 'bgpdump2', 'sink']
 
 # Targets `bench -t` accepts. The class both selects the daemon's behaviour and
@@ -200,6 +202,7 @@ TARGET_CLASSES = {
     'rustybgp': RustyBGPTarget,
     'rustbgpd': RustBGPdTarget,
     'holo': HoloTarget,
+    'zebra-rs': ZebraRSTarget,
     'openbgp': OpenBGPTarget,
     'flock': FlockTarget,
     'srlinux': SRLinuxTarget,
@@ -6025,7 +6028,7 @@ def check_target_workload(args):
     target = getattr(args, 'target', None)
     # The fork's rustbgpd adapter is not listed: it accepts scenario
     # files and refuses policy itself (RustBGPdTarget.reject_unsupported_policy()).
-    if target not in ('holo',):
+    if target not in ('holo', 'zebra-rs'):
         return
     if (getattr(args, 'filter_test', None) not in (None, 'None')
             or getattr(args, 'threads', None) is not None
