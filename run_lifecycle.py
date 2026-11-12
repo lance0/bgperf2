@@ -791,7 +791,9 @@ def bench(runtime, args):
     target_table_samples = []
     # The windows are durations; the tracker counts them in samples at the
     # cadence the monitor is asked for (measurement plan 7b).
-    tracker = runtime.ConvergenceTracker(sample_interval_s=runtime.MONITOR_POLL_INTERVAL_S)
+    tracker = runtime.ConvergenceTracker(
+        sample_interval_s=runtime.MONITOR_POLL_INTERVAL_S,
+        zero_route_startup_seconds=getattr(args, 'zero_route_startup_seconds', 15))
 
     def apply_target_neighbors(info):
         '''Fold one of the target poll's two neighbour messages into the run.
