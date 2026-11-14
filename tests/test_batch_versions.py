@@ -110,9 +110,10 @@ class TestCheckBatchImages:
             return name in ('bgperf/gobgp:4.8.0', 'bgperf/bird:latest')
 
         fake_img_exists(exists)
-        bgperf2.check_batch_images([
-            {'name': 'bird', 'monitor_version': '4.8.0'},
-        ])
+        bgperf2.check_batch_monitor_images([{
+            'name': 't', 'monitor': 'gobgp',
+            'targets': [{'name': 'bird', 'monitor_version': '4.8.0'}],
+        }])
         assert 'bgperf/gobgp:4.8.0' in seen
 
     def test_unknown_target_name(self, fake_img_exists):
@@ -413,14 +414,16 @@ class TestSecondRoundFixes:
                                                                fake_img_exists):
         '''A remote scenario has no target image, but still has a monitor.
         '''
+        test = {'name': 't', 'monitor': 'gobgp',
+                'targets': [{'name': 'bird', 'file': 'scenario.yaml'}]}
         fake_img_exists(lambda name: name == 'bgperf/gobgp:latest')
-        bgperf2.check_batch_images([{'name': 'bird', 'file': 'scenario.yaml'}])
+        bgperf2.check_batch_images(test['targets'])
+        bgperf2.check_batch_monitor_images([test])
 
         fake_img_exists(lambda name: False)
+        bgperf2.check_batch_images(test['targets'])
         with pytest.raises(SystemExit, match='monitor'):
-            bgperf2.check_batch_images([
-                {'name': 'bird', 'file': 'scenario.yaml'},
-            ])
+            bgperf2.check_batch_monitor_images([test])
 
     def test_batch_still_checks_normal_targets(self, fake_img_exists):
         fake_img_exists(lambda name: False)

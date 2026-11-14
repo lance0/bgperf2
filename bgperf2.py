@@ -5021,13 +5021,6 @@ def check_batch_images(targets):
         RustBGPdTarget._neighbor_poll_mode()
     missing = []
     for t in targets:
-        if not t.get('mrt_spec'):
-            # A native MRT cell is observed by its `observer_image`, not the
-            # GoBGP monitor; every other cell runs the selected GoBGP image.
-            try:
-                GoBGP.require_image(t.get('monitor_version'))
-            except (ImageNotBuilt, VersionNotSupported) as e:
-                missing.append('monitor: {}'.format(e))
         if t.get('file'):
             # A hand-written scenario can declare the target remote, in which
             # case there is no local image to check. bench() sorts it out once
@@ -5068,9 +5061,15 @@ def check_batch_monitor_images(tests):
         if len(native) == len(test['targets']):
             pass
         elif monitor == 'gobgp':
-            # The GoBGP monitor's image is the target's `monitor_version`,
-            # checked per target by `check_batch_images()`.
-            pass
+            # The fork pins the GoBGP monitor per target with `monitor_version`;
+            # a native MRT target is observed by its `observer_image` instead.
+            for t in test['targets']:
+                if t.get('mrt_spec'):
+                    continue
+                try:
+                    GoBGP.require_image(t.get('monitor_version'))
+                except (ImageNotBuilt, VersionNotSupported) as e:
+                    missing.append('monitor: {}'.format(e))
         else:
             wanted.add(MONITOR_CLASSES[monitor])
             for t in test['targets']:
@@ -5268,7 +5267,9 @@ def batch(args):
                     stop_signal.reason))
                 raise StopRequested(stop_signal.reason)
 
-            completed[cell_id] = bench(batch_cell_args(args, cell, scenarios))
+            selected_args=batch_cell_args(args,cell,scenarios)
+            selected_args.native_cell_id=cell_id
+            completed[cell_id] = bench(selected_args)
             write_batch_cell_result(args.results_dir, test['name'], cell_id,
                                     completed[cell_id], order=order, seed=seed)
             write_batch_csv(results_path(args.results_dir, f"{test['name']}.csv"),
@@ -5522,7 +5523,9 @@ def run_selected_batch_cells(args, expanded, scenarios=None):
             raise StopRequested(stop_signal.reason)
         cell_id = batch_cell_id(test['name'], cell)
         order, seed = sequences[test['name']]
-        row = bench(batch_cell_args(args, cell, scenarios))
+        selected_args=batch_cell_args(args,cell,scenarios)
+        selected_args.native_cell_id=cell_id
+        row = bench(selected_args)
         write_batch_cell_result(args.results_dir, test['name'], cell_id, row,
                                 order=order, seed=seed)
         if getattr(args, 'stop_on_failure', False) and row_failed(row):
