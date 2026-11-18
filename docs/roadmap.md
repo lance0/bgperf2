@@ -1,46 +1,12 @@
 # bgperf2 roadmap
 
-Updated 2026-11-09 UTC. This is the public index of engine development plans.
+Updated 2026-11-17 UTC. This is the public index of engine development plans.
 Everything needed to understand, use and contribute to bgperf2 belongs in this
 repository. Other projects can build campaigns and services on its documented
 CLI and versioned artifacts; none is required to use the engine.
 
 ## Current direction
 
-The selected [native batch recovery plan](plans/native-batch-recovery.md) moves
-durable attempts, explicit interruption recovery, calibration dependencies and
-independent failure handling into the public engine. It extends `batch` and
-removes agent-directed campaign recovery from the intended runtime workflow.
-Existing AWS measurements are stopped; local implementation and modeled tests
-do not authorize restarting them.
-
-The selected [native MRT performance CLI](plans/native-mrt-performance.md) moves
-routine fixed-input sweeps onto `bench`/`batch`, reusing exact-input and final
-identity checks without per-cell portable-recipe orchestration.
-
-The [native throughput support plan](plans/native-suite-throughput.md) delivers
-pure matrix inspection, operational phase timing, optional deferred graphs and
-generic local cell control. The implementation has modeled checks and an accepted small live success-path
-qualification. Larger workloads and fault/cancellation behavior remain separate
-selections. A consumer can already automate native
-batches across finite stages without waiting for these engine changes.
-
-Exact-input MRT preparation now selects a bounded, offline
-[source-peer/RIB inventory](plans/mrt-input-inventory.md). It establishes consumed
-file identity and encoded peer facts only. The selected [input-bound MRT recipe extension](plans/mrt-recipes.md) reuses
-the bounded runner with fixed peers, read-only whole-input identity and declared
-exact prefix expectations. Implementation and native qualification remain
-unfinished; expected export policy is never inferred from a target result.
-
-The MRT community control exposed a candidate injector attribute-grouping defect.
-The selected [exact-attribute build profile](plans/bgpdump2-exact-attributes.md)
-keeps unpatched builds intact and requires a separately identified source fix
-and fresh native qualification before further attribute claims.
-
-The operator selected [merge readiness](plans/milestone-a-merge-readiness.md):
-close hosted CI environment assumptions, review the accumulated branch and merge
-`milestone-a-newcomer` into `master` after green PR checks. Completed functional
-cases remain closed; the six concurrent engine edits are preserved separately.
 Make it easy for anyone evaluating BGP implementations to try performance
 comparisons across daemons, versions and workloads. The primary entry point is
 the README's [benchmark and batch comparison path](../README.md#performance-comparison).
@@ -76,6 +42,39 @@ hosted CI environment assumptions were fixed and the accumulated
 `milestone-a-newcomer` branch merged into `master` after green PR checks.
 Completed functional cases remain closed; the six concurrent engine edits
 are preserved separately.
+
+The later selected native batch/MRT work below extends the comparison workflow;
+it does not authorize restarting completed runtime cases.
+
+The selected [native batch recovery plan](plans/native-batch-recovery.md) moves
+durable attempts, explicit interruption recovery, calibration dependencies and
+independent failure handling into the public engine. It extends `batch` and
+removes agent-directed campaign recovery from the intended runtime workflow.
+Existing AWS measurements are stopped; local implementation and modeled tests
+do not authorize restarting them.
+
+The selected [native MRT performance CLI](plans/native-mrt-performance.md) moves
+routine fixed-input sweeps onto `bench`/`batch`, reusing exact-input and final
+identity checks without per-cell portable-recipe orchestration.
+
+The [native throughput support plan](plans/native-suite-throughput.md) delivers
+pure matrix inspection, operational phase timing, optional deferred graphs and
+generic local cell control. The implementation has modeled checks and an accepted small live success-path
+qualification. Larger workloads and fault/cancellation behavior remain separate
+selections. A consumer can already automate native
+batches across finite stages without waiting for these engine changes.
+
+Exact-input MRT preparation now selects a bounded, offline
+[source-peer/RIB inventory](plans/mrt-input-inventory.md). It establishes consumed
+file identity and encoded peer facts only. The selected [input-bound MRT recipe extension](plans/mrt-recipes.md) reuses
+the bounded runner with fixed peers, read-only whole-input identity and declared
+exact prefix expectations. Implementation and native qualification remain
+unfinished; expected export policy is never inferred from a target result.
+
+The MRT community control exposed a candidate injector attribute-grouping defect.
+The selected [exact-attribute build profile](plans/bgpdump2-exact-attributes.md)
+keeps unpatched builds intact and requires a separately identified source fix
+and fresh native qualification before further attribute claims.
 
 The operator selected and completed [FRR combined-controller functional validation](plans/frr-controller-runtime-validation.md)
 after controlled localization. Five public `step --execute` trials exercised

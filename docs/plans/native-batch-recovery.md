@@ -77,3 +77,34 @@ bounds fresh reservations per invocation and stores row column names. Existing
 native clocks/images/guards and historical attempts are unchanged. Real daemon
 or AWS execution remains stopped and separately selected. Focused recovery
 checks include rejection, lost review, no-launch recovery and bounded resume.
+
+
+## Default-branch integration, 2026-11-17
+
+The operator selected merging the completed source branches into their default
+branches. The engine integration combines published batch delivery `29bccb0`
+with current `master` `5077712`, preserving its general performance-comparison
+entry, maintainer first-run workflow and final-path artifact-recovery fixes.
+The only manual conflicts are README navigation and the roadmap; both retain
+current onboarding and native batch/MRT guidance. Measurement clocks, daemon
+images and closed runtime identities are not changed by conflict resolution.
+The combined tree receives local code review and the ordinary full quality
+checks before publication. This selects no native/AWS execution.
+
+
+Merge review returned two follow-ups and no code blockers. The raw backend
+returned JSON inside a Markdown code fence, so the strict local wrapper marked
+its receipt `not_ready` rather than `ready`. The original receipt/output are
+retained in `.dev-checks/default-integration-review-01`; a separate
+`format-assessment.json` parses that verbatim payload without replacing or
+upgrading the wrapper receipt. The reviewed staged diff SHA256 is
+`198443d4d2bb8e01d697f59ba8ccf598667b79efce9aebb294086725a17b3664`.
+
+Proceeding with the merge because the actual review is available, identifies no
+blocker, and both findings concern behavior already present in published
+`29bccb0`, rather than the manual documentation resolutions. Follow-up R1 is
+legacy/native bench control-directory validation before side effects; the new
+managed durable path already canonicalizes and checks its generated absolute
+control root. Follow-up R2 is an explicit zero-route-startup knob/legacy deadline
+policy; do not tune or relax the current guards as part of this integration.
+The ordinary full test and publication hooks remain required.
