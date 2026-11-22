@@ -65,7 +65,7 @@ def test_nondefault_workload_dimensions_still_reach_identity(monkeypatch):
     monkeypatch.setattr(bgperf2, 'host_cpus', lambda: frozenset(range(6)))
     target = {'name': 'bird', 'tester_type': 'bird'}
     test = {'name': 'dimensions', 'neighbors': [4], 'prefixes': [100],
-            'filter_test': ['None'], 'targets': [target],
+            'filter_test': ['None'], 'targets': [target], 'monitor': 'sink',
             'path_diversity': 2, 'receivers': 1,
             'churn_prefixes': 10, 'churn_bursts': 2,
             'pin': 'testers=4-5,target=0-1,monitor=2,receivers=3'}
