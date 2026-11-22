@@ -1,125 +1,389 @@
 bgperf2
-========
+=======
 
-bgperf2 is a performance measurement tool for BGP implementation. This was forked from https://github.com/osrg/bgperf and has been changed significantly. 
+bgperf2 measures how fast BGP daemons converge and what it costs them. It runs
+the daemon under test in a container, has generator containers announce routes
+to it, and times how long the routes take to come back out through a monitor
+session, while sampling CPU and memory. It started as a fork of
+[osrg/bgperf](https://github.com/osrg/bgperf) and has since been largely
+rewritten.
 
-* [How to install](#how_to_install)
-* [How to use](#how_to_use)
-* [How bgperf2 works](https://github.com/netenglabs/bgperf2/blob/master/docs/how_bgperf_works.md)
-* [Benchmark remote target](https://github.com/netenglabs/bgperf2/blob/master/docs/benchmark_remote_target.md)
-* [MRT injection](https://github.com/netenglabs/bgperf2/blob/master/docs/mrt.md)
-* [rustbgpd target](docs/rustbgpd.md)
-* [Running on AWS EC2 spot instances](https://github.com/netenglabs/bgperf2/blob/master/docs/howto_aws.md)
+* [Install](#install)
+* [Your first benchmark](#first-run)
+* [Try a performance comparison](#performance-comparison)
+* [What a run writes](#outputs)
+* [Batches](#batch)
+* [Getting results you can trust](#trust)
+* [Targets and versions](#targets)
+* [Debugging](#debugging)
+* [Roadmap and development plans](docs/roadmap.md)
 
-## Updates from original bgperf
-I've changed bgperf to work with python 3 and work with new versions of all the NOSes. It actually works, the original version that this is a fork of does not work anymore because of newer version of python and each of the routing stacks.
+Advanced workflows:
 
- This version no longer compiles EXABGP or FRR, it gets PIP or containers already created. Quagga has been removed since it doesn't seem to be updated anymore.
+* [Repeated recipe comparisons](docs/comparisons.md) (immutable target selections and verified portable reports)
+* [Portable recipe and result contracts](docs/recipes.md) (export, prepare, isolated execution and verified result packages)
+* [Your first maintainer workflow](docs/first-run.md) (simulated FRR investigation with verified reports)
+* [One maintainer investigation](docs/maintainer-workflow.md) (offline reproduction, local rollback, interruption recovery and correctness bisection)
+* [Prepare your own source checkout](docs/maintainer-checkout.md) (isolated revision range and verified, unexecuted handoff)
+* [Minimize a reproducer](docs/minimization.md) (bounded peer/prefix-count reduction with fresh confirmation and verified evidence)
+* [Fixed-input MRT performance sweeps](docs/native-mrt-performance.md) (native bench/batch, exact workload bindings and final prefix identity)
+* [Small functional checks](docs/functional-validation.md) (immediate bounded execution, load observations and verified correctness)
+* [Investigate a local BIRD fix](docs/investigations.md) (target/build identities, diagnostics and baseline/fix reports)
+* [Supplied-image FRR maintainer workflow](docs/frr-maintainer-workflow.md) (functional assertions, reports and bounded minimization)
+* [Localize a deterministic regression](docs/bisection.md) (bounded revision search, recovery and verified boundary evidence)
+* [How bgperf2 works](docs/how_bgperf_works.md) ·
+  [Benchmarking a remote target](docs/benchmark_remote_target.md) ·
+  [MRT injection](docs/mrt.md) ·
+  [Measurement definitions](docs/measurement-dictionary.md) ·
+  [rustbgpd target](docs/rustbgpd.md)
 
-To get bgperf2 to work with all the changes in each stack  I've had to change configuration. I 
-don't know if all the features of bgperr still work: I've gotten the simplest version of
-each config to work.
+Start with [one benchmark](#first-run), then use a
+[batch to compare daemons or versions](#performance-comparison) under the same
+workload. You can compare convergence time, CPU and memory without your own
+daemon source checkout or a bug to investigate. The advanced guides cover
+portable evidence, correctness checks and source investigation when you need them.
 
-Caveats: 
+## <a name="fork"></a>Differences from upstream
 
-I don't know if adding more policy will still work for all targets.
-I haven't tested remote targets.
+This fork tracks upstream `netenglabs/bgperf2` by cherry-picking its commits,
+and keeps these deliberate differences. Where the rest of this README or the
+`docs/` pages say otherwise, this section takes precedence.
+
+- **GoBGP is a target and the default monitor.** Upstream removed GoBGP as a
+  target and made the sink the default monitor. Here `-t gobgp` is still
+  selectable, and `bench`/`batch` measure with the GoBGP monitor unless a run
+  says `--monitor sink` (batch: `monitor: sink`). This keeps new rows
+  comparable with earlier GoBGP-monitor receipts. `--monitor-version` (batch:
+  `monitor_version`) pins the GoBGP monitor image and is refused under the
+  sink. The native MRT and durable native batch runners require the sink, so
+  they need `--monitor sink` explicitly. The GoBGP MRT generator removal is
+  kept.
+- **rustbgpd builds from a local checkout.** The `rustbgpd` target builds a
+  clean `RUSTBGPD_SOURCE` worktree (see [the rustbgpd target guide](docs/rustbgpd.md)),
+  rather than repackaging a published release image as upstream's adapter does.
+  It accepts `-f` scenarios, refuses policy it cannot represent, and is left out
+  of a bare `prepare`. [docs/plans/new-daemon-adapters.md](docs/plans/new-daemon-adapters.md)
+  describes upstream's adapter choices, not this fork's.
+- **The baseline CSV is kept.** `benchmarks/baseline/baseline-benchmark.csv`,
+  which upstream deleted, stays with its corrected header, pinned by
+  `tests/test_stats_contract.py`.
 
 ## What it does
-bgperf2 creates containers of bgp software to be performance tested. It then can run either one off tests "bench" or
-a group of tests "batch". It will create graphs to help you understand what the bgp software is doing as well as to
-compare across batches. 
 
-bgperf2 has two main ways of producing prefixes for BGP performance testing. The first way uses either BIRD or EXABGP
-to create prefixes and send them. These are pretty lightweight, so it's easy to generate hundreds (or even thousands)
-of neighbors with a small amount (hundreds or thousands) or prefixes. BIRD is generally faster, so it is the default
-but EXABGP is around for some extra testing.
+Each run has three roles, each in its own container on a dedicated Docker
+network:
 
-The second way to generate traffic is by playing back MRT files using [bgpdump2](https://github.com/rtbrick/bgpdump2). 
-This is much faster, and is good for playing back internet size tables.  [RouteViews](http://archive.routeviews.org/)
-is a good place to get MRT files to play back.
+- **target** — the daemon under test: BIRD (`bird`), FRRouting built from
+  source (`frr_c`), OpenBGPD (`openbgp`), RustyBGP (`rustybgp`, routes and
+  neighbors only; it lacks some of the policy bgperf2 uses), rustbgpd
+  (`rustbgpd`), Holo (`holo`), zebra-rs (`zebra-rs`) and Bio-Routing
+  (`bio-routing`) and Maghemite (`maghemite`), with permit-all IPv4 loading; see
+  [adapter scope](docs/recipes.md#target-adapter-scope). Flock (`flock`) and the
+  commercial Arista cEOS (`eos`), Juniper cRPD (`junos`) and Nokia SR Linux
+  (`srlinux`) are also selectable.
+- **testers** — route generators. BIRD (default) or ExaBGP synthesise prefixes,
+  which makes it cheap to drive hundreds of peers; bgpdump2 plays back an MRT
+  file, which is how you load a full Internet table.
+- **monitor** — the measuring instrument, peered with the target, counting what
+  the target re-advertises. The default is the purpose-built sink
+  (`bgperf/sink`); `--monitor gobgp` selects GoBGP, kept as a reference to
+  re-check a sink result against. GoBGP is not a target.
 
+`bench` runs one such experiment; `batch` runs a matrix of them from a YAML file
+and compares them in a CSV, a summary and graphs.
+
+For one native batch with separate calibrations, retained attempts and explicit
+Spot/interrupt continuation, see [durable native batches](docs/native-batches.md).
+The engine owns recovery; no external agent or private campaign runner is needed.
 
 ## Prerequisites
 
-* Python 3.7 or later
-* Docker (your user must be in the `docker` group)
-* Sysstat (`bench` shells out to `mpstat`)
+* Linux with Docker; your user must be in the `docker` group.
+* `sysstat` and `procps` (`bench` shells out to `mpstat` and `free`).
+* Python 3.14 with venv/ensurepip support. `requirements.lock` pins the full
+  runtime and test environment; `pip-requirements.txt` and `test-requirements.txt`
+  are the human-edited sources.
 
-##  <a name="how_to_install">How to install
-
-```bash
-$ git clone https://github.com/netenglabs/bgperf2.git
-$ cd bgperf2
-$ python3 -m venv venv
-$ venv/bin/pip install -r pip-requirements.txt
-$ venv/bin/python bgperf2.py --help
-usage: bgperf2.py [-h] [-b BENCH_NAME] [-d DIR]
-                 {doctor,prepare,update,bench,config,batch} ...
-
-BGP performance measuring tool
-
-positional arguments:
-  {doctor,prepare,update,bench,config,batch}
-    doctor              check env
-    prepare             prepare env
-    update              rebuild bgp docker images
-    bench               run benchmarks
-    config              generate config
-    batch               run batch benchmarks
-
-options:
-  -h, --help            show this help message and exit
-  -b BENCH_NAME, --bench-name BENCH_NAME
-  -d DIR, --dir DIR
-$ ./bgperf2.py prepare
-$ ./bgperf2.py doctor
-docker version ... ok (1.9.1)
-bgperf2 image ... ok
-gobgp image ... ok
-bird image ... ok
-```
-
-Activating the venv (`source venv/bin/activate`) lets you drop the `venv/bin/`
-prefix and run `./bgperf2.py` directly; the rest of this document does that.
-
-On a fresh VM, `new_vm.sh` installs the system packages, creates the venv, and
-downloads a RouteViews MRT file into `mrt/` for the MRT-based benchmarks.
-
-### Getting a current MRT table
-
-`new_vm.sh` fetches the 2021 table the older benchmarks used. Grabbing a
-present-day one is a two-minute job, and worth doing — a 2021 table is a
-smaller internet than the one being benchmarked today:
+## <a name="install"></a>Install
 
 ```bash
-mkdir -p mrt
-curl -o mrt/rib.bz2 \
-  https://archive.routeviews.org/route-views2/bgpdata/2026.08/RIBS/rib.20260808.0000.bz2
-bunzip2 mrt/rib.bz2 && mv mrt/rib mrt/rib.20260808.0000
+git clone https://github.com/netenglabs/bgperf2.git
+cd bgperf2
+python3.14 scripts/bootstrap.py
+venv/bin/python bgperf2.py prepare -t bird -t sink   # the default target, tester and monitor
+venv/bin/python bgperf2.py doctor
+venv/bin/python bgperf2.py verify -t bird
 ```
 
-RouteViews posts a RIB dump every two hours under `<year>.<month>/RIBS/`. They
-are about 80 MB compressed and 1.3 GB expanded. To see what a table actually
-holds before benchmarking against it — `bench` exits if no peer has as many
-prefixes as you asked for:
+Activating the venv (`source venv/bin/activate`) lets you run `./bgperf2.py`
+directly, as the rest of this document does. On a fresh Ubuntu VM, `new_vm.sh`
+installs the system packages and creates the venv. A bare `prepare` builds one
+image for every buildable daemon, which takes hours; build what you need with
+`-t`.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `doctor` | Checks Docker and lists which images and versions are built |
+| `prepare [-t NAME ...]` | Builds daemon images; skips existing ones unless `-f` |
+| `update NAME --version V` | Builds one more version image |
+| `images` | Lists versions, which are built, and the git ref each came from |
+| `verify [-t NAME]` | Starts each built image and checks it reports its own version |
+| `dockerfile NAME --version V` | Prints the Dockerfile a version would build, without building |
+| `bench` | Runs one benchmark |
+| `batch -c FILE` | Runs a matrix of benchmarks from a YAML file |
+| `config -o FILE` | Writes the scenario a `bench` would use, without running it |
+
+Global options go before the command: `-d/--dir` is the work directory for
+configs and logs (default `/var/tmp`; see
+[where the work directory lives](#workdir)) and `-b/--bench-name` names the run's
+subdirectory and Docker network (default `bgperf2`). Every command has `--help`.
+
+The separate `venv/bin/python recipes.py` entry point offers `export`, `validate`,
+`inspect`, `plan` and `result-validate` without probing the host or Docker.
+`check` explicitly takes a read-only prerequisite snapshot using the local Docker
+CLI; it never acquires images or starts containers. It supports a small synthetic
+IPv4 recipe contract. `prepare RECIPE` reports a local image acquisition plan;
+only `prepare RECIPE --pull` can acquire missing selected repository digests.
+`run` explicitly executes the selected recipe with a bounded worker and returns
+a local result package; `result-verify` checks its files and recipe binding.
+`target-image`, `target-source-plan` and explicit `target-build` supply a target
+override without changing recipe controls. `investigate` records a serial
+baseline/fix pair with diagnostics and a verified human/JSON report. See the
+[recipe guide](docs/recipes.md) and [local-fix walkthrough](docs/investigations.md).
+
+## <a name="first-run"></a>Your first benchmark
 
 ```bash
-docker run --rm --entrypoint= -v $PWD/mrt/rib.20260808.0000:/root/mrt_file \
-    bgperf/bgpdump2 /usr/local/sbin/bgpdump2 -c /root/mrt_file
+./bgperf2.py bench -n 10 -p 1000
 ```
 
-That prints a per-peer prefix count. The 2026-08-08 table has 28 peers, 17 of
-them carrying a full ~1.05M-prefix table, which is what makes
-`prefixes: [1_050_000]` across 10 peers possible.
+This benchmarks BIRD (`-t bird` is the default) with 10 BIRD tester peers each
+announcing 1,000 prefixes (the defaults are 100 and 100). While it runs it
+prints a progress line every second; at the end it prints a summary and one CSV
+row, preceded by its header, for pasting into a spreadsheet. The columns are
+defined in the [measurement dictionary](docs/measurement-dictionary.md); the
+ones most people want are `elapsed (s)` (convergence as seen by the monitor),
+`max cpu %`, `max mem (GB)` and `max foreign cpu %` (anything else competing
+for the machine; `0` is what you want).
 
-### Where output goes
+Common options:
 
-Generated graphs and CSVs are written to `results/`, overridable with
-`--results-dir`. That directory is gitignored, so runs no longer leave files
-scattered in the repo root.
+* `-t NAME` and `--version V` — the target and its version image.
+* `-n` / `-p` — peers, and prefixes per peer.
+* `-g bgpdump2 --mrt-file /absolute/path` — play back an MRT file instead of
+  synthetic prefixes; see [Getting an MRT table](#mrt). (Batch configs may use
+  relative paths.)
+* `-a`, `-e`, `-c`, `-x` — the number of as-path, prefix-list, community-list
+  and ext-community-list filters on the target (default 0).
+* `--filter_test transit|ixp` — apply a realistic import policy.
+* `--pin target=0-7,monitor=8-9,testers=10-15` — give each role its own cores
+  (add `receivers=...` with `--receivers`). Every role the run has must be named
+  and the sets must not overlap. Pinning keeps the generators and the monitor
+  from competing with the daemon you are measuring.
+* `--monitor gobgp` — the reference monitor instead of the sink.
+* `-o FILE` — also append the CSV row to `FILE`.
 
-### Results you can trust: the machine has to be yours
+Try `-n1 -p1` first if anything looks wrong; see [Debugging](#debugging).
+
+## <a name="performance-comparison"></a>Try a performance comparison
+
+Use a [batch](#batch) to compare target daemons or versions with the same peers,
+prefixes, generator and monitor. For a small version comparison, save this as
+`benchmarks/local/compare.yaml` (create the directory if needed):
+
+```yaml
+tests:
+  - name: version-comparison
+    neighbors: [2]
+    prefixes: [100]
+    filter_test: [None]
+    repetitions: 3
+    order: shuffle
+    seed: 20261106
+    targets:
+      - name: bird
+        versions: ['2.19.2', '3.3.2']
+        tester_type: bird
+```
+
+After [installation](#install), build the selected version images and run it:
+
+```bash
+./bgperf2.py prepare -t bird --versions 2.19.2,3.3.2
+./bgperf2.py verify -t bird --versions 2.19.2,3.3.2
+./bgperf2.py batch -c benchmarks/local/compare.yaml
+```
+
+This runs six benchmarks and writes CSV results, a summary and graphs under
+`results/`. The small workload and three repetitions let you try the workflow;
+they do not establish sensitivity to a particular performance difference.
+Choose a workload that matches your question, inspect individual runs and
+variation, and check [measurement conditions](#trust) before interpreting a
+difference. These are descriptive comparisons; automatic performance regression
+verdicts remain disabled and calibration remains deferred.
+
+Change `targets` to compare other [supported daemons or versions](#targets),
+building their images first. For immutable target identities, repeated pairs and
+verified portable evidence, use the advanced [recipe comparison guide](docs/comparisons.md).
+
+## <a name="outputs"></a>What a run writes
+
+Recipe workflows can use [shared artifact storage](docs/artifact-storage.md) to
+compress and deduplicate bulk evidence automatically. Comparisons reference the
+same objects; independent expanded packages are produced on explicit export.
+
+Everything generated goes under `results/` (gitignored), or `--results-dir`.
+Every file of a run is named from one stem built from what the run was —
+target, version, tester, prefixes, peers, and any filter, workload control,
+pinning, monitor and repetition — for example
+`bird_2.19.2_bgpdump2_1050000_10_mon-sink`.
+
+| File | Contents |
+|---|---|
+| `<stem>.events.json` | The full record of one run: timing events, what each generator offered and when, the target's own table, export, churn and policy-reload results, host contention, and `findings` naming what the run was waiting for or why that cannot be said |
+| `<stem>.versions.json` | Provenance: the bgperf2 revision, every image and daemon version, the run's parameters and the host |
+| `<stem>_cpu.png`, `_mem_used.png`, `_free_mem.png`, `_machine_idle.png`, `_mon_received.png`, `_neighbors.png` | Time series of the run |
+
+A batch also writes, per test:
+
+| File | Contents |
+|---|---|
+| `<test>.csv` | One row per run, in matrix order |
+| `<test>.summary.json` | Median, min, max, spread and pass states across repetitions, and whether cells are separated |
+| `<test>.cells/<key>.json` | Each cell's row, the record the CSV and summary are built from |
+| `bgperf_<test>_<metric>.png` | Bars comparing the targets: elapsed, total time, route reception, CPU, memory and more |
+
+`bench` exits 1 when its run is marked failed (as for a setup error), 143 when
+stopped by SIGTERM, and 0 when the run converged. A batch records a failed cell as a result and carries on.
+
+The CSV is the legacy, compact view. The `events.json` and `summary.json`
+documents carry what the CSV cannot, and the
+[measurement dictionary](docs/measurement-dictionary.md) defines every field.
+
+## <a name="batch"></a>Batches
+
+A batch runs every combination of the axes in a YAML file and compares the
+targets. `benchmarks/example.yaml` is the smallest one; keep your own configs in
+`benchmarks/local/`, which is gitignored.
+
+```bash
+./bgperf2.py batch -c benchmarks/example.yaml
+```
+
+```YAML
+tests:
+  - name: mrt-table              # names the CSV, summary and graphs
+    neighbors: [10, 20]          # axes: every combination is a cell
+    prefixes: [1_050_000]
+    filter_test: [None]          # None, transit or ixp
+    repetitions: 3               # optional: run the whole matrix 3 times
+    order: shuffle               # optional: matrix (default) or shuffle
+    seed: 20261021               # with shuffle: fixes the order
+    monitor: sink                # optional: sink (default) or gobgp
+    pin: target=0-7,monitor=8-9,testers=10-27
+    targets:
+      - name: bird
+        version: 2.19.2
+        tester_type: bgpdump2
+        mrt_file: mrt/rib.20260808.0000
+      - name: frr_c
+        versions: [9.1, 10.7]    # one target entry per version
+        tester_type: bgpdump2
+        mrt_file: mrt/rib.20260808.0000
+```
+
+**Test keys** (beside `name`, `neighbors`, `prefixes`, `filter_test` and
+`targets`, which are required): `repetitions`, `order`, `seed`, `monitor`,
+`pin`, and the workload controls `prefix_scope`, `path_diversity`, `receivers`,
+`churn_prefixes`, `churn_bursts` and `policy_reload_blocks` described under
+[workload controls](#workload). Any other key is refused, so a typo cannot
+silently run the wrong matrix.
+
+**Target keys**: `name`, `version` or `versions`, `label` (the row and bar
+name; two targets in one test may not share one), `tester_type` (`bird`,
+`exa` or `bgpdump2`; default `bird`), `mrt_file`, `mrt_injector`, `threads`,
+`image`, `filter_type`, the filter counts `as_path_list_num`,
+`prefix_list_num`, `community_list_num` and `ext_community_list_num`, and the
+addressing overrides `local_address_prefix`, `target_local_address`,
+`monitor_local_address`, `target_router_id` and `monitor_router_id`, and
+`license_file`, `repeat`, `tester_trace_io`, `docker_network_name` and `file`
+(a scenario file). A test key written under a target is refused rather than
+ignored.
+
+Paths in a config may be relative or use `~`. Every axis combination is checked,
+and every image must exist, before the first container starts.
+
+### Repetitions
+
+One run of a cell tells you nothing about how much that number moves between runs. Add
+`repetitions` to a test to run the whole matrix more than once:
+
+```YAML
+tests:
+  - name: variance
+    repetitions: 3
+    neighbors: [10]
+    prefixes: [100_000]
+    filter_test: [None]
+    targets:
+      - {name: bird, version: 2.19.2, label: bird 2.19.2, tester_type: bird}
+```
+
+The matrix is repeated as a block — every cell once, then every cell again — rather than each cell
+three times in a row, so consecutive runs of the same cell do not share a warm page cache and the
+same thermal state, and an interrupted batch has one observation of everything rather than every
+observation of the first few cells.
+
+Each pass gets its own run name (`bird 2.19.2 #1`, `#2`, `#3`), so its CSV row, its graph bar and
+its `.events.json` / `.versions.json` are its own; a shared name would have the second pass
+overwrite the first one's files. A test without `repetitions` runs once, with no `#` suffix.
+
+### Order and seed
+
+`order: shuffle` runs each pass of the matrix in a permuted order, so slow drift
+over a long batch (a warming machine, a filling cache, a neighbour's job) does
+not line up with one target. The permutation is derived from `seed`; state one
+to make the order reproducible. Without one a seed is drawn and recorded in
+every cell's result. The CSV, summary and graphs are always in matrix order.
+
+### Stopping and resuming
+
+SIGTERM stops a batch at the next check: the cell in flight is abandoned rather
+than recorded, and the process exits 143. `--resume` then skips every cell that
+already has a result and runs the rest in the planned order, continuing a drawn
+seed. It refuses results for cells the config no longer lists and results that
+ran under a different order or seed: if you edit an axis, target, monitor,
+`repetitions` or `seed`, measure into a new `--results-dir`. A plain `batch`
+starts fresh and removes the previous cell results for its tests.
+
+### Scenario files in a batch
+
+Each scenario named by a target's `file:` is rendered once per path at batch startup, before image
+checks or any cell runs. Every cell uses an independent copy of that validated configuration.
+Stateful templates no longer vary on each cell; use generated scenarios with matrix axes or
+separate scenario files for different workloads. Template rendering is batch preparation outside
+cell `total time`; each cell includes its actual configuration-copy cost. Direct `bench -f` includes
+its own read/render duration as before.
+
+### Running a batch in pieces
+
+```bash
+./bgperf2.py batch -c my.yaml --list-cells             # every cell, in run order, with its key (JSON; no Docker)
+./bgperf2.py batch -c my.yaml --cells 3f2a... 9c01...  # run just these cells, then rebuild the report
+./bgperf2.py batch -c my.yaml --cells 3f2a... --no-report
+./bgperf2.py batch -c my.yaml --report                 # rebuild CSV, summary and graphs from recorded cells
+```
+
+The report names any cell without a result and leaves the graphs until every
+cell has one. `--cells` refuses a cell that already has a result; delete its
+`<test>.cells/<key>.json` to measure it again. `--list-cells` and `--cells`
+need `seed:` on a shuffled test.
+
+## <a name="trust"></a>Getting results you can trust
+
+### The machine has to be yours
 
 A benchmark sharing its host produces numbers that look fine and mean nothing,
 so every run records what else was running. This is not a theoretical worry:
@@ -162,7 +426,7 @@ a target, add its process names there** or that target reports its own load as
 contention and all of its rows look incomparable. The cEOS and SR Linux entries
 are the main agents, not the complete set.
 
-### Where the bench directory lives
+### <a name="workdir"></a>Where the work directory lives
 
 `-d/--dir` defaults to `/var/tmp`, and it holds every tester and target log,
 bind-mounted. It defaulted to `/tmp` for years, which systemd mounts as tmpfs on
@@ -193,7 +457,7 @@ is almost entirely `<RMT> Invalid route ... withdrawn` — the target reflecting
 routes back to testers that reject them, which is normal and which
 `find_errors()` already discards.
 
-### Reading the legacy timing fields
+### Reading the timing fields
 
 The complete field-by-field contract is in the
 [legacy CSV measurement dictionary](docs/measurement-dictionary.md).
@@ -231,117 +495,21 @@ waiting for — or, more often, saying which measurement forbids naming it. All
 of them are in `<prefix>.events.json`, and each run records the bgperf2
 revision and schema versions that produced them.
 
-The measurement implementation and 64 GB validation plans
-([implementation](docs/bgperf2-measurement-implementation-plan.md),
-[validation](docs/2026-64gb-timing-validation-plan.md)) add the remaining
-evidence before drawing new bottleneck or fine version-ranking conclusions.
-Why each piece of that measurement work was built the way it was, and what was
-measured to decide it, is in the
-[decision log](docs/bgperf2-measurement-decision-log.md).
+The [measurement dictionary](docs/measurement-dictionary.md) defines current
+measurements and their limits.
 
 ### IPv4 only
 
 Everything here is IPv4, in four separate places: synthetic prefixes are
-generated as IPv4 `/32`s (`gen_paths`), the gobgp MRT injector is invoked with
-`--no-ipv6`, the monitor and gobgp read `afi_safis[0]` — the first address
+generated as IPv4 `/32`s (`gen_paths`), the MRT injectors replay only IPv4, the monitor and gobgp read `afi_safis[0]` — the first address
 family — so v6 routes would not be counted even if they arrived, and peering
 uses an IPv4 `--local-address-prefix`. Supporting IPv6 means all four: prefix
 generation, a v6 peering plane, dropping `--no-ipv6`, and summing across
 families instead of indexing `[0]`.
-## <a name="how_to_use">How to use
 
-Use `bench` command to start benchmark test.
-By default, `bgperf2` benchmarks [BIRD](http://bird.network.cz/).
-`bgperf2` boots 100 BGP test peers each advertising 100 routes to it.
+## <a name="targets"></a>Targets and versions
 
-```bash
-$ ./bgperf2.py bench
-run monitor
-run bird
-Waiting 18 seconds for monitor
-run tester tester type bird
-launched 1 testers
-elapsed: 5sec, cpu: 1.28%, mem: 10.50MB, mon recved: 10000, neighbors_received: 100, neighbors_accepted: 100, %idle 94.7, free mem 57.15GB
-bird: 2.17.1+branch.master.fe0c22277c21
-Max cpu: 23.41, max mem: 10.50MB
-Min %idle 94.7, Min mem free 57.15GB
-Time since first received prefix: 4
-total time: 31.32s
-
-name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date, cores, Mem (GB), tester errors, tester timeouts, failed, MSG, filters, max foreign cpu %, neighbor poll mode, target image, tester version, monitor version
-bird,bird,2.17.1+branch.master.fe0c22277c21,100,100,9900,10000,18,5,1,4,31.32,23,0.01,95,57.152,,2026-08-07,32,60.73GB,0,0,,,,0,,bgperf/bird:latest,2.17.1+branch.master.fe0c22277c21,3.37.0
-```
-
-As you might notice, the interesting statistics are shown twice, once in an easy to read format and the second
-in a CSV format to easily copy and paste to do analysis later.
-
-To change a target implementation, use `-t` option.
-Currently, `bgperf2` supports [BIRD](http://bird.network.cz/) and [FRRouting](https://frrouting.org/)
-(other than GoBGP. There is very intial support for[RustyBGP](https://github.com/osrg/rustybgp), partly
-because RustyBGP doesn't support all policy that Bgperf2 tries to use for policy testing. If you just want to
-do routes and neighbors then RustyBGP works.
-
-```bash
-$ ./bgperf2.py bench -t gobgp
-run monitor
-run gobgp
-Waiting 19 seconds for monitor
-run tester tester type bird
-launched 1 testers
-elapsed: 6sec, cpu: 5.28%, mem: 40.15MB, mon recved: 10000, neighbors_received: 100, neighbors_accepted: 100, %idle 57.0, free mem 56.04GB
-gobgp: 3.37.0
-Max cpu: 893.00, max mem: 40.15MB
-Min %idle 57.0, Min mem free 56.04GB
-Time since first received prefix: 5
-total time: 33.27s
-
-name, target, version, peers, prefixes per peer, required, received, monitor (s), elapsed (s), prefix received (s), testers (s), total time, max cpu %, max mem (GB), min idle%, min free mem (GB), flags, date, cores, Mem (GB), tester errors, tester timeouts, failed, MSG, filters
-gobgp,gobgp,3.37.0,100,100,9900,10000,19,6,1,5,33.27,893,0.04,57,56.039,,2026-08-07,32,60.73GB,0,0,,,
-```
-
-To change a load, use following options.
-
-* `-n` : the number of BGP test peer (default 100)
-* `-p` : the number of prefix each peer advertise (default 100)
-* `-a` : the number of as-path filter (default 0)
-* `-e` : the number of prefix-list filter (default 0)
-* `-c` : the number of community-list filter (default 0)
-* `-x` : the number of ext-community-list filter (default 0)
-
-```bash
-$ python3 bgperf2.py bench
-run monitor
-run gobgp
-Waiting 5 seconds for neighbor
-run tester tester type normal
-tester booting.. (100/100)
-elapsed: 2sec, cpu: 0.79%, mem: 42.27MB, recved: 10000
-gobgp: 2.29.0
-Max cpu: 554.03, max mem: 45.71MB
-Time since first received prefix: 2
-total time: 24.07s
-
-name, target, version, peers, prefixes per peer, neighbor (s), elapsed (s), prefix received (s), exabgp (s), total time, max cpu %, max mem (GB), flags, date,cores,Mem (GB)
-gobgp,gobgp,2.29.0,100,100,5,2,0,2,24.07,554,0.045,,2021-08-02,32,62.82GB
-```
-
-For a comprehensive list of options, run `python3 ./bgperf2.py bench --help`.
-
-## targets
-
-Targets are the container being tested. bgperf2 was initially created to create containers of BGP software and 
-and make them testable. However, a challenge is the best way to be able to do this over time. For instance, 
-the instructions for how to build these software stacks has changed over time. So is the best way to keep up 
-to compile the software ourselves or to try to download containers from the open source project themsevles. 
-When I originally forked bgperf2 it hadn't changed in 4 years, so almost none of the containers could be built
-and all of the software had changed how they interat. I'm not sure how best to make bgperf2 work over time.
-
-FRR is the clearest example. There used to be an `frr` target that used a prebuilt FRRouting
-container hardcoded to 7.5.1, which meant the version you tested was whatever that image happened
-to pin. It has been removed. The `frr_c` target replaces it: it checks FRRouting out of git and
-builds the container, so you choose the version.
-
-## Testing several versions of one daemon
+### Several versions of one daemon
 
 Each buildable daemon gets one image per version, tagged `bgperf/<name>:<version>`. Build them
 with `prepare` (which builds the daemon's default list) or `update` (for anything else):
@@ -406,7 +574,7 @@ event-history, and policy-boundary contract.
 The commercial NOSes work the same way once you tag what you downloaded (`docker tag <image>
 crpd:24.2`, then `-t junos --version 24.2`).
 
-### BIRD 3 and threads
+#### BIRD 3 and threads
 
 BIRD 3 is the multi-threaded rewrite; BIRD 2 does everything in one thread. But **BIRD 3 starts a
 single worker unless the config asks for more**, so a 2.x-vs-3.x comparison without `--threads`
@@ -430,6 +598,32 @@ set it for both.
 
 `--threads` is ignored by daemons with no such setting.
 
+#### When an old version will not build
+
+Build instructions drift: the base distro moves on, dependencies get renamed, configure flags come
+and go. Two levels of override, cheapest first.
+
+For a different *value* — base image, extra packages, configure flags — add a rule to the daemon
+class's `VERSION_BUILD_VARS`, keyed by version prefix:
+
+```python
+class FRRoutingCompiled(Container):
+    VERSION_BUILD_VARS = (
+        ('8.', {'ubuntu_version': '20.04', 'extra_setup': 'apt-get install -y libyang-dev'}),
+    )
+```
+
+For a genuinely different recipe, drop a whole Dockerfile in
+`dockerfiles/<name>/<version>.dockerfile` (see `dockerfiles/README.md`). The longest matching
+version prefix wins, so `10.dockerfile` covers the whole 10.x series.
+
+Either way, check the result without paying for a build:
+
+```bash
+./bgperf2.py dockerfile frr_c --version 8.0
+```
+
+<a name="workload"></a>
 ### Workload controls beyond peers and prefixes
 
 `-n` and `-p` scale one axis: each peer gets its own disjoint prefix block, so
@@ -513,39 +707,41 @@ polls before the controller reads it and `tester_complete` is stamped late. Meas
 read `reported_injection_s` for a traced run, and do not put traced and untraced runs in the same
 comparison.
 
-### When an old version will not build
+### <a name="mrt"></a>Getting an MRT table
 
-Build instructions drift: the base distro moves on, dependencies get renamed, configure flags come
-and go. Two levels of override, cheapest first.
-
-For a different *value* — base image, extra packages, configure flags — add a rule to the daemon
-class's `VERSION_BUILD_VARS`, keyed by version prefix:
-
-```python
-class FRRoutingCompiled(Container):
-    VERSION_BUILD_VARS = (
-        ('8.', {'ubuntu_version': '20.04', 'extra_setup': 'apt-get install -y libyang-dev'}),
-    )
-```
-
-For a genuinely different recipe, drop a whole Dockerfile in
-`dockerfiles/<name>/<version>.dockerfile` (see `dockerfiles/README.md`). The longest matching
-version prefix wins, so `10.dockerfile` covers the whole 10.x series.
-
-Either way, check the result without paying for a build:
+MRT playback needs the bgpdump2 image: `./bgperf2.py prepare -t bgpdump2`.
+Select and record an MRT file explicitly. For example, this dated dump can be
+downloaded into the ignored `mrt/` directory:
 
 ```bash
-./bgperf2.py dockerfile frr_c --version 8.0
+mkdir -p mrt
+curl -o mrt/rib.bz2 \
+  https://archive.routeviews.org/route-views2/bgpdata/2026.08/RIBS/rib.20260808.0000.bz2
+bunzip2 mrt/rib.bz2 && mv mrt/rib mrt/rib.20260808.0000
 ```
 
-### Testing commercial BGP Stacks
+RouteViews posts a RIB dump every two hours under `<year>.<month>/RIBS/`. They
+are about 80 MB compressed and 1.3 GB expanded. To see what a table actually
+holds before benchmarking against it — `bench` exits if no peer has as many
+prefixes as you asked for:
+
+```bash
+docker run --rm --entrypoint= -v $PWD/mrt/rib.20260808.0000:/root/mrt_file \
+    bgperf/bgpdump2 /usr/local/sbin/bgpdump2 -c /root/mrt_file
+```
+
+That prints a per-peer prefix count. The 2026-08-08 table has 28 peers, 17 of
+them carrying a full ~1.05M-prefix table, which is what makes
+`prefixes: [1_050_000]` across 10 peers possible.
+
+### Commercial stacks
 
 bgperf2 was originally created to test open source bgp software, so for most containers it compiles the software
-and creates a container. For commerical NOSes this doesn't make sense. For those you will need to download
+and creates a container. For commercial NOSes this doesn't make sense. For those you will need to download
 the container images manually and then use bgperf2.
 
 For most of these images, bgperf2 mounts a local directory (usually in /var/tmp/bgperf2) to the container. These
-commerical stacks then write back data as root, and set the privleges so that a regular user cannot delete these
+commercial stacks then write back data as root, and set the privileges so that a regular user cannot delete these
 files and directories.
 
 bgperf2 tries to delete /var/tmp/bgperf2 before it runs, but it can't with data from these stacks, so you
@@ -560,12 +756,12 @@ testing you will have to edit config files, which is documented below.
 
 **Warning** The license for these stacks prohibits publishing results. Don't publish results.
 
-#### EOS
+#### Arista cEOS
 
 [cEOS overview](https://www.arista.com/en/products/software-controlled-container-networking)
 
 To download, after getting an account: https://www.arista.com/en/support/software-download. Make sure you get the cEOS64
-image. I didn't the first time, and the results are frustringly slow. After downloading:
+image. I didn't the first time, and the results are frustratingly slow. After downloading:
 
 ``` bash
 $ docker import ../NOS/cEOS64-lab-4.27.0F.tar.xz ceos:latest
@@ -589,7 +785,7 @@ service routing protocols model multi-agent
 There is no way to adjust the number of threads being used. For cEOS it appears to be hardcoded
 no matter the hardware that you have.
 
-#### Juniper
+#### Juniper cRPD
 
 [Junos cRPD deployment guide](https://www.juniper.net/documentation/us/en/software/crpd/crpd-deployment/index.html)
 
@@ -610,9 +806,9 @@ is not relevant. To see if your config worked correctly on startup:
 $ docker logs bgperf_junos_target
  ```
 
-[Deploying BGP RIB Sharding and Update Threading](https://www.juniper.net/documentation/en_US/day-one-books/DO_BGPSharding.pdf) -- while informative it's weird to me that it's 2021 and getting mult-threaded performance requires a 40 page document. How am I not supposed to think that networking is two decades behind everybody else in software? (This isn't just a Juniper problem by any means)
+[Deploying BGP RIB Sharding and Update Threading](https://www.juniper.net/documentation/en_US/day-one-books/DO_BGPSharding.pdf) -- while informative it's weird to me that it's 2021 and getting multi-threaded performance requires a 40 page document. How am I not supposed to think that networking is two decades behind everybody else in software? (This isn't just a Juniper problem by any means)
 
-For multithreading, as mentioned above bgperf2 sets this up by default in nos_tempaltes/junos.j2
+For multithreading, as mentioned above bgperf2 sets this up by default in nos_templates/junos.j2
 
 ``` bash
 processes {
@@ -629,167 +825,97 @@ processes {
     }
 ```
 
-data.cores is set in junos.py and by default it's half the number of availble cores on the test machine, 
+data.cores is set in junos.py and by default it's half the number of available cores on the test machine, 
 with a max of 31, since that is the Junos max. If you want to try setting the threads to something different
 you can hard code those values. If you want to see without multi-threading, delete that whole section.
 
-## batch
-A  feature called batch lets you run multiple tests, collect all the data, and produces graphs. 
-If you run a test that runs out of physical RAM on your machine, linux OOM killer will just kill the process and you'll lose the data from that experiment.
+#### Nokia SR Linux
 
-The `benchmarks/` directory holds example batch configs that show how it works — start with
-`benchmarks/benchmark.yaml`. You can list the targets that you want tested in a batch, as well as
-iterate through prefix count and neighbor count. Run one with:
+Pulled rather than built: `docker pull ghcr.io/nokia/srlinux:<version>`, then
+`-t srlinux --version <version>`. The same licence caution applies.
 
-```bash
-$ ./bgperf2.py batch -c benchmarks/benchmark.yaml
-```
+## <a name="debugging"></a>Debugging
 
-Configs that play back MRT data expect the file at `mrt/rib.20210801.0000`, which `new_vm.sh`
-downloads. Paths in a batch config may be relative or use `~`; they are resolved before being
-handed to Docker. Keep personal, unshared configs in `benchmarks/local/` — that path is gitignored.
+Start with one peer and one route: `./bgperf2.py bench -n1 -p1`. If it stalls
+waiting for a neighbor, the generated config for the target is usually wrong.
 
-Each scenario named by a target's `file:` is rendered once per path at batch startup, before image
-checks or any cell runs. Every cell uses an independent copy of that validated configuration.
-Stateful templates no longer vary on each cell; use generated scenarios with matrix axes or
-separate scenario files for different workloads. Template rendering is batch preparation outside
-cell `total time`; each cell includes its actual configuration-copy cost. Direct `bench -f` includes
-its own read/render duration as before.
+Each run writes its configs, startup scripts and logs under
+`<--dir>/<--bench-name>/` — `/var/tmp/bgperf2/` by default — one subdirectory
+per role, bind-mounted into the containers. The containers are named
+`bgperf_<daemon>_target` (for example `bgperf_bird_target`,
+`bgperf_frrouting_target`), `bgperf_monitor`, `bgperf_bird_tester_<n>` or
+`bgperf_bgpdump2_tester_<n>` for the generators, and `bgperf_receiver<n>`. The sink monitor writes
+every session event to `monitor/sink.log`, which is the first thing to read;
+under `--monitor gobgp` query the monitor with `docker exec bgperf_monitor gobgp
+neighbor`.
 
-### Repeating a matrix
-
-One run of a cell tells you nothing about how much that number moves between runs. Add
-`repetitions` to a test to run the whole matrix more than once:
-
-```YAML
-tests:
-  - name: variance
-    repetitions: 3
-    neighbors: [10]
-    prefixes: [100_000]
-    filter_test: [None]
-    targets:
-      - {name: bird, version: 2.19.2, label: bird 2.19.2, tester_type: bird}
-```
-
-The matrix is repeated as a block — every cell once, then every cell again — rather than each cell
-three times in a row, so consecutive runs of the same cell do not share a warm page cache and the
-same thermal state, and an interrupted batch has one observation of everything rather than every
-observation of the first few cells.
-
-Each pass gets its own run name (`bird 2.19.2 #1`, `#2`, `#3`), so its CSV row, its graph bar and
-its `.events.json` / `.versions.json` are its own; a shared name would have the second pass
-overwrite the first one's files. `--resume` skips exactly the passes that finished, including an
-interruption part way through one. A test without `repetitions` runs once and is named exactly as
-before — and adding `repetitions` to a config that has already run re-runs it, rather than leaving
-one unnamed row beside `#2` and `#3`.
-
-If you use a file that looks like this:
-
-```YAML
-tests:
-  - 
-    name: 10K
-    neighbors: [10, 30, 50, 100]
-    prefixes: [10_000]
-    filter_test: [None]
-    targets: 
-      -
-        name: bird
-        label: bird -s
-        single_table: True
-      - 
-        name: frr
-      -
-        name: gobgp
-      -
-        name: frr_c
-        label: frr 8
-      -
-        name: rustybgp
-```
-
-You will get output like this:
+The target's startup script is copied in as `/root/config/start.sh`. Running it
+by hand after a run shows the output bgperf2 does not capture:
 
 ```bash
-name, target, version, peers, prefixes per peer, neighbor (s), elapsed (s), prefix received (s), exabgp (s), total time, max cpu %, max mem (GB), flags, date,cores,Mem (GB)
-bird -s,bird,v2.0.8-59-gf761be6b,10,10000,3,2,0,2,13.9,30,0.015,-s,2021-08-02,32,62.82GB
-frr,frr,FRRouting 7.5.1_git (910c507f1541).,10,10000,0,3,0,3,11.58,37,0.089,,2021-08-02,32,62.82GB
-gobgp,gobgp,2.29.0,10,10000,6,9,0,9,24.65,1450,0.141,,2021-08-02,32,62.82GB
-frr 8,frr_c,FRRouting 8.0-bgperf (489e9d4e8956).,10,10000,0,3,0,3,11.61,31,0.1,,2021-08-02,32,62.82GB
-rustybgp,rustybgp,exec,10,10000,4,3,0,3,15.94,262,0.032,,2021-08-02,32,62.82GB
-bird -s,bird,v2.0.8-59-gf761be6b,30,10000,4,3,0,3,26.99,100,0.161,-s,2021-08-02,32,62.82GB
-frr,frr,FRRouting 7.5.1_git (ab68d18f80c7).,30,10000,0,3,0,3,22.53,86,0.302,,2021-08-02,32,62.82GB
-gobgp,gobgp,2.29.0,30,10000,5,61,0,61,85.8,1620,0.447,,2021-08-02,32,62.82GB
-frr 8,frr_c,FRRouting 8.0-bgperf (750804dc0e98).,30,10000,0,3,0,3,22.21,78,0.296,,2021-08-02,32,62.82GB
-rustybgp,rustybgp,exec,30,10000,4,4,0,4,28.09,446,0.128,,2021-08-02,32,62.82GB
-bird -s,bird,v2.0.8-59-gf761be6b,50,10000,3,6,0,6,42.35,100,0.396,-s,2021-08-02,32,62.82GB
-frr,frr,FRRouting 7.5.1_git (9e4604a042a6).,50,10000,0,4,0,4,35.48,102,0.513,,2021-08-02,32,62.82GB
-gobgp,gobgp,2.29.0,50,10000,4,160,0,160,194.23,1638,0.875,,2021-08-02,32,62.82GB
-frr 8,frr_c,FRRouting 8.0-bgperf (eb81873b8335).,50,10000,1,6,0,6,36.69,103,0.52,,2021-08-02,32,62.82GB
-rustybgp,rustybgp,exec,50,10000,4,5,0,5,40.74,469,0.307,,2021-08-02,32,62.82GB
-bird -s,bird,v2.0.8-59-gf761be6b,100,10000,3,13,0,13,91.68,100,1.343,-s,2021-08-02,32,62.82GB
-frr,frr,FRRouting 7.5.1_git (8dc6f2f40d8c).,100,10000,1,7,0,7,74.99,101,1.291,,2021-08-02,32,62.82GB
-gobgp,gobgp,2.29.0,100,10000,5,661,0,661,724.83,1664,1.846,,2021-08-02,32,62.82GB
-frr 8,frr_c,FRRouting 8.0-bgperf (74ac3704b034).,100,10000,1,8,1,7,70.46,103,1.116,,2021-08-02,32,62.82GB
-rustybgp,rustybgp,exec,100,10000,6,16,0,16,80.37,597,1.253,,2021-08-02,32,62.82GB
+docker exec bgperf_bird_target /root/config/start.sh
+docker exec bgperf_bird_target ps auxww        # e.g. find and kill an old daemon first
 ```
 
-That example and its output are from 2021-08-02 and are kept as they were; this config no longer
-runs. The `frr` target has since been removed, and `single_table` is now refused. On that date `-s`
-still changed BIRD's config: without it, each peer got its own table and a pipe copying the whole
-table into it. From 2021-08-13 BIRD built one shared table whether or not `-s` was given, so any
-`bird -s` row from after that date is the same configuration as a `bird` row. See
-`docs/invariants/workload-controls.md`.
-
-It will create graphs and a CSV file of the output.
-
-And some graphs. These are some of the important ones
-
-![Time to receive all routes](docs/bgperf_10K_route_reception.png)
-
-![CPU Usage ](docs/bgperf_10K_max_cpu.png)
-
-![Memory Usage ](docs/bgperf_10K_max_mem.png)
-
-## Debugging
-
-If you try to change the config, it's a little tricky to debug what's going on since there are so many containers. What bgperf is doing is creating configs and startup scripts in 2 and then it copies those to the containers before launching them. It creates three containers: bgperf_exabgp_tester_tester, bgperf_\<target\>_target, and bgperf2_monitor. If things aren't working, it's probably because the config for the target is not correct. bgperf2 puts all the log output in /var/tmp/bgperf2/*.log, but what it doesn't do is capture the output of the startup script.
-
-If it doesn't seem to be working, try with 1 peer and 1 route (-n1 -p1) and make sure
-that it connecting. If it's just stuck at waiting to connect to the neighbor, then probably the config is wrong and neighbors are not being established between the monitor (gobgp) and the NOS being tested
-
-You'll have to break into gobgp and the test config.
-
-if you want to see what is happening when the test containers starts, after the test is over (or you've killed it), run 
-```$ docker exec bgperf_bird_target /root/config/start.sh```
-that's what bgperf2 is doing. It creates a /root/config/start.sh command and is running it, so if you run it manually you can see if that command produces output to help you debug.
-
-to clean up any existing docker containers
-
-```$ docker kill `docker ps -q`; docker rm `docker ps -aq` ```
-
-The startup script is in /var/tmp/bgperf2/\<target\>/start.sh and gets copied to the target as /root/config/start.sh.
-
-In other words, to launch the start.sh and see the output you can run this docker command:
+bgperf2 removes its own containers at the start of each run. To clear them by
+hand without touching anything else on the host:
 
 ```bash
-$ docker exec bgperf_bird_target /root/config/start.sh
-bird: I found another BIRD running.
-
-```
-In this case, things were already working, so I'll run ps and kill the old bird and start a new one.
-
-```
-$ docker exec bgperf_bird_target ps auxww
-USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
-root           1  0.0  0.0   3984  2820 ?        Ss   21:21   0:00 bash
-root          14  0.0  0.0   4144  2016 ?        Ss   21:21   0:00 bird -c /root/config/bird.conf
-root          22  0.0  0.0   5904  2784 ?        Rs   21:22   0:00 ps auxww
-$ docker exec bgperf_bird_target kill 14
+docker rm -f $(docker ps -aq --filter name=bgperf_)
 ```
 
+The commercial images write their bind-mounted files as root; if bgperf2 cannot
+clean up, `sudo rm -rf /var/tmp/bgperf2`.
+
+## Tests
+
+The test suite needs no Docker and no privileges:
+
+```bash
+python3.14 scripts/bootstrap.py --check
+venv/bin/python -m pytest tests/ -q
 ```
-$ docker exec bgperf_bird_target /root/config/start.sh
-```
-No output, so it was just fine.
+
+It covers the measurement, parsing and batch layers; a real `bench` is the only
+end-to-end check.
+
+## Development
+
+The [FRR source workflow](docs/frr-source-workflow.md) connects trusted local
+builds, candidate correctness checks, bounded minimization and revision search.
+Its maintained modeled walkthrough runs without Docker or a real compiler;
+live source qualification remains separate.
+
+Use the [comparison walkthrough](docs/comparisons.md) for explicit observable
+assertions and repeated serial comparisons of two selections of the same supported target adapter, with
+portable verified reports. The maintained Docker-free demo includes controlled
+differences, noise and inconclusive evidence. Calibrated regression verdicts
+remain disabled pending separately authorized calibration.
+
+Use [staged comparison execution](docs/comparison-execution.md) for serial
+per-attempt checks and explicit review gates. The
+[deterministic bisection guide](docs/bisection.md) covers local revision searches
+with fresh boundary confirmations; its controlled walkthrough needs no Docker
+or quiet measurement window. Live bisection qualification remains deferred;
+[engine decisions](docs/decisions.md#qualified-on-real-daemons) lists
+the successfully exercised packaging-patched source-build case and its limits.
+
+The [public roadmap](docs/roadmap.md) indexes current priorities, detailed plans
+and deferred workload ideas. Engine plans and implementation decisions live in
+this repository. Proposed capabilities are labelled separately from supported
+commands; no other project or private repository is needed to use or contribute
+to bgperf2. Read [contributor/agent guidance](CLAUDE.md) before changes.
+
+## History
+
+bgperf2 was forked from osrg/bgperf when none of its containers built any more,
+and was ported to Python 3 and current daemon releases. FRR is now compiled
+from source as `frr_c`, choosing the version; the old prebuilt `frr` target
+(pinned to 7.5.1), Quagga, and GoBGP as a target and MRT injector have been
+removed. Policy beyond the configurations exercised here, and remote targets,
+are less tested.
+
+The [Python environment guide](docs/python-environment.md) documents the full
+hashed lock, verification and dependency updates.
+
+Native [throughput controls](docs/native-throughput.md) provide offline planning, prerequisite preflight, operational phase journals and optional deferred graphs.

@@ -2,12 +2,18 @@
 
 Recording which build produced a result, and the one check the Docker-free test suite cannot make.
 
-**Read this before editing:** `base.py` (`Container.version_string()`, `collect_provenance()`,
+Target substitutions and trusted local-source builds in `recipe_targets.py`
+keep requested and observed identities distinct, preserve source checkouts and
+do not turn unknown binary/build facts into reconstruction claims. The
+[investigation guide](../investigations.md) owns their versioned contract and
+source/build trust boundary.
+
+**Read this before editing:** `recipe_targets.py` (target/build identity and local source), `recipe_source_range.py` (isolated local history and object integrity), `recipe_handoff.py` (frozen source/command bindings), `recipe_preflight.py` (exact immutable image inspection), `recipe_prepare.py` (selected digest acquisition), `run_lifecycle.py` (run orchestration), `base.py` (`Container.version_string()`, `collect_provenance()`,
 `RECIPE_LABEL_KEY`, `recipe_hash()`, `img_recipe_label()`, `Container.current_recipe_hash()`,
 `Container.override_buildargs()`, `Container.recipe_status()`), `bgperf2.py` (`verify`, `doctor`,
 `images`, `prepare`, `checkable_versions()`), and every module carrying a version command: `bird.py`,
-`gobgp.py`, `rustybgp.py`, `openbgp.py`, `frr.py`, `frr_compiled.py`, `bgpdump2.py`, `exabgp.py`,
-`junos.py`, `eos.py`, `srlinux.py`, `flock.py`, `monitor.py`, `tester.py`, `mrt_tester.py`
+`gobgp.py`, `rustybgp.py`, `rustbgpd.py`, `holo.py`, `zebra_rs.py`, `bio_routing.py`, `maghemite.py`, `openbgp.py`, `frr.py`, `frr_compiled.py`, `bgpdump2.py`, `exabgp.py`, `junos.py`,
+`eos.py`, `srlinux.py`, `flock.py`, `monitor.py`, `tester.py`, `mrt_tester.py`, `sink.py`
 
 These are invariants, not background: every rule here was written because the obvious alternative was tried and published a wrong number quietly. `CLAUDE.md` carries the one-line index; this file carries the argument.
 
@@ -37,9 +43,68 @@ is the instrument the timings are read from.
   `tester version`, `monitor version`) and a full `<prefix>.versions.json` manifest beside the
   graphs. Appending at the end is required — `create_batch_graphs()` indexes the row positionally.
 
-Caveat worth knowing: a git ref pins source, not dependencies. RustyBGP gitignores its `Cargo.lock`,
-so its builds resolve dependencies fresh and old refs rot — `340f521` (the 2024-12 commit the 2025
-baseline benched) no longer compiles on any toolchain, which is why it is not offered as a version.
+## Image build provenance limits
+
+Pinned source objects retain their original identity: Git replacement refs cannot
+substitute another object for a declared commit. Engine prerequisite inspection
+also rejects index flags that can conceal modified files from ordinary status.
+The [local revision preparation contract](../source-range.md) validates selected
+commit/tree/blob contents and owned worktree metadata before considering a
+range prepared. Original checkout preservation, local-only copying and explicit
+source limits remain separate from source trust or runtime qualification.
+
+The [maintainer handoff](../maintainer-handoff.md) binds plans and future command
+arguments without predicting built images or executing those commands. A
+checksummed but changed runbook must fail semantic reconstruction. Frozen
+declarations cannot qualify local availability, an execution host, a binary
+rebuild or performance detection.
+
+Recipe preparation reuses only exact local immutable identities and pulls only
+the selected missing `repository@sha256:...` references with explicit `--pull`.
+A missing bare image ID has no recoverable repository name and blocks the whole
+acquisition; never infer a tag or repository from it. Inspect every selected
+reference before pulling, then verify the exact requested pin again after each
+pull. A failed later acquisition preserves earlier cached images and reports the
+partial outcome; it must not claim all images were prepared or delete evidence.
+An immutable digest identifies content, not a trusted publisher, source revision,
+reconstructible build or verified daemon binary. Those provenance claims remain
+unknown. Docker's local `Size` is not the registry download size.
+
+BIRD clones `https://gitlab.nic.cz/labs/bird.git` with Git's default TLS
+certificate verification and installs `ca-certificates` explicitly. A certificate
+failure must fail the build; do not disable verification to work around it.
+Existing images need an explicit rebuild to incorporate recipe changes:
+`update bird` for the unversioned image, or `update bird --versions 2.19.2`
+for one release tag (likewise for 3.3.2).
+
+OpenBGPD is repackaged from `openbgpd/openbgpd:<tag>`, not compiled from
+source. `prepare -t openbgp -f -n` forces the wrapper layers to rebuild without
+cache; it does not rebuild `bgpd`. Only the unversioned `latest` build
+pulls its upstream base. Versioned builds reuse a cached upstream image if
+present: `PULL_BASE` assumes release tags are immutable, and `--no-cache`
+does not refresh them. If upstream republishes a release tag, this is a known
+provenance gap requiring an explicit upstream pull and recorded digest. Its recipe only
+clears the upstream entrypoint and sets a shell command. A changed wrapper image
+ID, recipe hash or build date therefore does not prove a changed daemon binary.
+For a rebuild comparison, manually record the upstream image digest, resulting
+image ID, reported version and daemon binary SHA-256. The engine's version
+manifest does not collect all these identities automatically. Upstream build
+dependencies remain outside this recipe's source provenance.
+
+RustyBGP's recipe uses `cargo build --release` against upstream source without
+a tracked `Cargo.lock` or `--locked`. Its selected git ref identifies source,
+while Cargo resolves dependencies at build time. The builder/runtime tags and
+package repositories also move. A rebuild of the same ref can produce a
+different dependency graph or fail to compile; its printed source SHA cannot
+establish binary equivalence. For future builds, manually capture the built image identity and build output.
+The engine does not persist build logs or export the resolved Cargo dependency
+graph; the multi-stage recipe copies only binaries into the runtime image.
+Recovering a historical dependency graph from a printed source SHA is therefore
+unavailable. For example, historical ref `340f521` (2024-12) is no longer
+offered among supported versions after rebuild failures with newer dependencies. The Python dependency lock
+does not lock this container build. Adding a Rust dependency lock or digest-pinned
+container inputs is separate work; historical graphs must remain unknown where
+not recorded.
 
 ## verify — the check the test suite cannot do
 
@@ -58,7 +123,8 @@ incomparable for years. Notes for anyone extending it:
 - Probe through the classes that really run the image — `TARGET_CLASSES` **and** `TESTER_CLASSES`,
   never the daemon base class. The rustybgp bug was invisible when the base was asked directly,
   because GoBGP is not in that MRO. `TESTER_CLASSES` exists for this: `bench` builds
-  `ExaBGPTester(Tester, ExaBGP)`, not `ExaBGP`, and bird/gobgp run as both roles with different MROs.
+  `ExaBGPTester(Tester, ExaBGP)`, not `ExaBGP`, and bird runs as both roles with different MROs.
+  gobgp is in neither table — it is only the monitor — so `MONITOR_CLASSES` probes it as `Monitor`.
 - The throwaway container is created with `entrypoint=[]`. `command` is *appended* to an
   `ENTRYPOINT`, not run instead of it, so `bgperf/bgpdump2` and `bgperf/exabgp_mrtparse`
   (`ENTRYPOINT ["/bin/bash"]`) would run `bash sleep 600`, exit 126, and every later `exec` would

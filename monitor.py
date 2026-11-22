@@ -15,6 +15,7 @@
 
 from json.decoder import JSONDecodeError
 import sys
+import shlex
 
 from docker.errors import APIError
 
@@ -25,6 +26,7 @@ class SessionUnavailable(RuntimeError):
     '''A session this run requires cannot be asked whether it is established.'''
 
 from gobgp import GoBGP
+from sink import Sink, SinkLogError, SinkLogReader
 import os
 from  settings import dckr
 import yaml
@@ -45,7 +47,19 @@ class MonitorReadError(Exception):
     """
 
 
-class Monitor(GoBGP):
+class Instrument(object):
+    '''The monitor role, whichever daemon fills it.
+
+    A mixin, first in each monitor class's MRO, holding what the role is
+    rather than what the daemon is: the container name, the poll loop that
+    feeds the run's stats queue, and the failure counters that loop keeps.
+    Each monitor supplies `read_sample()` and `wait_established()`.
+
+    It is deliberately not a `GoBGP`. The sink's monitor takes its version
+    command from `Sink`; through `Monitor` it would have reached
+    `GoBGP.exec_version_cmd()` first and parsed its own banner as gobgpd's,
+    which is the MRO bug that made rustybgp record UNKNOWN on every run.
+    '''
     # The monitor is the instrument, so its read failing is a fact about the
     # measurement rather than about a target. Counted and reported on the same
     # rule as `Container.neighbor_stats()`.
@@ -54,8 +68,115 @@ class Monitor(GoBGP):
     monitor_sample_consecutive_failures = 0
     monitor_sample_last_error = None
 
-
     CONTAINER_NAME = 'bgperf_monitor'
+
+    def read_sample(self, sampled_at):
+        '''One sample, shaped as `gobgp neighbor -j`'s first neighbour.
+
+        `sampled_at` is the `time.monotonic()` the loop stamped before the
+        read. Anything that is not a count raises, and the loop records it as
+        a failed read of the instrument, never as a monitor holding nothing.
+        '''
+        raise NotImplementedError()
+
+    def check_point(self):
+        '''The count the poll loop calls `checked` at, or None for none.
+
+        One helper for the poll loop and for the sink log's dating, so the
+        line the log dates the check-point to and the sample that sets
+        `monitor_required_reached` judge one threshold by construction.
+        '''
+        config = getattr(self, 'config', None) or {}
+        cps = config.get('monitor', {}).get('check-points') or []
+        return int(cps[0]) if cps else None
+
+    def stats(self, queue, interval=1):
+        '''Poll the monitor's accepted count into the run's stats queue.
+
+        `interval` is the cadence asked for between two reads, and only the
+        floor of the resolution achieved: a poll reads
+        before it waits. It is a parameter rather than a literal because the
+        controller publishes it as the floor of every monitor-owned interval's
+        resolution -- a hardcoded sleep here and a constant there would drift
+        apart silently, and the resolution is what says whether an interval
+        was resolved at all.
+        '''
+        self.stop_monitoring = False
+        def stats():
+            required = self.check_point()
+            while True:
+                if self.stop_monitoring:
+                    return
+                # Stamped before the exec, not after, for the reason the
+                # tester poll loop gives: `gobgp neighbor -j` is a docker
+                # exec, and dating the sample to when the read *finished*
+                # would push every monitor event later by a whole read. That
+                # end of `post_injection_tail_s` would then be late while the
+                # generator's end is early, biasing the one interval that
+                # spans both instruments -- and the sign of that interval is
+                # the finding. Before the read is a lower bound on when the
+                # count was true.
+                sampled_at = time.monotonic()
+                # Everything that touches the payload is inside the guard, and
+                # the guard is not the one that used to be here.
+                #
+                # `gobgp neighbor -j` answers with its *error* JSON-encoded, so
+                # a failed read parses cleanly into a `str` -- and
+                # `json.loads('"rpc error: ..."')[0]` is `'r'`, which does not
+                # raise. The old `try` therefore caught nothing, and
+                # `info['who'] = ...` on the very next line, outside it, killed
+                # this thread for the rest of the run. That is the same payload
+                # that killed the target's sampler and cost the campaign's
+                # `rustybgp default` cell 2194s -- but here it lands on the
+                # instrument every published timing is read from: `recved`
+                # freezes, and `ConvergenceTracker` fails the run as stuck with
+                # no target-side guard able to save it.
+                try:
+                    info = self.read_sample(sampled_at)
+                    info['who'] = self.name
+                    state = info['afi_safis'][0]['state']
+                    if 'accepted' in state and required is not None and required <= int(state['accepted']):
+                        info['checked'] = True
+                    else:
+                        info['checked'] = False
+                    # Keep the wall timestamp for compatibility/debug
+                    # correlation, but durations are calculated from this
+                    # monotonic observation time at the queue boundary.
+                    info['time'] = datetime.datetime.now()
+                    info['monotonic_s'] = sampled_at
+                    queue.put(info)
+                    self.monitor_sample_consecutive_failures = 0
+                except Exception as e:
+                    self.monitor_sample_failures += 1
+                    self.monitor_sample_consecutive_failures += 1
+                    self.monitor_sample_last_error = '{0}: {1}'.format(
+                        type(e).__name__, e)
+                    if (self.monitor_sample_consecutive_failures == 1
+                            or self.monitor_sample_consecutive_failures
+                            % self.MONITOR_SAMPLE_REPORT_EVERY == 0):
+                        print('WARNING: monitor read for {0} failed '
+                              '({1} consecutive, {2} total): {3}'.format(
+                                  self.monitor_for,
+                                  self.monitor_sample_consecutive_failures,
+                                  self.monitor_sample_failures,
+                                  self.monitor_sample_last_error),
+                              file=sys.stderr, flush=True)
+                # Outside the guard, so a failing read waits like a succeeding
+                # one. The old `continue` skipped it, and a persistent failure
+                # then spun `docker exec` as fast as the host allowed -- inside
+                # the container being measured, inflating `max cpu %` and
+                # `min idle%` on the run whose timings are published, and
+                # invisible to `max foreign cpu %` because `gobgp` is in
+                # `contention.BGPERF_PROCESSES`.
+                time.sleep(interval)
+
+        t = Thread(target=stats)
+        t.daemon = True
+        t.start()
+
+
+class Monitor(Instrument, GoBGP):
+    '''The GoBGP monitor: `gobgp neighbor -j`, read by `docker exec`.'''
 
     def run(self, conf, dckr_net_name=''):
         ctn = super(GoBGP, self).run(dckr_net_name)
@@ -156,103 +277,23 @@ gobgpd -t yaml -f {1}/{2} -l {3} > {1}/gobgpd.log 2>&1
 
             n = n+1
 
-    def stats(self, queue, interval=1):
-        '''Poll the monitor's accepted count into the run's stats queue.
 
-        `interval` is the cadence asked for between two `gobgp neighbor -j`
-        execs, and only the floor of the resolution achieved: a poll reads
-        before it waits. It is a parameter rather than a literal because the
-        controller publishes it as the floor of every monitor-owned interval's
-        resolution -- a hardcoded sleep here and a constant there would drift
-        apart silently, and the resolution is what says whether an interval
-        was resolved at all.
-        '''
-        self.stop_monitoring = False
-        def stats():
-            cps = self.config['monitor']['check-points'] if 'check-points' in self.config['monitor'] else []
-            while True:
-                if self.stop_monitoring:
-                    return
-                # Stamped before the exec, not after, for the reason the
-                # tester poll loop gives: `gobgp neighbor -j` is a docker
-                # exec, and dating the sample to when the read *finished*
-                # would push every monitor event later by a whole read. That
-                # end of `post_injection_tail_s` would then be late while the
-                # generator's end is early, biasing the one interval that
-                # spans both instruments -- and the sign of that interval is
-                # the finding. Before the read is a lower bound on when the
-                # count was true.
-                sampled_at = time.monotonic()
-                # Everything that touches the payload is inside the guard, and
-                # the guard is not the one that used to be here.
-                #
-                # `gobgp neighbor -j` answers with its *error* JSON-encoded, so
-                # a failed read parses cleanly into a `str` -- and
-                # `json.loads('"rpc error: ..."')[0]` is `'r'`, which does not
-                # raise. The old `try` therefore caught nothing, and
-                # `info['who'] = ...` on the very next line, outside it, killed
-                # this thread for the rest of the run. That is the same payload
-                # that killed the target's sampler and cost the campaign's
-                # `rustybgp default` cell 2194s -- but here it lands on the
-                # instrument every published timing is read from: `recved`
-                # freezes, and `ConvergenceTracker` fails the run as stuck with
-                # no target-side guard able to save it.
-                try:
-                    payload = json.loads(decode_cli_output(
-                        self.local('gobgp neighbor -j'),
-                        container=self.name, cmd='gobgp neighbor -j'))
-                    if not isinstance(payload, list) or not payload:
-                        raise MonitorReadError(
-                            '`gobgp neighbor -j` returned {0}, not a list of '
-                            'neighbours: {1!r}'.format(
-                                type(payload).__name__, str(payload)[:200]))
-                    info = payload[0]
-                    if not isinstance(info, dict):
-                        raise MonitorReadError(
-                            '`gobgp neighbor -j` returned a {0} where a '
-                            'neighbour was expected: {1!r}'.format(
-                                type(info).__name__, str(info)[:200]))
-                    info['who'] = self.name
-                    state = info['afi_safis'][0]['state']
-                    if 'accepted'in state and len(cps) > 0 and int(cps[0]) <= int(state['accepted']):
-                        #cps.pop(0)
-                        info['checked'] = True
-                    else:
-                        info['checked'] = False
-                    # Keep the wall timestamp for compatibility/debug
-                    # correlation, but durations are calculated from this
-                    # monotonic observation time at the queue boundary.
-                    info['time'] = datetime.datetime.now()
-                    info['monotonic_s'] = sampled_at
-                    queue.put(info)
-                    self.monitor_sample_consecutive_failures = 0
-                except Exception as e:
-                    self.monitor_sample_failures += 1
-                    self.monitor_sample_consecutive_failures += 1
-                    self.monitor_sample_last_error = '{0}: {1}'.format(
-                        type(e).__name__, e)
-                    if (self.monitor_sample_consecutive_failures == 1
-                            or self.monitor_sample_consecutive_failures
-                            % self.MONITOR_SAMPLE_REPORT_EVERY == 0):
-                        print('WARNING: monitor read for {0} failed '
-                              '({1} consecutive, {2} total): {3}'.format(
-                                  self.monitor_for,
-                                  self.monitor_sample_consecutive_failures,
-                                  self.monitor_sample_failures,
-                                  self.monitor_sample_last_error),
-                              file=sys.stderr, flush=True)
-                # Outside the guard, so a failing read waits like a succeeding
-                # one. The old `continue` skipped it, and a persistent failure
-                # then spun `docker exec` as fast as the host allowed -- inside
-                # the container being measured, inflating `max cpu %` and
-                # `min idle%` on the run whose timings are published, and
-                # invisible to `max foreign cpu %` because `gobgp` is in
-                # `contention.BGPERF_PROCESSES`.
-                time.sleep(interval)
-
-        t = Thread(target=stats)
-        t.daemon = True
-        t.start()
+    def read_sample(self, sampled_at):
+        payload = json.loads(decode_cli_output(
+            self.local('gobgp neighbor -j'),
+            container=self.name, cmd='gobgp neighbor -j'))
+        if not isinstance(payload, list) or not payload:
+            raise MonitorReadError(
+                '`gobgp neighbor -j` returned {0}, not a list of '
+                'neighbours: {1!r}'.format(
+                    type(payload).__name__, str(payload)[:200]))
+        info = payload[0]
+        if not isinstance(info, dict):
+            raise MonitorReadError(
+                '`gobgp neighbor -j` returned a {0} where a '
+                'neighbour was expected: {1!r}'.format(
+                    type(info).__name__, str(info)[:200]))
+        return info
 
 
 class Receiver(Monitor):
@@ -298,6 +339,17 @@ class Receiver(Monitor):
             'never polled as one. Read the monitor. What the target exported '
             'to this session is read with accepted_prefixes().')
 
+    def read_export(self, sampled_at):
+        """One export round's read: the count, and nothing to date it by.
+
+        The interface the export poll reads every receiver through, so it has
+        one read path. A GoBGP receiver has no log of its own, so its events
+        are dated by the round; `SinkReceiver.read_export()` returns its log's
+        `sink` section in the second place instead. Raises where
+        `accepted_prefixes()` does.
+        """
+        return self.accepted_prefixes(), None
+
     def accepted_prefixes(self):
         """How many prefixes the target has exported to this session so far.
 
@@ -326,3 +378,204 @@ class Receiver(Monitor):
         # Absent means zero, exactly as the monitor's own loop reads it: gobgp
         # omits the field until the session has accepted something.
         return int(state['accepted']) if 'accepted' in state else 0
+
+
+class SinkMonitor(Instrument, Sink):
+    '''The purpose-built monitor (measurement plan Phase 7a).
+
+    It holds the one session to the target and appends its count to
+    `sink.log` in its bind-mounted directory; `read_sample()` reads that file
+    on the host with `SinkLogReader`, so no read costs a `docker exec`. The
+    sample is the one `Monitor.read_sample()` returns, and it goes through the
+    same poll loop at the same cadence, so everything downstream of the queue
+    runs unchanged. Using the sink's own timestamps is 7b, not this.
+    '''
+
+    LOG_NAME = 'sink.log'
+    STDERR_NAME = 'sink.stderr'
+    # How long the establishment wait gives a sink to write its first line
+    # before calling it dead. The sink writes its format line before it does
+    # anything else, so this bounds a sink that never started -- a bad flag,
+    # a missing binary -- not a slow session.
+    START_GRACE_S = 30
+
+    def __init__(self, host_dir, conf, image='bgperf/sink'):
+        super(SinkMonitor, self).__init__(host_dir, conf, image=image)
+        self.reader = SinkLogReader(os.path.join(self.host_dir, self.LOG_NAME))
+
+    def get_startup_cmd(self):
+        target = self.config['target']
+        return '''#!/bin/bash
+ulimit -n 65536
+exec {binary} -local-as {local_as} -peer-as {peer_as} -router-id {router_id} \\
+    -local-address {local_address} -peer-address {peer_address} \\
+    -connect-retry 10s {snapshot}-log {guest}/{log} > {guest}/{stderr} 2>&1
+'''.format(binary=self.DAEMON_BINARY, local_as=self.conf['as'],
+           peer_as=target['as'], router_id=self.conf['router-id'],
+           local_address=self.conf['local-address'],
+           peer_address=target['local-address'], guest=self.guest_dir,
+           log=self.LOG_NAME, stderr=self.STDERR_NAME,
+           snapshot=('-snapshot-socket ' + shlex.quote(self.prefix_snapshot_socket) + ' '
+                     + ('-snapshot-max-prefixes ' + str(int(self.prefix_snapshot_max_prefixes)) + ' '
+                        if getattr(self, 'prefix_snapshot_max_prefixes', None) is not None else '')
+                     if getattr(self, 'prefix_snapshot_socket', None) else ''))
+
+    def run(self, conf, dckr_net_name=''):
+        # `Container.run()` asks the container for `ip addr` to find its
+        # interface; the sink's image has no `ip`, the exec answers with an
+        # error text rather than raising, and the default it then takes only
+        # matters to a container with a second address, which a monitor never
+        # has.
+        ctn = Container.run(self, dckr_net_name)
+        # Removed before the sink starts, never after. The log is opened for
+        # append, and under `-r/--repeat` this directory survives from the
+        # previous run: its lines would read as an earlier process of this
+        # one, and the gap between the two runs as the instrument stalling.
+        for name in (self.LOG_NAME, self.STDERR_NAME):
+            try:
+                os.remove(os.path.join(self.host_dir, name))
+            except FileNotFoundError:
+                pass
+        self.config = conf
+        self.reader = SinkLogReader(os.path.join(self.host_dir, self.LOG_NAME),
+                                    required=self.check_point())
+        self.exec_startup_cmd(detach=True)
+        return ctn
+
+    def stderr_tail(self, limit=400):
+        try:
+            with open(os.path.join(self.host_dir, self.STDERR_NAME), 'rb') as f:
+                text = f.read().decode('utf-8', 'replace').strip()
+        except OSError as e:
+            return '(no stderr: {0})'.format(e)
+        return text[-limit:] or '(stderr empty)'
+
+    def wait_established(self, neighbor, role='monitor'):
+        '''Wait for the log to say the session is up; return the seconds waited.
+
+        `neighbor` is accepted for `Monitor`'s signature and not needed: the
+        sink is configured with exactly one peer, the target.
+
+        A sink that has not written yet is waited for, up to `START_GRACE_S`.
+        Every other refusal ends the wait, unlike GoBGP's bad payload, which is
+        retried: a malformed log, an unknown format or a sink that stopped
+        writing will not become a session by waiting, and waiting for one
+        forever is how a run hangs in "Waiting N seconds for monitor".
+        '''
+        n = 0
+        while True:
+            if n > 0:
+                rm_line()
+            print(f"Waiting {n} seconds for {role}")
+            try:
+                sample = self.reader.sample()
+            except FileNotFoundError:
+                sample = None
+            except SinkLogError as exc:
+                log = self.reader.log
+                if log.processes or log.malformed_lines:
+                    raise SessionUnavailable(
+                        '{0} ({1}): its log cannot be read as a session: {2}. '
+                        'stderr: {3}'.format(self.name, role, exc,
+                                             self.stderr_tail())) from exc
+                sample = None
+            except OSError as exc:
+                raise SessionUnavailable(
+                    '{0} ({1}): its log could not be read: {2}'.format(
+                        self.name, role, exc)) from exc
+            if sample is None and n >= self.START_GRACE_S:
+                raise SessionUnavailable(
+                    '{0} ({1}) wrote no log line in {2}s, so it never started. '
+                    'stderr: {3}'.format(self.name, role, n, self.stderr_tail()))
+            if sample is not None and \
+                    sample['state']['session_state'] == 'established':
+                return n
+            time.sleep(1)
+            n = n + 1
+
+    def read_sample(self, sampled_at):
+        # The staleness check is made at the loop's own stamp, so the sample
+        # and the clock it is judged by are the same instant.
+        sample = self.reader.sample(now_ns=int(sampled_at * 1e9))
+        # Every sample says how far the sink's clock is from the host's,
+        # because the controller dates the monitor's events to the sink's own
+        # timestamps (measurement plan 7b) and must be able to refuse to.
+        # Measured once per sink process, not per sample; see
+        # `SinkLogReader.clock_offset_ns()`.
+        sample['sink']['clock_offset_ns'] = self.clock_offset_ns()
+        return sample
+
+    def clock_offset_ns(self):
+        # The reader's, measured once per sink process: the same measurement
+        # that decides whether its lines may be held back to a sample's stamp.
+        return self.reader.clock_offset_ns()
+
+    def log_evidence(self):
+        '''`SinkLog.evidence()` for the whole log, read afresh.
+
+        A reader of its own rather than `self.reader`: the poll thread may
+        still be inside a read of that one when the run finishes, and two
+        threads advancing one offset would each skip what the other consumed.
+        '''
+        try:
+            log = SinkLogReader(self.reader.path).read_all()
+        except OSError as e:
+            return {'unreadable': '{0}: {1}'.format(type(e).__name__, e)}
+        return log.evidence(time.time_ns(), time.monotonic_ns())
+
+
+class SinkReceiver(SinkMonitor):
+    '''An export receiver that is a sink (measurement plan 7a).
+
+    `Receiver`'s contract, on the sink: a session the target exports its
+    table to, which announces nothing and is never polled into the stats
+    queue -- `stats()` is refused for the reason `Receiver.stats()` is. It is
+    read with `read_export()`, which reads its log on the host, so a
+    round of the export poll no longer costs a `docker exec` per receiver.
+
+    Every receiver was a full GoBGP holding its own copy of the table, which
+    is how a `--receivers` run could trip `low_free_memory` on memory it
+    consumed by design; a sink holds a prefix set.
+    '''
+
+    CONTAINER_NAME = None
+    CONTAINER_NAME_PREFIX = Receiver.CONTAINER_NAME_PREFIX
+
+    def __init__(self, index, host_dir, conf, image='bgperf/sink'):
+        self.index = index
+        Container.__init__(self, '{0}{1}'.format(self.CONTAINER_NAME_PREFIX, index),
+                           image, host_dir, self.GUEST_DIR, conf)
+        self.reader = SinkLogReader(os.path.join(self.host_dir, self.LOG_NAME))
+
+    def stats(self, queue, interval=1):
+        return Receiver.stats(self, queue, interval)
+
+    # `check_point()` is inherited on purpose. A receiver has been served when
+    # it holds the run's check-point -- `ExportEventRecorder`'s
+    # `required_prefixes` is that same `check-points[0]` -- so the line its log
+    # dates `receiver_table_reached` to is judged by the threshold the export
+    # poll judges the round by.
+
+    def read_export(self, sampled_at):
+        """One round's read: the count, and the `sink` section dating it.
+
+        The monitor's own `read_sample()`, so a receiver's log is read and
+        annotated on exactly the monitor's rules: as of the round's stamp,
+        with the reader's clock offset. Raises on a log that cannot be read
+        as a count, for the reason `Receiver.read_export()` gives.
+        """
+        sample = self.read_sample(sampled_at)
+        return sample['afi_safis'][0]['state']['accepted'], sample['sink']
+
+    def accepted_prefixes(self):
+        """How many prefixes the target has exported to this session so far.
+
+        Not what the export poll calls -- that is `read_export()`, which reads
+        as of the round's stamp and carries the dates; this reads as of now,
+        for a caller that wants only the count. Raises where the log cannot
+        be read as a count -- not written, stale,
+        malformed -- and the export poll records that round as unread, for
+        the reason `Receiver.accepted_prefixes()` gives: a session we failed
+        to ask and a session given no routes are different measurements.
+        """
+        return self.reader.sample()['afi_safis'][0]['state']['accepted']

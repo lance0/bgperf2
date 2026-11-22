@@ -2,7 +2,27 @@
 
 Whether the machine was yours, and where the run is allowed to write.
 
-**Read this before editing:** `contention.py`, `bgperf2.py` (`warn_if_machine_is_busy()`, `controller_foreign_cpu()`, `warn_if_log_dir_is_in_ram()`, `warn_if_log_dir_is_short_on_space()`, the controller threads)
+This document also governs recipe prerequisite snapshots and shared bounded
+local probes in `recipe_preflight.py` and selected image preparation
+in `recipe_prepare.py`.
+Read [the recipe guide](../recipes.md) before changing its probes or status claims.
+Its capacity observations are not workload estimates or host qualification;
+destination checks must not create directories, modify evidence, or accept
+RAM-backed paths. Bootstrap verification reuses the existing idle measurement
+guard. No prerequisite report authorizes a benchmark.
+Preparation must pass that guard before inspecting images and recheck it after
+plan disclosure immediately before every explicit pull. It creates no runtime
+containers, networks, volumes or attempt directories. A local acquisition plan
+does not authorize acquisition without `--pull`, or qualify measurement idleness.
+
+Explicit recipe runs additionally use `recipe_run.py`, `recipe_worker.py` and
+`recipe_diagnostics.py` for scoped diagnostics. Their stage records do not
+redefine measurement clocks, optional probes have uncalibrated overhead and
+missing memory remains unknown. The [investigation guide](../investigations.md)
+owns the precise accounting, bounds and partial-evidence meanings.
+
+**Read this before editing:** `recipe_run.py` (scoped recipe controller), `recipe_worker.py` (scoped recipe worker), `recipe_diagnostics.py` (owned diagnostic observations), `recipe_receive.py` (small receive API qualification), `recipe_preflight.py` (read-only prerequisites and shared probes), `recipe_prepare.py` (selected image preparation), `run_lifecycle.py` (run orchestration), `contention.py`, `role_cpu.py`, `bgperf2.py` (`warn_if_machine_is_busy()`, `controller_foreign_cpu()`, `controller_role_cpu()`, `role_cpu_members()`, `warn_if_log_dir_is_in_ram()`, `warn_if_log_dir_is_short_on_space()`, the controller threads)
+`recipe_minimization_session.py` governs owned minimization reservations and explicit single-step execution.
 
 These are invariants, not background: every rule here was written because the obvious alternative was tried and published a wrong number quietly. `CLAUDE.md` carries the one-line index; this file carries the argument.
 
@@ -97,6 +117,43 @@ and a contention column stuck at 0, and the samplers wait on the event instead o
 they stop at once rather than lingering a poll interval. `tests/test_controller_threads.py` covers
 both directions.
 
+## Per-role CPU — `role_cpu.py`
+
+`min idle%` says whether the machine had anything spare. `max foreign cpu %` says whether anything
+outside the benchmark used it. Neither says which of the benchmark's own roles did the work, and
+that is the measurement `findings.md` keeps naming as missing. Comparison plan §6 item 1 added it.
+Every container the run started is read from its cgroup v2 `cpu.stat` once a second, on the
+controller's monotonic clock. Each role's members are summed and published as `events.json`'s
+`role_cpu` section. The rules are the ones above, applied to cgroups:
+
+- **A delta between two reads, never one reading.** `usage_usec` is cumulative since the container
+  started, which is the lifetime-average trap `ps -eo pcpu` falls into.
+- **Stamped before the read, and the interval published is the one achieved.** Each interval
+  carries its own `start_s`/`end_s`, so a slow pass shows up as a long interval rather than as a
+  high rate.
+- **A role is summed only when every member was read at both ends.** A generator whose container
+  exited makes the role's sum smaller, not unknown. Published as a number, that reads as less
+  work. That interval is `null` and names the missing member. A role whose cgroup could not be
+  resolved at all is `unmeasured_reason`, not an empty role.
+- **The cgroup is found through `/proc/<pid>/cgroup`, never built from the container id.** The
+  path differs between Docker's `systemd` and `cgroupfs` drivers. A v1 host has no unified path
+  and is refused by name, because its `cpuacct.usage` is a different file in different units and
+  has not been checked here.
+- **Resolved before the bench clock starts.** It takes a `docker inspect` per container, and fifty
+  of them inside the clock would publish the controller's cost as the run's.
+- **Not through the run's queue**, for the receiver poll's reason (`export-timing.md`). The
+  monitor loop stops reading the queue at convergence, and churn and the reload skip anything but
+  monitor samples. A queued series would end exactly where the post-convergence workload begins.
+  The poll thread is the recorder's only writer. It takes one last pass when `controller_stop` is
+  set, and `finish_bench()` joins it **after** `bench_stop`.
+- **It changes no verdict.** `findings.py` does not read it. A rule that does is a separate
+  decision, taken on data gathered for that purpose (`findings.md`), and `tests/test_role_cpu.py`
+  fails if `findings.py` starts naming the section.
+
+The controller itself, and the kernel's softirq work for the bridge, belong to no role.
+`--pin` does not confine them to cores left free by the role layout: they remain
+unrestricted, and this section does not measure them.
+
 ## The bench directory must not be in RAM
 
 `-d/--dir` holds every role's config and logs, bind-mounted under it, and defaults to `/var/tmp` —
@@ -124,12 +181,14 @@ is the reserve only root may use, and bgperf2 does not run as root — and it me
 **existing** ancestor, because `bench()` asks before it creates the directory, on purpose. A warning
 about log volume is worth nothing once the logs are written.
 
-Two things made it that large, and only one is fixed:
+Two things made historical BIRD logs that large:
 
 - The BIRD tester config used `log ... all`, which includes `trace` — every route event, ~7KB per
   prefix. It now names the classes `find_errors()` actually needs, about 6x less.
 - What remains is `<RMT> Invalid route ... withdrawn`: the target re-advertises everything it
   learns back to the testers, which reject it. That is normal operation — `find_errors()` already
-  excludes those lines — but they are class `remote`, which `find_errors()` needs, so they cannot be filtered
-  out without blinding it. Stopping the target from exporting to testers would remove the noise but
-  would also change the workload (no RIB-out to N peers), so it is left alone.
+  excludes those lines. Fresh generators now filter only those existing remote
+  exclusions before disk, retaining all other remote messages. Their GNU awk
+  helper names itself `bgperf-bird-log`; only that dedicated name is allowed,
+  not generic awk interpreters. Generator cgroup CPU still includes the helper.
+  The target continues exporting to testers, preserving its RIB-out workload.

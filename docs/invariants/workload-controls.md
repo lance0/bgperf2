@@ -2,7 +2,8 @@
 
 What `bench`/`batch` may be asked to run, and the guards that refuse the rest.
 
-**Read this before editing:** `bgperf2.py` (argument guards, `bench()`, `batch()`, `check_batch_test()`, `bench_output_prefix()`), `base.py` (`gen_conf()`, `gen_paths()`, `Target.scenario_neighbors()`), `churn.py`, `policy.py`, `bird.py` (the churn protocol and the reload command)
+**Read this before editing:** `cpu_pinning.py` (pure CPU lists and role-pinning validation), `recipes.py` (portable source validation), `recipe_worker.py` (recipe CPU layout forwarding), `recipe_preflight.py` (online CPU availability), `batch_cells.py` (pure matrix construction, prefix scope and legacy identities), `run_lifecycle.py` (run orchestration), `bgperf2.py` (argument guards, `bench()`, `batch()`, `batch_cell_args()`, `check_batch_test()`, `bench_output_prefix()`), `base.py` (`gen_conf()`, `gen_paths()`, `Target.scenario_neighbors()`), `churn.py`, `policy.py`, `bird.py` (the churn protocol and the reload command)
+`recipe_minimization.py` governs explicit selected-cell projection and bounded peer/prefix reductions.
 
 These are invariants, not background: every rule here was written because the obvious alternative was tried and published a wrong number quietly. `CLAUDE.md` carries the one-line index; this file carries the argument.
 
@@ -63,7 +64,7 @@ still reaches `write_provenance()` and `bench_output_prefix()`, so a default the
 matters: a CLI mistake costs one run, a batch mistake costs a matrix, and nobody is watching it.
 
 A test key written under a *target* is refused (`BATCH_TEST_ONLY_KEYS`). There is no allowlist of
-target keys -- `batch()` reads a fixed field list and ignores the rest -- and every knob an operator
+target keys -- `batch_cell_args()` reads a fixed field list and ignores the rest -- and every knob an operator
 sets is a target key, so a test key one level too deep is the natural slip and fails silently:
 `prefix_scope: total` under a target runs that target at `neighbors x prefixes`, converges, and
 writes rows that read as a peer sweep.
@@ -381,6 +382,95 @@ argparse's bare `unrecognized arguments`.
 - `gen_conf()` no longer writes `single-table` into the scenario; the stats row keeps its `flags`
   column (always empty) for the stats contract.
 
+## `--pin ROLE=CPUS,...` — confine each role to its own cores
+
+`--pin target=0-7,monitor=8-9,testers=10-15` (batch: `pin:`, a *test* key) gives every container of
+a role one Docker cpuset (`Container.cpuset`, applied in `Container.run()`). Without it target,
+generators, monitor and receivers share every core, and a co-located role's CPU lands in the
+target's timing. Comparison plan §4 item 2 and §5's bias check are why it exists.
+
+- **Every role the run has must be named, and the sets must be disjoint.** An unnamed role runs on
+  every core, the pinned ones included, so a run pinning only the target would be published as
+  isolated when it was not. `receivers` is required exactly when the run has receivers, and refused
+  when it has none -- from `--receivers` on a generated run, from the scenario's own list under `-f`.
+- **A CPU the host does not have is refused before the teardown**, read from
+  `/sys/devices/system/cpu/online` (`host_cpus()`), not from this process's affinity. Docker would
+  refuse it too, but only once the previous run's containers were gone. It is the one guard that
+  reads the host, so `bench()` resolves the pin after every command-line guard.
+- **The cpuset is read back after the container is created.** A daemon that dropped it would
+  publish an unpinned run under a pinned name, so a mismatch raises.
+- **Refused under `-r/--repeat`, in both directions.** `--repeat` builds no tester objects and a
+  container's cpuset is fixed at creation, so `--pin -r` would run the generators on whatever cores
+  they already had. The reverse is the quieter one: an unpinned `-r` after a pinned run reuses
+  pinned generators. `pinned_tester_containers()` refuses that before the teardown, which makes it a
+  Docker call after the pure guards. A batch target with `repeat` refuses a pinned test outright, and
+  `check_batch_pin_and_repeat()` refuses a *batch* mixing a pinned test with a repeat target in
+  either order (shuffle and `--resume` decide which runs first). It also checks the host once for
+  pinned generators left behind. Found in review: per-test checks passed it, and the matrix
+  ended at the second test's first cell.
+- **Refused for a remote target** (`-f` only): bgperf2 does not start it, so there is nothing to
+  confine.
+- **Three entry points, not four**, for the reason `--policy-reload-blocks` has three: a cpuset is a
+  property of the containers, not of the scenario, so `config` does not take the flag.
+- **Canonical form.** Role order is fixed and each set is written as its shortest cpulist, so two
+  spellings of one layout give one cell id, one stem and one manifest entry. Commas separate both
+  roles and CPUs; a token with no `=` extends the role before it.
+- **Recorded, unlike the workload keys, under `-f` too.** Both `run` blocks carry `pin` as
+  `{role: cpus}`, or `null` when unpinned: bgperf2 starts the containers whatever wrote the
+  scenario. The stem gets `pin.target0-7.monitor8-9.testers10-15` (commas become `+`), and the cell
+  id and description carry the canonical spec, only when it is set, so every existing id resumes.
+  It is not a CSV column, for the reason `--path-diversity` is not.
+- **What it does not pin:** the controller itself (bgperf2, `mpstat`, the `docker exec` polls) and
+  the kernel's network softirqs still run anywhere. Disjoint sets are only disjoint physical cores
+  where a vCPU is a core, not an SMT sibling; check `lscpu`'s `Thread(s) per core` on the host
+  before relying on it (plan §4 item 2).
+
+## `--monitor gobgp|sink` — which instrument measures the run
+
+`--monitor` (batch: `monitor:`, a *test* key) chooses the monitor class from `MONITOR_CLASSES`.
+**`DEFAULT_MONITOR` is `sink` since measurement plan 7d (2026-10-02).** GoBGP stays selectable
+as the reference a sink result can be re-checked against, one cell at a time, so the monitor
+stays a run dimension. The bridge block (7c) that would have compared the two up front was
+dropped by the operator in favour of re-benching.
+
+- **Three entry points, not four**, for the reason `--pin` has three: the monitor is a container,
+  not part of the scenario, so `config` does not take it. A batch value is checked against
+  `MONITOR_TYPES` by `check_batch_test()`, since `batch()` bypasses argparse's `choices`.
+- **The image is checked after every command-line guard and before the teardown**, on both the
+  generated and the `-f` path (a `-f` run starts the monitor too), and once per batch by
+  `check_batch_monitor_images()`. The GoBGP monitor's image had never been checked at all. A run
+  with receivers checks `RECEIVER_CLASSES[monitor]`'s image as well: review found that under
+  `--monitor sink` the receivers were still GoBGP and their image went unchecked.
+- **Named only away from `UNMARKED_MONITOR`, which is not `DEFAULT_MONITOR`.** The stem gets
+  `mon-sink`, and the cell id and description carry `monitor` only for the sink, so every existing
+  artifact and cell id is unchanged. The omission is tied to the instrument the old rows were
+  measured on rather than to the default: tied to the default, the 7d flip would have handed the
+  unmarked name to the sink and renamed every GoBGP cell measured before it. So since the flip a
+  default run is the marked one: `bench -t bird -n1 -p1` writes `bird_bird_1_1_mon-sink.*`.
+- **A config that ran before the flip says so.** Every 2026 config under `benchmarks/` states its
+  monitor, and those that ran under GoBGP say `monitor: gobgp` (`test_static.py` enforces it).
+  Without the key, re-reading one after the flip describes its cells as sink cells:
+  `check_repetition_configs.py` reported exactly that for the archived timing-validation blocks,
+  and review found the GoBGP half of all three monitor-pair configs had become a second sink run.
+  With it, their cell ids are byte-identical to the ones recorded, because GoBGP is the unmarked
+  instrument.
+- **`--resume` refuses rows another instrument measured** (`check_resumable()`), before anything
+  asks Docker. A cell id names its instrument, so such rows are results for cells the config no
+  longer lists, and continuing would report them beside rows measured under the new one. It
+  catches both ways in: a config with no `monitor:` key that ran GoBGP before the flip, and a
+  `monitor:` edited between runs. The way out is a new `--results-dir`, or stating the instrument
+  the rows ran under.
+- **An absent monitor in a cell id is `UNMARKED_MONITOR`** (`cell_monitor()`), never the
+  default, and `batch()` runs a cell under the same reading. An id omits the key on GoBGP, and
+  analysis reads ids back from recorded results; read as the default, every
+  GoBGP cell measured before the flip would be described as a sink cell.
+- **Recorded under `-f` too**, in both `run` blocks and as the manifest's `monitor.daemon`,
+  because bgperf2 starts the monitor whatever wrote the scenario. Not a CSV column: the
+  `monitor version` column already names the build.
+- **The receivers follow the monitor** (`RECEIVER_CLASSES`): GoBGP under `gobgp`, sinks under
+  `sink`, so one dimension names every instrument in the run, and a GoBGP re-check compares
+  whole instruments rather than a sink monitor beside GoBGP receivers.
+
 ## `--threads N` — worker threads on the target
 
 `--threads N` sets worker threads on the target (`conf['target']['threads']`). Only BIRD reads it
@@ -395,3 +485,18 @@ Batch configs take `versions: [...]` on a target, expanded by `expand_target_ver
 run per version with an auto label. Batch yaml is parsed with `BatchLoader`, which drops YAML's
 float resolver — plain `yaml.safe_load` reads `10.10` as `10.1` and would silently bench the wrong
 release.
+
+## Portable recipe source validation
+
+The read-only `recipes.py` interface validates a strict subset of batch YAML
+for portable synthetic IPv4 BIRD/BIRD/sink recipes. It uses `batch_cells.py`
+for shared construction and historical IDs, and rejects unsupported source
+fields before selecting a cell. Optional CPU pinning uses the shared pure
+`cpu_pinning.py` rules; every role is required and the sets must be disjoint.
+The recipe reader bounds CPU ranges before expansion, preserves absent-pin
+identities, and binds a canonical declared layout into the cell and recipe.
+Read-only prerequisites check online IDs; the scoped worker must forward the
+layout into the same lifecycle guards and artifact fields as `bench`.
+The authoritative envelope and
+status contracts live in [the recipe guide](../recipes.md). The existing batch
+and scenario guards above retain their behavior.

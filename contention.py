@@ -36,10 +36,15 @@ BGPERF_PROCESSES = frozenset((
     # FRR
     'bgpd', 'zebra', 'staticd', 'watchfrr', 'mgmtd', 'vtysh', 'watchquagga',
     # other open-source targets and the load generators
-    'gobgpd', 'gobgp', 'bird', 'birdc', 'rustybgpd', 'rustybgp',
-    'rustbgpd', 'rbgp',
+    'gobgpd', 'gobgp', 'bird', 'birdc', 'rustybgpd', 'rustybgp', 'rustbgpd', 'rbgp',
+    'holod', 'grpcurl', 'bgperf-bird-log',
+    'zebra-rs', 'vtyctl', 'bgperf-z-wait',
+    'bio-rd', 'bgperf-bio-http',
+    'mgd', 'bgperf-mg-http',
     'openbgpd', 'bgpd.openbsd', 'bgpctl', 'bgplgd', 'exabgp', 'bgpdump2',
     'flockd', 'flock',
+    # the purpose-built monitor (Phase 7)
+    'bgperf-sink',
     # commercial NOSes: Junos cRPD, Arista cEOS, Nokia SR Linux
     'rpd', 'mgd', 'na-grpcd', 'na_grpcd', 'jsd', 'lmpd', 'ppmd', 'bfdd',
     'Bgp', 'ConfigAgent', 'EosSdk', 'Sysdb', 'Fru', 'Launcher', 'ProcMgr',

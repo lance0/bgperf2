@@ -16,6 +16,14 @@
 # limitations under the License.
 
 import argparse
+import run_lifecycle
+from batch_cells import (DEFAULT_PATH_DIVERSITY, DEFAULT_RECEIVERS,
+                         UNMARKED_MONITOR, PREFIX_SCOPES, MRT_TESTER_TYPES,
+                         SYNTHETIC_TESTER_TYPES, TESTER_TYPES,
+                         MAX_SUGGESTED_PEERS, _is_positive_count,
+                         _divisors_near, resolve_prefix_scope, cell_monitor,
+                         construct_batch_cells, batch_cell_id, batch_cell_key,
+                         BatchLoader, expand_target_versions)
 import glob
 import hashlib
 import signal
@@ -40,8 +48,9 @@ from nsenter import Namespace
 from psutil import virtual_memory
 import subprocess
 from subprocess import check_output
-import matplotlib.pyplot as plt
-import numpy as np
+from lazy_runtime import module as lazy_module
+plt = lazy_module('matplotlib.pyplot')
+np = lazy_module('numpy')
 from base import *
 from exabgp import ExaBGP, ExaBGP_MRTParse
 from gobgp import GoBGP, GoBGPTarget
@@ -50,18 +59,24 @@ from frr import FRRoutingTarget
 from frr_compiled import FRRoutingCompiled, FRRoutingCompiledTarget
 from rustybgp import RustyBGP, RustyBGPTarget
 from rustbgpd import RustBGPd, RustBGPdTarget
+from holo import Holo, HoloTarget
+from zebra_rs import ZebraRS, ZebraRSTarget
+from bio_routing import BioRouting, BioRoutingTarget
+from maghemite import Maghemite, MaghemiteTarget
 from openbgp import OpenBGP, OpenBGPTarget
 from flock import Flock, FlockTarget
 from srlinux import SRLinux, SRLinuxTarget
 from junos import Junos, JunosTarget
 from eos import Eos, EosTarget
 from tester import ExaBGPTester, BIRDTester
-from mrt_tester import GoBGPMRTTester, ExaBGPMrtTester
+from mrt_tester import ExaBGPMrtTester
 from bgpdump2 import Bgpdump2, Bgpdump2Tester
-from monitor import Monitor, Receiver
-import reclaim
+from monitor import Monitor, Receiver, SinkMonitor, SinkReceiver
+from sink import SINK_CLOCK_OFFSET_LIMIT_NS, Sink
 from convergence import ConvergenceTracker
-from reclaim import StopRequested, StopSignal, watch_for_interruption
+from role_cpu import (ROLE_CPU_INTERVAL_S, RoleCpuRecorder, cgroup_dir_for_pid,
+                      read_effective_cpuset, read_members)
+from stop import StopRequested, StopSignal
 from policy import (DEFAULT_POLICY_RELOAD_BLOCKS,
                     PolicyReloadConfigurationError, PolicyReloadTracker,
                     policy_reload_counts, rejected_block_indexes,
@@ -79,7 +94,9 @@ from measurements import (EVENT_ARTIFACT_SCHEMA, ChurnEventRecorder,
                           MonitorEventRecorder, PolicyReloadEventRecorder,
                           TesterEventRecorder, event_artifact,
                           export_poll_can_stop, monitor_metrics, natural_key,
-                          tester_fleet_metrics, tester_metrics)
+                          SinkDates, sink_event_dates,
+                          tester_fleet_metrics,
+                          tester_metrics)
 from settings import dckr
 from summary import describe_batch_summary, summarize_batch
 from queue import Empty as QueueEmpty, Queue
@@ -99,16 +116,25 @@ BUILDABLE_IMAGES = {
     'bird': BIRD,
     'rustybgp': RustyBGP,
     'rustbgpd': RustBGPd,
+    'holo': Holo,
+    'zebra-rs': ZebraRS,
+    'bio-routing': BioRouting,
+    'maghemite': Maghemite,
     'openbgp': OpenBGP,
     'flock': Flock,
     'frr_c': FRRoutingCompiled,
     'bgpdump2': Bgpdump2,
+    # The purpose-built monitor (measurement plan Phase 7), probed by `verify`
+    # through MONITOR_CLASSES as the class that runs it.
+    'sink': Sink,
 }
 
 # What `prepare` builds, in order. Flock and the commercial NOSes are left out:
 # they are downloaded rather than compiled.
-PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp',
-                  'openbgp', 'frr_c', 'bgpdump2']
+# The fork's rustbgpd image builds from a local checkout, so a bare `prepare`
+# leaves it out; `prepare -t rustbgpd` still builds it.
+PREPARE_IMAGES = ['exabgp', 'exabgp_mrtparse', 'gobgp', 'bird', 'rustybgp', 'holo', 'zebra-rs', 'bio-routing', 'maghemite',
+                  'openbgp', 'frr_c', 'bgpdump2', 'sink']
 
 # Targets `bench -t` accepts. The class both selects the daemon's behaviour and
 # supplies the image naming used to resolve --version.
@@ -122,15 +148,69 @@ TESTER_CLASSES = {
     'exabgp_mrtparse': ExaBGPMrtTester,
     'bgpdump2': Bgpdump2Tester,
     'bird': BIRDTester,
-    'gobgp': GoBGPMRTTester,
 }
 
+# GoBGP is only ever the measurement instrument -- the monitor, and the export
+# receivers, which subclass it. It was removed as a target and as an MRT
+# generator on 2026-09-29: too slow to be worth benchmarking, and as a
+# generator it became the bottleneck itself. Its image is still built and must
+# still be probed, and through the class that really runs it, for the same
+# reason TESTER_CLASSES exists.
+#
+# The sink is the purpose-built replacement (measurement plan Phase 7). It is
+# probed as `SinkMonitor`, not `Sink`, for the same reason: that class mixes
+# the monitor role into the daemon, and an MRO is exactly where rustybgp's
+# version parser went wrong.
+MONITOR_CLASSES = {
+    'gobgp': Monitor,
+    'sink': SinkMonitor,
+}
+
+# Which of them a run measures with (`--monitor`; batch: `monitor:`, a *test*
+# key). Upstream made the sink the default in measurement plan 7d. This fork
+# keeps GoBGP as the default: its campaigns compare against receipts measured
+# with the GoBGP monitor, and a default flip would move every daemon's timings
+# at once. The sink stays selectable with `--monitor sink` / `monitor: sink`
+# until it is qualified against GoBGP on the fork's own shapes.
+MONITOR_TYPES = tuple(MONITOR_CLASSES)
+DEFAULT_MONITOR = 'gobgp'
+# The class each monitor's export receivers run as. A receiver is a monitor
+# nothing reads (`monitor.Receiver`), so it follows the run's instrument.
+RECEIVER_CLASSES = {
+    'gobgp': Receiver,
+    'sink': SinkReceiver,
+}
+
+
+def run_monitor(args):
+    '''The monitor a run measures with, from `--monitor` or its default.'''
+    return getattr(args, 'monitor', None) or DEFAULT_MONITOR
+
+
+def batch_test_monitor(test):
+    '''The monitor a batch test measures with: its `monitor:`, or the default.
+
+    The one reading of a test, for `expand_batch_cells()` and
+    `check_batch_monitor_images()` both, so the image checked is the image
+    run. (A cell or a parsed cell id is read with `cell_monitor()`, which is a
+    different question: there an absent key is the unmarked instrument.)
+    '''
+    return test.get('monitor') or DEFAULT_MONITOR
+
+
 TARGET_CLASSES = {
+    # Kept in this fork: GoBGP is one of the daemons its cross-stack campaign
+    # compares. Upstream dropped it as a target on 2026-09-29; the MRT
+    # generator removal is kept.
     'gobgp': GoBGPTarget,
     'bird': BIRDTarget,
     'frr_c': FRRoutingCompiledTarget,
     'rustybgp': RustyBGPTarget,
     'rustbgpd': RustBGPdTarget,
+    'holo': HoloTarget,
+    'zebra-rs': ZebraRSTarget,
+    'bio-routing': BioRoutingTarget,
+    'maghemite': MaghemiteTarget,
     'openbgp': OpenBGPTarget,
     'flock': FlockTarget,
     'srlinux': SRLinuxTarget,
@@ -232,150 +312,22 @@ def bench_output_prefix(args):
                      or DEFAULT_POLICY_RELOAD_BLOCKS)
     if reload_blocks != DEFAULT_POLICY_RELOAD_BLOCKS:
         parts.append('pr{0}'.format(reload_blocks))
+    # And the core layout: a pinned run and an unpinned run of one cell are
+    # the same workload everywhere else in this stem -- the comparison Phase 3
+    # of the daemon comparison exists to make -- so without it the second
+    # would replace the first's artifacts.
+    pin = getattr(args, 'pin', None)
+    if pin:
+        parts.append(pin_stem(pin))
+    # And the instrument: one cell measured with each monitor -- a sink result
+    # re-checked under GoBGP -- is the same workload everywhere else in this
+    # stem, so without it the second would replace the first's artifacts.
+    # Marked away from UNMARKED_MONITOR, so the default (the sink) is the
+    # marked one and every GoBGP artifact keeps its pre-Phase-7 name.
+    monitor = run_monitor(args)
+    if monitor != UNMARKED_MONITOR:
+        parts.append('mon-{0}'.format(monitor))
     return '_'.join(parts)
-
-
-# How `-p/--prefix-num` is read. `per-peer` is what bgperf has always meant by
-# it, and multiplies: `-n 50 -p 100000` is five million routes. `total` reads it
-# as the whole table and splits it across the sessions.
-PREFIX_SCOPES = ('per-peer', 'total')
-
-# Generators that play back an MRT file rather than synthesising prefixes. For
-# these `-p` is already the size of the whole table -- `gen_conf()` sets the
-# monitor check-point from it directly rather than multiplying -- so a scope
-# has nothing to divide and asking for one is a mistake worth naming.
-MRT_TESTER_TYPES = ('gobgp', 'bgpdump2')
-
-# Every generator `-g` accepts, and the single source for the CLI's `choices`.
-# `gen_conf()` branches on `not in ('exa', 'bird')` rather than on
-# MRT_TESTER_TYPES, so an unrecognised value is treated as an MRT injector: a
-# typo'd `tester_type: brid` on a batch target -- which bypasses argparse
-# entirely -- reached that branch and died at its bare `exit(1)`, taking the
-# rest of the matrix with it.
-SYNTHETIC_TESTER_TYPES = ('exa', 'bird')
-TESTER_TYPES = SYNTHETIC_TESTER_TYPES + MRT_TESTER_TYPES
-
-
-def resolve_prefix_scope(scope, neighbor_num, prefix_num, tester_type=None):
-    """The per-peer prefix count a run should generate, from what was asked for.
-
-    Sessions and table size are one axis today, and that is the gap this
-    closes. `gen_conf()` gives every neighbour its own `gen_paths(p)` off a
-    shared iterator, so the peers get disjoint prefixes and the table is
-    `n * p`: a batch sweeping `neighbors: [10, 25, 50]` at a fixed `prefixes`
-    is sweeping the table size at the same time, and nothing downstream can
-    separate "50 sessions were slower" from "five times the routes were
-    slower". `2026-core-synth.yaml` is exactly this shape -- its four cells
-    hold 500k, 1M, 2.5M and 5M routes.
-
-    Under `total` the peer count moves and the table does not. The result is
-    normalised to a per-peer count here, before anything reads it, because
-    `-n 50 -p 100000 --prefix-scope total` and `-n 50 -p 2000` are the same
-    workload and must produce the same row: the CSV column is called
-    `prefixes per peer`, `bench_output_prefix()` names artifacts from
-    `prefix_num`, and `create_graph()` groups bars by it. A scope that
-    survived into those would have to be a new dimension in all three.
-
-    The division has to be exact, and an inexact one is refused rather than
-    rounded or spread. A remainder means the peers do not all offer the same
-    table, so `prefixes per peer` is a number that is not true of any of them,
-    each neighbour's `check-points` differs, and the monitor's own check-point
-    stops being `n * p`. Refusing costs a message before the first container;
-    the alternative is a column that quietly means something else for those
-    rows.
-    """
-    if scope in (None, 'per-peer'):
-        return prefix_num
-    if scope not in PREFIX_SCOPES:
-        raise ValueError("unknown prefix scope '{0}': expected one of {1}".format(
-            scope, ', '.join(PREFIX_SCOPES)))
-    if tester_type in MRT_TESTER_TYPES:
-        raise ValueError(
-            "--prefix-scope total does not apply to the '{0}' tester: it plays "
-            'back an MRT file, so -p is already the whole table and there is '
-            'nothing to divide across the peers'.format(tester_type))
-    if neighbor_num < 1:
-        raise ValueError('--prefix-scope total needs at least one peer to '
-                         'divide the table across, got {0}'.format(neighbor_num))
-    if prefix_num < neighbor_num:
-        raise ValueError(
-            '--prefix-scope total: {0} prefixes across {1} peers leaves peers '
-            'with none. A session that offers nothing is not a peer under '
-            'test'.format(prefix_num, neighbor_num))
-    if prefix_num % neighbor_num:
-        per_peer = prefix_num // neighbor_num
-        # Prefix counts always -- both are exact by construction. Peer counts
-        # only where a usable one exists, since a table with no divisor near
-        # the asked-for count has nothing to offer and saying so is better
-        # than naming one nobody would run.
-        peers = _divisors_near(prefix_num, neighbor_num)
-        advice = "use {0} or {1} prefixes".format(
-            per_peer * neighbor_num, (per_peer + 1) * neighbor_num)
-        if peers:
-            advice += ', or {0} peers'.format(
-                ' or '.join(str(n) for n in peers))
-        raise ValueError(
-            '--prefix-scope total: {0} prefixes do not divide evenly across '
-            '{1} peers ({2} each, {3} left over). An uneven split makes the '
-            "CSV's `prefixes per peer` untrue of every peer; {4}".format(
-                prefix_num, neighbor_num, per_peer, prefix_num % neighbor_num,
-                advice))
-    return prefix_num // neighbor_num
-
-
-# How far *above* the asked-for peer count the search will look -- a distance,
-# not an absolute ceiling. Only the upward half needs bounding: the scan
-# otherwise walked to `prefix_num` itself, offering five million peers after a
-# fifth of a second of searching, and a suggestion far above what the operator
-# asked for is not one whatever it costs. Downward it is already bounded by the
-# asked-for count, and a divisor below that is by construction a number the
-# operator was willing to be near -- 1443 for someone who asked for 1500 is
-# useful advice, so it is deliberately not capped.
-MAX_SUGGESTED_PEERS = 512
-
-
-def _is_positive_count(value):
-    """A whole number of 1 or more, the one rule both entry points apply.
-
-    `True` is an `int` in Python and is not a peer count.
-    """
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
-
-
-def _divisors_near(prefix_num, neighbor_num):
-    """Peer counts closest to the one asked for that divide this table.
-
-    A message that only says the division failed leaves the operator doing
-    arithmetic on a 1,050,000-prefix RIB; a workable number either side is the
-    whole fix. One peer is excluded for the same reason a five-million-peer
-    suggestion is: a suggestion the operator cannot act on is worse than none,
-    because it reads as the tool having thought about it.
-    """
-    # Never past two prefixes per peer, at either end: a peer count equal to
-    # the table size divides it exactly and offers each session a single
-    # route, which is the same kind of unusable advice as suggesting five
-    # million peers, and the next divisor down is the first that is not.  Only
-    # reachable on a table small enough to be within MAX_SUGGESTED_PEERS of
-    # the asked-for count.
-    most = prefix_num // 2
-    below = next((n for n in range(min(neighbor_num - 1, most), 1, -1)
-                  if prefix_num % n == 0), None)
-    # A distance above the asked-for count, not an absolute cap: an absolute
-    # one offers nothing at all to anybody who asked for more than it, so a
-    # 513-peer request got no upward suggestion even though 625 divides.
-    ceiling = min(most, neighbor_num + MAX_SUGGESTED_PEERS)
-    above = next((n for n in range(neighbor_num + 1, ceiling + 1)
-                  if prefix_num % n == 0), None)
-    return [n for n in (below, above) if n]
-
-
-# How many peers announce each block of prefixes. 1 is what bgperf has always
-# generated: every peer takes its own block off the shared iterator, so the
-# peers are disjoint and the table is `n * p`. Above 1 the peers are grouped and
-# every peer in a group announces the *same* block, so the target holds that
-# many competing paths for each of those prefixes and has to select between
-# them -- which is the work `n * p` disjoint prefixes never asks it to do.
-DEFAULT_PATH_DIVERSITY = 1
 
 
 def path_diversity_groups(neighbor_num, diversity):
@@ -510,15 +462,6 @@ def resolve_path_diversity(diversity, neighbor_num, tester_type=None,
     return diversity
 
 
-# How many receive-only sessions the target exports its table to, beside the
-# monitor. 0 is every run bgperf has ever made: one table in, one session out,
-# so the cost of exporting a table and the cost of receiving one are a single
-# number that nothing downstream can separate. Each receiver is one more copy
-# of the RIB-out for the target to build, encode and send, and it announces
-# nothing -- so the ingress side of the run is untouched by how many there are.
-DEFAULT_RECEIVERS = 0
-
-
 def resolve_receivers(receivers):
     """The validated export fan-out, checked before any container starts.
 
@@ -539,6 +482,33 @@ def resolve_receivers(receivers):
             '--receivers must be a whole number of 0 or more, got '
             '{0!r}'.format(receivers))
     return receivers
+
+
+# The roles `--pin` gives cores to, in the order the canonical form writes
+# them. `receivers` is a role only on a run that has receivers.
+from cpu_pinning import (PIN_ROLES, parse_cpu_list, format_cpu_list, resolve_pin,
+                         format_pin, parse_pin, pin_cpusets, pin_stem)
+
+
+def host_cpus():
+    '''The CPU ids Docker will accept in a cpuset: the host's online CPUs.
+
+    Read from sysfs rather than `os.sched_getaffinity()`, which is this
+    process's own mask and says nothing about what a container may be given.
+    '''
+    try:
+        with open('/sys/devices/system/cpu/online') as f:
+            return parse_cpu_list(f.read().strip())
+    except (OSError, ValueError):
+        return frozenset(range(os.cpu_count() or 1))
+
+
+def pinned_tester_containers(names, cpuset_of):
+    '''The tester containers among `names` that carry a cpuset.'''
+    prefixes = tuple(cls.CONTAINER_NAME_PREFIX for cls in TESTER_CLASSES.values())
+    return sorted((name for name in names
+                   if name.startswith(prefixes) and cpuset_of(name)),
+                  key=natural_key)
 
 
 def surplus_receiver_names(container_names, wanted):
@@ -639,10 +609,11 @@ def scenario_receivers(conf):
     return receivers
 
 
-def describe_export_fanout_cost(receivers):
+def describe_export_fanout_cost(receivers, monitor):
     """What the fan-out costs the host, said out loud before the run.
 
-    Each receiver is a full GoBGP holding its own copy of the table, on the
+    Under the GoBGP monitor each receiver is a full GoBGP holding its own copy
+    of the table, on the
     same host, and `min free mem (GB)` is host-wide -- so the fan-out lands in
     a published column, and `findings.py` turns a low value into the
     `low_free_memory` confounder, which withholds `limiting_component`
@@ -654,14 +625,20 @@ def describe_export_fanout_cost(receivers):
     the paths, and a number this function invented would be quoted back as
     though it had been measured. It names the mechanism and leaves the
     arithmetic to whoever knows the table.
+
+    Under the sink each receiver holds a prefix set instead: far less, but
+    still bgperf2's own memory in the same column, so the sentence names what
+    is held rather than going quiet.
     """
     if not receivers:
         return None
-    return ('export fan-out: {0} receiver{1} will each hold a full copy of the '
-            'table on this host. That memory is bgperf2\'s own and is counted '
-            'in the published `min free mem` column, where a low value becomes '
-            'the low_free_memory confounder and withholds the '
-            'verdict'.format(receivers, '' if receivers == 1 else 's'))
+    held = ('a set of the table\'s prefixes' if monitor == 'sink'
+            else 'a full copy of the table')
+    return ('export fan-out: {0} receiver{1} will each hold {2} on this host. '
+            'That memory is bgperf2\'s own and is counted in the published '
+            '`min free mem` column, where a low value becomes the '
+            'low_free_memory confounder and withholds the '
+            'verdict'.format(receivers, '' if receivers == 1 else 's', held))
 
 
 def resolve_churn(churn_prefixes, churn_bursts, neighbor_num, prefix_num,
@@ -1347,7 +1324,8 @@ def verify(args):
         # rustybgp. De-duplicated so a daemon that is only ever one role is
         # still probed once, via the base class.
         roles = []
-        for label, table in (('target', TARGET_CLASSES), ('tester', TESTER_CLASSES)):
+        for label, table in (('target', TARGET_CLASSES), ('tester', TESTER_CLASSES),
+                             ('monitor', MONITOR_CLASSES)):
             cls = table.get(name)
             if cls is not None and cls not in [c for _, c in roles]:
                 roles.append((label, cls))
@@ -1660,15 +1638,26 @@ def update(args):
                                 checkout=args.checkout or cls.DEFAULT_REF,
                                 nocache=args.no_cache)
 
+# Containers of roles bgperf2 no longer runs. A host whose last run used one
+# can still have it holding that role's address on the bench bridge, and the
+# next run would fail to attach there with nothing in the teardown saying why.
+# GoBGP stopped being an MRT generator on 2026-09-29; this fork keeps it as a
+# target, so no target container is retired.
+RETIRED_TARGET_CONTAINERS = ()
+RETIRED_TESTER_PREFIXES = ('bgperf_gobgp_mrttester_',)
+
+
 def remove_target_containers():
     # Derived from TARGET_CLASSES so registering a target in one place is
     # enough. A target missing from this list leaves its container behind and
     # the next bench fails on the duplicate name -- FRRoutingTarget is included
     # explicitly because frr_c inherits its container name from it.
-    for target_class in set(TARGET_CLASSES.values()) | {FRRoutingTarget}:
-        if ctn_exists(target_class.CONTAINER_NAME):
-            print('removing target container', target_class.CONTAINER_NAME)
-            dckr.remove_container(target_class.CONTAINER_NAME, force=True)
+    names = {c.CONTAINER_NAME
+             for c in set(TARGET_CLASSES.values()) | {FRRoutingTarget}}
+    for name in sorted(names | set(RETIRED_TARGET_CONTAINERS)):
+        if ctn_exists(name):
+            print('removing target container', name)
+            dckr.remove_container(name, force=True)
 
 def remove_old_containers():
     if ctn_exists(Monitor.CONTAINER_NAME):
@@ -1684,9 +1673,9 @@ def remove_old_containers():
         if ctn_name.startswith(Receiver.CONTAINER_NAME_PREFIX) or \
             ctn_name.startswith(ExaBGPTester.CONTAINER_NAME_PREFIX) or \
             ctn_name.startswith(ExaBGPMrtTester.CONTAINER_NAME_PREFIX) or \
-            ctn_name.startswith(GoBGPMRTTester.CONTAINER_NAME_PREFIX) or \
             ctn_name.startswith(Bgpdump2Tester.CONTAINER_NAME_PREFIX) or \
-            ctn_name.startswith(BIRDTester.CONTAINER_NAME_PREFIX):
+            ctn_name.startswith(BIRDTester.CONTAINER_NAME_PREFIX) or \
+            ctn_name.startswith(RETIRED_TESTER_PREFIXES):
             role = ('receiver'
                     if ctn_name.startswith(Receiver.CONTAINER_NAME_PREFIX)
                     else 'tester')
@@ -1867,6 +1856,93 @@ def controller_foreign_cpu(queue, interval=5):
     t.start()
 
 
+def role_cpu_members(target, monitor, testers, receivers, repeat=False):
+    """Each role's containers with their cgroup, and the roles that have none.
+
+    Resolved once, before the bench clock starts: a `docker inspect` per
+    container is tens of milliseconds, and fifty of them inside the clock
+    would be the controller's cost published as the run's. A container whose
+    cgroup cannot be found is left out of its role and the role is unmeasured
+    by name, never summed without it.
+    """
+    roles = {'target': [target] if target is not None else [],
+             'monitor': [monitor],
+             'testers': list(testers),
+             'receivers': list(receivers)}
+    members, unmeasured = {}, {}
+    if target is None:
+        unmeasured['target'] = 'the target is remote; it has no container here'
+    if repeat and not testers:
+        # --repeat reuses the generators the previous run started, and this
+        # run holds no handle on them. Named, so an empty role is not read as
+        # generators that did no work.
+        unmeasured['testers'] = ('-r/--repeat reuses the previous run\'s '
+                                 'generator containers, which this run did not '
+                                 'start')
+    for role, containers in roles.items():
+        resolved, failures = [], []
+        for c in containers:
+            try:
+                pid = dckr.inspect_container(c.ctn_id)['State']['Pid']
+                cgroup_dir = cgroup_dir_for_pid(pid)
+            except Exception as exc:
+                failures.append('{0}: {1}'.format(c.name, exc))
+                continue
+            resolved.append({'name': c.name, 'cgroup_dir': cgroup_dir,
+                             'cpuset_requested': getattr(c, 'cpuset', None),
+                             'cpuset_effective': read_effective_cpuset(cgroup_dir)})
+        if failures:
+            unmeasured[role] = 'no cgroup for ' + '; '.join(failures)
+        elif resolved:
+            members[role] = resolved
+    return members, unmeasured
+
+
+def controller_role_cpu(recorder, stop, interval=ROLE_CPU_INTERVAL_S,
+                        reader=None):
+    """Poll every role's cgroup into `recorder` until `stop` is set.
+
+    Not through the run's queue, for the reason the receiver poll is not
+    (docs/invariants/export-timing.md): `bench()`'s loop stops reading it at
+    convergence and the post-convergence workloads skip anything that is not a
+    monitor sample, so a CPU series fed through it would end where churn and
+    the reload begin -- the stretch a per-role reading is most wanted for.
+    This thread is the recorder's only writer and `finish_bench()` reads it
+    after the join.
+
+    Stamped before the read, on the rule both tester poll loops follow, and one
+    last pass is taken when `stop` is set, so the series ends at the run's end
+    rather than up to a poll before it.
+    """
+    read = reader or read_members
+
+    def poll():
+        while True:
+            sampled_s = time.monotonic()
+            try:
+                usage, errors = read(recorder.members)
+            except Exception as exc:
+                # Never let a sampling hiccup take down a running benchmark;
+                # every member counts as unread on this pass instead.
+                usage = {}
+                errors = {m['name']: '{0}: {1}'.format(type(exc).__name__, exc)
+                          for ms in recorder.members.values() for m in ms}
+            recorder.observe(sampled_s, usage, errors)
+            if stop.is_set():
+                return
+            stop.wait(interval)
+
+    t = Thread(target=poll)
+    t.daemon = True
+    t.start()
+    return t
+
+
+# Teardown patience for the final cgroup pass, not a measurement: reading a few
+# dozen files takes well under a millisecond.
+ROLE_CPU_TEARDOWN_WAIT_S = 5.0
+
+
 def controller_memory_free(queue):
     '''collect stats on the whole machine that is running the tests'''
     def stats():
@@ -1902,75 +1978,20 @@ controller_stop = threading.Event()
 #
 # Deliberately *not* cleared per run, unlike `controller_stop`. A stop asked
 # for during cell 7 must still be refused-upon at cell 8; clearing it between
-# cells would let a batch answer a reclaim by starting another cell.
+# cells would let a batch answer a stop by starting another cell.
 stop_signal = StopSignal()
-
-
-def read_instance_metadata(path, headers):
-    """One IMDS read, returning `(status, body)`. The only EC2-aware code here.
-
-    `requests` is already a dependency (docker-py pulls it, and this module
-    imports its ConnectionError). Timeouts are short and connect and read are
-    bounded separately: on a non-EC2 host the link-local address usually
-    blackholes rather than refusing, so the connect timeout is what makes the
-    first poll fail fast instead of hanging the thread that owns it.
-    """
-    import requests
-    url = reclaim.IMDS_BASE + path
-    timeout = (reclaim.IMDS_TIMEOUT_S, reclaim.IMDS_TIMEOUT_S)
-    if path == reclaim.TOKEN_PATH:
-        response = requests.put(
-            url, timeout=timeout,
-            headers={'X-aws-ec2-metadata-token-ttl-seconds':
-                     str(reclaim.TOKEN_TTL_SECONDS)})
-    else:
-        response = requests.get(url, timeout=timeout, headers=headers or {})
-    return response.status_code, response.text
-
-
-def start_interruption_watch():
-    """Begin watching for a spot reclamation notice, if this host has one.
-
-    Silent on a host that is not EC2: the watcher gives up after a few failed
-    reads and says nothing, because every developer machine is "not EC2" and a
-    warning nobody can act on is a warning everybody learns to skip.
-
-    Idempotent -- a batch calls it once and every cell's `bench()` inherits the
-    same watcher, rather than starting one per cell and leaving forty behind.
-    """
-    global interruption_watcher
-    if interruption_watcher is not None:
-        return interruption_watcher
-
-    def on_notice(notice):
-        # Printed from the watcher thread, which is the only place that knows
-        # the notice arrived rather than the stop being asked for some other
-        # way. The cell loop prints what it *does* about it.
-        print('\n{0}'.format(notice))
-        print('stopping at the next cell boundary; the cell in flight is '
-              'abandoned rather than recorded')
-
-    interruption_watcher = threading.Thread(
-        target=watch_for_interruption,
-        args=(stop_signal, read_instance_metadata),
-        kwargs={'on_notice': on_notice},
-        daemon=True)
-    interruption_watcher.start()
-    return interruption_watcher
-
-
-interruption_watcher = None
 
 
 def install_stop_handlers():
     """Make SIGTERM an orderly stop rather than a killed process.
 
-    A spot reclaim is SIGTERM, then SIGKILL about two minutes later. Two
-    minutes does not finish a cell -- an MRT cell runs for tens of minutes --
-    so this never tries to save the cell in flight. It marks the stop, and the
-    loops that would otherwise keep running for another half hour abandon what
-    they are doing at their next check. What is saved is everything already
-    checkpointed, and the guarantee that nothing half-done is recorded as done.
+    A host being shut down sends SIGTERM and then SIGKILL shortly after, which
+    does not finish a cell -- an MRT cell runs for tens of minutes -- so this
+    never tries to save the cell in flight. It marks the stop, and the loops
+    that would otherwise keep running abandon what they are doing at their
+    next check, stopping the samplers on the way out. What is kept is every
+    cell result already written, and the guarantee that nothing half-done is
+    recorded as done. The process then exits 143.
 
     **SIGINT is left alone.** Ctrl-C already raises `KeyboardInterrupt`, which
     unwinds immediately; routing it through here would make an interactive
@@ -2034,6 +2055,9 @@ RECEIVER_POLL_INTERVAL_S = MONITOR_POLL_INTERVAL_S
 # it. Patience rather than a measurement: it is taken after `total time` has
 # been stopped, so it reaches no published column, and its only job is to stop
 # a `docker exec` that never returns from hanging the teardown for ever.
+# Sized for the GoBGP receivers. A sink receiver's read is a file read on the
+# host, so under `--monitor sink` both this and the duty cycle are far more
+# than a round needs, which costs nothing.
 EXPORT_POLL_TEARDOWN_WAIT_S = 30
 EXPORT_POLL_TEARDOWN_PER_RECEIVER_S = 5
 
@@ -2072,6 +2096,32 @@ def observe_tester_sample(info, recorders, errors):
         errors[info['who']] = str(e)
         return False
     return True
+
+
+def tester_offering_complete(recorders, errors):
+    """Whether every generator has reported offering its whole table.
+
+    True or False, or None where there is no evidence to gate on: no tester in
+    the run reports its offering, or a recorder that had not completed was
+    retired over a fault in the measurement wiring. A retired recorder must
+    not end or stall a run that is otherwise producing a result
+    (`observe_tester_sample()`), so such a run is decided as runs were before
+    the convergence gate read this.
+
+    A generator whose polls merely fail to read is deliberately *not* None.
+    Reads fail routinely while containers come up and succeed afterwards
+    (`note_tester_read_failure()`), so withdrawing the evidence on any failure
+    would switch the gate off for the run that needs it. One that never reads
+    again cannot be shown to have offered its table, and on a target with no
+    second witness that run ends at STUCK_S naming the generators rather than
+    converging on one peer's table.
+    """
+    if not recorders:
+        return None
+    for name, recorder in recorders.items():
+        if name in errors and not recorder.complete:
+            return None
+    return all(recorder.complete for recorder in recorders.values())
 
 
 def note_tester_read_failure(info, failures):
@@ -2167,6 +2217,13 @@ def controller_export_stats(receivers, recorder, state, read_failures, stop,
     served simultaneously can be off by at most one gap and can never be
     published as a *resolved* spread -- verified on a 6-receiver 1M-prefix run,
     which reported a 3.849s spread against a 3.849s resolution and said so.
+
+    That paragraph describes a GoBGP fan-out. A sink receiver's events are
+    dated by its own log lines instead (measurement plan 7b): the round only
+    decides *that* an event happened, `read_export()` reads each log as of the
+    round's stamp, and the event carries its line's date and bound. The
+    round's timestamp and gap then bound only an event whose line could not
+    be used, which says so in `sink_dates_refused`.
     '''
     def ended():
         return stop.is_set() or (delivery_stop is not None
@@ -2181,10 +2238,14 @@ def controller_export_stats(receivers, recorder, state, read_failures, stop,
         # `monitor_delta_s`, whose sign is the finding.
         sampled_at = time.monotonic()
         accepted = {}
+        dates = {}
         errors = {}
         for receiver in receivers:
             try:
-                accepted[receiver.name] = receiver.accepted_prefixes()
+                # A sink receiver answers with its log's `sink` section too,
+                # read as of this round's stamp; a GoBGP one with None (7b).
+                accepted[receiver.name], section = receiver.read_export(
+                    sampled_at)
             except Exception as e:                      # noqa: BLE001
                 # A read that could not be made is missing evidence, not a
                 # receiver holding nothing, and not a reason to end a run that
@@ -2193,8 +2254,23 @@ def controller_export_stats(receivers, recorder, state, read_failures, stop,
                 # the instrument simply never resolved.
                 accepted[receiver.name] = None
                 errors[receiver.name] = repr(e)
+                continue
+            if section is None:
+                continue
+            try:
+                dates[receiver.name] = sink_event_dates(
+                    section, SINK_CLOCK_OFFSET_LIMIT_NS)
+            except Exception as e:                      # noqa: BLE001
+                # Guarded apart from the read: a count that was read stands
+                # whatever happens to its dating, which falls back to the
+                # round's -- losing the finer date must never cost the
+                # observation.
+                dates[receiver.name] = SinkDates(
+                    refused='the sink section could not be read: {0!r}'.format(
+                        e))
         note_export_read_failures(errors, read_failures)
-        observe_export_sample(sampled_at, accepted, recorder, state)
+        observe_export_sample(sampled_at, accepted, recorder, state,
+                              sink=dates or None)
         return sampled_at, accepted
 
     def poll():
@@ -2315,7 +2391,7 @@ def drain_stale_samples(q):
         dropped += 1
 
 
-def observe_export_sample(monotonic_s, accepted, recorder, state):
+def observe_export_sample(monotonic_s, accepted, recorder, state, sink=None):
     '''Record one polled round of receiver counts.
 
     A recorder that rejects a round -- one that went backwards, or one whose
@@ -2327,7 +2403,12 @@ def observe_export_sample(monotonic_s, accepted, recorder, state):
     if recorder is None or 'observation_error' in state:
         return False
     try:
-        recorder.observe(monotonic_s, accepted)
+        # Passed only when there is one, so a GoBGP fan-out's call is the one
+        # it always was.
+        if sink is None:
+            recorder.observe(monotonic_s, accepted)
+        else:
+            recorder.observe(monotonic_s, accepted, sink=sink)
     except (ValueError, TypeError) as e:
         state['observation_error'] = str(e)
         return False
@@ -2484,1006 +2565,40 @@ def target_read_pairing(target):
         'window_ms': [round(-interval / 2.0 * 1000, 1),
                       round(PAIRED_READ_LOOKAHEAD_S * 1000, 1)],
     }
+def scenario_mrt_tester_class(tester):
+    '''The class that plays back a scenario's `type: mrt` tester.
+
+    There is no default injector. It used to be gobgp, which was removed as a
+    generator on 2026-09-29 -- it was slow enough to become the bottleneck
+    itself -- and silently substituting another would run a different workload
+    than the scenario was written for.
+    '''
+    injector = tester.get('mrt_injector')
+    if injector == 'exabgp':
+        return ExaBGPMrtTester
+    if injector == 'bgpdump2':
+        return Bgpdump2Tester
+    if injector == 'gobgp':
+        raise ValueError('mrt_injector gobgp was removed: GoBGP is only the '
+                         'monitor now. Use mrt_injector: bgpdump2')
+    if injector is None:
+        raise ValueError('a type: mrt tester needs an mrt_injector (bgpdump2 '
+                         'or exabgp); the old default, gobgp, was removed')
+    raise ValueError('invalid mrt_injector: {0!r}'.format(injector))
 
 
 def bench(args):
-    if args.target == 'rustbgpd':
-        RustBGPdTarget._neighbor_poll_mode()
-    # Here as well as in `batch()`, because a `bench` run is also a thing a
-    # reclaim can take away -- `scripts/calibration_case.sh` drives one
-    # directly, and so does anyone debugging a cell. Both calls are idempotent:
-    # re-installing a signal handler replaces it with itself, and the watcher
-    # returns the thread it already started, so the forty cells of a batch
-    # share the one watcher the batch began.
-    install_stop_handlers()
-    start_interruption_watch()
-
-    output_stats = {}
-    config_dir = '{0}/{1}'.format(args.dir, args.bench_name)
-    dckr_net_name = args.docker_network_name or args.bench_name + '-br'
-
-    target_image_name = None
-    scenario_load_s = 0.0
-    # First, and outside the `-f` branch: the flag reaches nothing on either
-    # path, and it reads only the command line.
-    try:
-        refuse_single_table(getattr(args, 'single_table', False),
-                            '-s/--single-table')
-    except ValueError as e:
-        sys.exit(str(e))
-    # Above the teardown, and before anything reads `prefix_num`: the row, the
-    # artifact names and the scenario all take the per-peer count, so the
-    # division happens once, here. A scope that cannot be applied should cost a
-    # message rather than the previous run's containers -- which is why every
-    # guard in this function sits above the teardown, and why the ones that
-    # read only the command line sit above the one Docker call among them.
-    # batch() has already divided by the time it gets here, which is why it
-    # passes `per-peer` explicitly.
-    if not args.file:
-        # `check_batch_test()` refuses these on the batch path; nothing did
-        # here. `resolve_prefix_scope()` is the single normalisation point but
-        # it only rejects them under `total`, so `bench -n 0` reached
-        # `gen_conf()` untouched, which builds a scenario with no testers and a
-        # monitor check-point of `int(0 * 0.99)` -- satisfied at zero routes,
-        # so the run writes a row that reads as a converged benchmark.
-        for flag, value in (('-n/--neighbor-num', args.neighbor_num),
-                            ('-p/--prefix-num', args.prefix_num)):
-            if not _is_positive_count(value):
-                sys.exit('{0} must be a whole number of 1 or more, got '
-                         '{1!r}'.format(flag, value))
-        check_generator_matches_workload(args)
-        try:
-            args.receivers = resolve_receivers(getattr(args, 'receivers', None))
-        except ValueError as e:
-            sys.exit(str(e))
-        # Before the scope, so a run asking for both is told they are not
-        # defined together rather than being told the arithmetic of a
-        # combination that is refused anyway.
-        try:
-            args.path_diversity = resolve_path_diversity(
-                getattr(args, 'path_diversity', None), args.neighbor_num,
-                getattr(args, 'tester_type', None),
-                getattr(args, 'prefix_scope', None))
-        except ValueError as e:
-            sys.exit(str(e))
-    if args.file and (getattr(args, 'receivers', None)
-                      or DEFAULT_RECEIVERS) != DEFAULT_RECEIVERS:
-        # A scenario file states every session the target has, receivers
-        # included, so this would add nothing to the config and start
-        # containers nobody peered with -- above the teardown, like the two
-        # refusals beside it.
-        sys.exit('--receivers has nothing to add under -f: a scenario file '
-                 'states the sessions the target has itself')
-    churn_flags = churn_flags_set(getattr(args, 'churn_prefixes', None),
-                                  getattr(args, 'churn_bursts', None))
-    if args.file and churn_flags:
-        # A scenario file states what each peer announces, and the churn block
-        # is cut out of what bgperf2 generated -- there is nothing here to take
-        # it from. Above the teardown like the refusals beside it. Both flags,
-        # not just the block: `resolve_churn()` runs only for a generated
-        # scenario, so `-f --churn-bursts 5` otherwise ran an ordinary run,
-        # withdrew nothing and recorded `churn_bursts: null` in both manifests
-        # -- the operator's flag gone without a word.
-        sys.exit('{0} {1} nothing to withdraw under -f: a scenario file states '
-                 "each neighbour's prefixes itself".format(
-                     ' and '.join(churn_flags),
-                     'have' if len(churn_flags) > 1 else 'has'))
-    if args.file and (getattr(args, 'policy_reload_blocks', None)
-                      or DEFAULT_POLICY_RELOAD_BLOCKS) \
-            != DEFAULT_POLICY_RELOAD_BLOCKS:
-        # A scenario file states the peers and the blocks they announce, and
-        # the reload's policy is built from exactly those -- so there is
-        # nothing here to select. Above the teardown, like the refusals beside
-        # it, and refused rather than ignored for the reason the churn flags
-        # are: accepted, the run would name its artifacts `pr<N>`, record the
-        # workload in both manifests, and change no policy at all.
-        sys.exit('--policy-reload-blocks has nothing to reject under -f: a '
-                 "scenario file states each neighbour's prefixes itself")
-    if args.file and (getattr(args, 'path_diversity', None)
-                      or DEFAULT_PATH_DIVERSITY) != DEFAULT_PATH_DIVERSITY:
-        # Same rule as the scope beside it, and above the teardown for the same
-        # reason: a scenario file states each neighbour's paths, so grouping
-        # them here would do nothing at all, and doing nothing quietly is worse
-        # than the silence about `-n` and `-p` it joins.
-        sys.exit('--path-diversity has nothing to group under -f: a scenario '
-                 "file states each neighbour's paths itself")
-    if args.file and getattr(args, 'prefix_scope', None) not in (None, 'per-peer'):
-        # `-n`/`-p` are already ignored under `-f`, and this would be too --
-        # but the whole point of the flag is that the number means something
-        # different, so accepting it where it does nothing is worse than the
-        # existing silence about the two it joins.
-        sys.exit('--prefix-scope has nothing to divide under -f: a scenario '
-                 'file states each neighbour\'s prefixes itself')
-    if not args.file:
-        try:
-            args.prefix_num = resolve_prefix_scope(
-                getattr(args, 'prefix_scope', None), args.neighbor_num,
-                args.prefix_num, getattr(args, 'tester_type', None))
-        except ValueError as e:
-            sys.exit(str(e))
-        # After the scope, because the block is taken out of each peer's own
-        # list and `--prefix-scope total` is what decides how long that list
-        # is: `-n 10 -p 1000 --prefix-scope total` gives every peer 100
-        # prefixes, so a churn block of 500 is larger than what a peer
-        # announces even though it is a fifth of the table.
-        try:
-            args.churn_prefixes, args.churn_bursts = resolve_churn(
-                getattr(args, 'churn_prefixes', None),
-                getattr(args, 'churn_bursts', None),
-                args.neighbor_num, args.prefix_num,
-                getattr(args, 'tester_type', None),
-                getattr(args, 'filter_test', None))
-        except ValueError as e:
-            sys.exit(str(e))
-        if args.churn_prefixes and args.repeat:
-            # `-r/--repeat` reuses the tester *containers* and builds no tester
-            # objects at all, so there is nothing to issue a burst through and
-            # nothing rewrites the generator config the churn protocol lives
-            # in. Accepted, the run would name its artifacts `ch<N>x<B>`,
-            # record the workload in both manifests, and withdraw nothing --
-            # the shape `--receivers` was found in one round earlier.
-            sys.exit('--churn-prefixes cannot be used with -r/--repeat: '
-                     'repeat reuses the generator containers as they are, so '
-                     'the churn block is neither written into their config '
-                     'nor reachable to withdraw')
-        # After the scope for the reason churn is: the reload's block count is
-        # checked against the peer count and the diversity, and `--prefix-scope
-        # total` changes neither -- but the expected count it will be measured
-        # against is `blocks x prefixes per peer`, so it must be the resolved
-        # per-peer number. The churn values here are the normalised ones, which
-        # is enough: `resolve_churn()` has already refused a bare
-        # `--churn-bursts`, so anything still set is a real churn workload.
-        try:
-            args.policy_reload_blocks = resolve_policy_reload(
-                getattr(args, 'policy_reload_blocks', None),
-                args.neighbor_num,
-                getattr(args, 'path_diversity', None),
-                getattr(args, 'target', None),
-                getattr(args, 'tester_type', None),
-                getattr(args, 'filter_test', None),
-                args.churn_prefixes, args.churn_bursts,
-                getattr(args, 'repeat', False))
-        except ValueError as e:
-            sys.exit(str(e))
-
-    if not args.file:
-        # After every guard that reads only the command line, and still before
-        # anything is torn down. Both halves matter: a typo'd --version must
-        # cost nothing, since everything below destroys the previous run's
-        # containers and config dir, which this repository keeps on purpose so
-        # a failure can be investigated -- and this is a Docker call, so
-        # running it *first* meant a mistyped -p or --path-diversity was
-        # answered by `ImageNotBuilt` on a host with no daemon or no image, and
-        # made the argument guards' own tests depend on which images happened
-        # to be built. That suite deliberately needs no Docker.
-        #
-        # Only a -f scenario can declare the target remote, and a remote target
-        # has no local image to resolve, so that case waits for the parse.
-        target_image_name = target_image(args.target,
-                                         getattr(args, 'version', None),
-                                         args.image)
-    else:
-        # A scenario file is checked before the teardown too, so a refusal
-        # costs a message rather than the previous run's containers. Mako can
-        # execute stateful code, so reuse exactly the object we validate.
-        # Loading used to be inside `total time`; retain its actual duration
-        # in that total without executing the template a second time. A batch
-        # supplies a private copy and charges only that copy's actual cost.
-        try:
-            if hasattr(args, '_batch_scenario'):
-                conf = args._batch_scenario
-                scenario_load_s = args._batch_scenario_copy_s
-            else:
-                scenario_load_start = time.monotonic()
-                with open(args.file) as f:
-                    conf = render_scenario(f.read())
-                scenario_load_s = time.monotonic() - scenario_load_start
-            refuse_scenario_single_table(
-                conf, "the scenario's target `single-table`")
-            # Here rather than after the parse below, for the same reason
-            # (bgperf2-urp): `resolve_receivers()` guards every path that
-            # builds a scenario; this guards the one path handed one.
-            scenario_receivers(conf)
-        except ValueError as e:
-            sys.exit(str(e))
-    # The monitor is the measurement instrument. Resolve its selected GoBGP
-    # image here too, after the command-line guards and before teardown, so a
-    # missing tag cannot destroy the previous row's containers and diagnostics.
-    monitor_image_name = GoBGP.require_image(
-        getattr(args, 'monitor_version', None))
-    remove_target_containers()
-
-    if not args.repeat:
-        remove_old_containers()
-
-        if os.path.exists(config_dir):
-            shutil.rmtree(config_dir, ignore_errors=True)
-
-    # Only once the previous run's containers are gone. batch() reuses this
-    # process for every cell, so checking earlier would see the last cell's own
-    # target daemon still running and report it as somebody else's job.
-    warn_if_machine_is_busy()
-    warn_if_log_dir_is_in_ram(config_dir)
-    warn_if_log_dir_is_short_on_space(config_dir)
-
-    bench_start = time.time() - scenario_load_s
-    if not args.file:
-        conf = gen_conf(args)
-
-        if not os.path.exists(config_dir):
-            os.makedirs(config_dir)
-        with open('{0}/scenario.yaml'.format(config_dir), 'w') as f:
-            f.write(conf)
-        conf = yaml.safe_load(Template(conf).render())
-
-    # After the scenario is parsed, so this covers a -f run too -- which is one
-    # of the ways the flag reaches nothing.
-    warn_if_trace_io_reaches_no_generator(args, conf)
-
-    # A `-f` run's fan-out is whatever the file says, so the notice waits for
-    # the parse; the file's receivers were validated before the teardown.
-    fanout_cost = describe_export_fanout_cost(len(conf.get('receivers') or []))
-    if fanout_cost:
-        print(fanout_cost)
-
-    churn_prefixes = getattr(args, 'churn_prefixes', None) or DEFAULT_CHURN_PREFIXES
-    churn_bursts = getattr(args, 'churn_bursts', None) or DEFAULT_CHURN_BURSTS
-    churn_groups = None
-    if churn_prefixes:
-        # The block count the monitor's side of a burst is measured against,
-        # from the one function that owns that arithmetic -- the same one
-        # `gen_conf()` used for the check-point, so the two cannot disagree
-        # about how many distinct prefixes a group's peers share.
-        churn_groups = path_diversity_groups(
-            args.neighbor_num,
-            getattr(args, 'path_diversity', None) or DEFAULT_PATH_DIVERSITY)
-        print(describe_churn_workload(churn_prefixes, churn_bursts,
-                                      args.neighbor_num, churn_groups))
-
-    policy_reload_blocks = (getattr(args, 'policy_reload_blocks', None)
-                            or DEFAULT_POLICY_RELOAD_BLOCKS)
-    if policy_reload_blocks:
-        print(describe_policy_reload_workload(
-            policy_reload_blocks, args.neighbor_num, args.prefix_num,
-            getattr(args, 'path_diversity', None),
-            getattr(TARGET_CLASSES.get(getattr(args, 'target', None)),
-                    'POLICY_RELOAD_MECHANISM', None)))
-
-    # A remote target is not a container bgperf2 starts, so it has no image --
-    # resolving one would fail a remote run on the default target's image.
-    is_remote = bool(conf['target'].get('remote'))
-    if target_image_name is None and not is_remote:
-        target_image_name = target_image(args.target, getattr(args, 'version', None), args.image)
-
-    bridge_found = False
-    for network in dckr.networks(names=[dckr_net_name]):
-        if network['Name'] == dckr_net_name:
-            print('Docker network "{}" already exists'.format(dckr_net_name))
-            bridge_found = True
-            break
-    if not bridge_found:
-        subnet = conf['local_prefix']
-        print('creating Docker network "{}" with subnet {}'.format(dckr_net_name, subnet))
-        ipam = IPAMConfig(pool_configs=[IPAMPool(subnet=subnet)])
-        network = dckr.create_network(dckr_net_name, driver='bridge', ipam=ipam)
-
-    # Every session the target holds, not just the route sources: this warns
-    # about the kernel's ARP table, and a receiver occupies an entry in it
-    # exactly as a generator peer does.
-    num_tester = (sum(len(t.get('neighbors', [])) for t in conf.get('testers', []))
-                  + len(conf.get('receivers') or []))
-    if num_tester > gc_thresh3():
-        print('gc_thresh3({0}) is lower than the number of peer({1})'.format(gc_thresh3(), num_tester))
-        print('type next to increase the value')
-        print('$ echo 16384 | sudo tee /proc/sys/net/ipv4/neigh/default/gc_thresh3')
-
-    print('run monitor')
-    m = Monitor(config_dir+'/monitor', conf['monitor'],
-                image=monitor_image_name)
-    m.monitor_for = args.target
-    m.run(conf, dckr_net_name)
-
-    # Started with the monitor and established before any generator launches:
-    # a receiver that came up mid-run would take a partial table and the export
-    # work would land on the target at a moment nothing recorded, which is the
-    # one thing this fan-out exists to measure.
-    #
-    # Built on every run, `-r/--repeat` included, because that is the monitor's
-    # contract and a receiver is a monitor in every respect but being read.
-    # `--repeat` reuses the *tester* containers; `Container.run()` removes and
-    # recreates anything else it finds by name, and the target is rebuilt from
-    # scratch under it too, so every receiver session has to be re-established
-    # anyway. Skipping them under `--repeat` meant the count the target was
-    # configured for, the count in the artifact name and the count in the
-    # manifest were three claims about sessions that did not exist.
-    receivers_wanted = conf.get('receivers') or []
-    for name in surplus_receiver_names(get_ctn_names(), len(receivers_wanted)):
-        # The one case recreating by name does not cover: a run asking for
-        # fewer than the last built leaves the rest up, and under `--repeat`
-        # nothing else removes them.
-        print('removing surplus receiver container', name)
-        dckr.remove_container(name, force=True)
-    receiver_containers = []
-    for idx, receiver in enumerate(receivers_wanted):
-        r = Receiver(idx, '{0}/receiver{1}'.format(config_dir, idx), receiver)
-        print('run receiver', r.name)
-        r.run(conf, dckr_net_name)
-        receiver_containers.append(r)
-
-
-    ## I'd prefer to start up the testers and then start up the target  
-    # however, bgpdump2 isn't smart enough to wait and rety connections so
-    # this is the order
-    testers = []
-    mrt_injector = None
-    if not args.repeat:
-        valid_indexes = None
-        asns = None
-        for idx, tester in enumerate(conf['testers']):
-            if 'name' not in tester:
-                name = 'tester{0}'.format(idx)
-            else:
-                name = tester['name']
-            if not 'type' in tester:
-                tester_type = 'bird'
-            else:
-                tester_type = tester['type']
-            if tester_type == 'exa':
-                tester_class = ExaBGPTester
-            elif tester_type == 'bird':
-                tester_class = BIRDTester
-            elif tester_type == 'mrt':
-                if 'mrt_injector' not in tester:
-                    mrt_injector = 'gobgp'
-                else:
-                    mrt_injector = tester['mrt_injector']
-                if mrt_injector == 'gobgp':
-                    tester_class = GoBGPMRTTester
-                elif mrt_injector == 'exabgp':
-                    tester_class = ExaBGPMrtTester
-                elif mrt_injector == 'bgpdump2':
-                    tester_class = Bgpdump2Tester
-                else:
-                    print('invalid mrt_injector:', mrt_injector)
-                    sys.exit(1)
-
-            else:
-                print('invalid tester type:', tester_type)
-                sys.exit(1)
-
-
-            t = tester_class(name, config_dir+'/'+name, tester)
-            if not mrt_injector:
-                print('run tester', name, 'type', tester_type)
-            else:
-                print('run tester', name, 'type', tester_type, mrt_injector)
-            if idx > 0:
-                rm_line()
-            t.run(conf['target'], dckr_net_name)
-            testers.append(t)
-
-
-            # have to do some extra stuff with bgpdump2
-            #  because it's sending real data, we need to figure out
-            #  wich neighbor has data and what the actual ASN is
-            if tester_type == 'mrt' and mrt_injector == 'bgpdump2' and not valid_indexes:
-                print("finding asns and such from mrt file")
-                valid_indexes = t.get_index_valid(args.prefix_num)
-                asns = t.get_index_asns()
-
-                for test in conf['testers']:
-                    test['bgpdump-index'] = valid_indexes[test['mrt-index'] % len(valid_indexes)]
-                    neighbor = next(iter(test['neighbors'].values()))
-                    neighbor['as'] = asns[test['bgpdump-index']]
-
-                # TODO: this needs to all be moved to it's own object and file
-                #  so this stuff isn't copied around
-                str_conf = gen_mako_macro() + yaml.dump(conf, default_flow_style=False)
-                with open('{0}/scenario.yaml'.format(config_dir), 'w') as f:
-                    f.write(str_conf)
-
-    # Bound before the branch, because only one of the two branches binds it.
-    # A remote run has no target container at all, and `abandon_run()` reads
-    # this to stop the target's sampler: unbound, a stop on a remote run dies
-    # with a `NameError` *before* the samplers are stopped, which is the one
-    # thing abandoning a run may not skip.
-    target = None
-    if is_remote:
-        print('target is remote ({})'.format(conf['target']['local-address']))
-
-        ip = IPRoute()
-
-        # r: route to the target
-        r = ip.get_routes(dst=conf['target']['local-address'], family=AF_INET)
-        if len(r) == 0:
-            print('no route to remote target {0}'.format(conf['target']['local-address']))
-            sys.exit(1)
-
-        # intf: interface used to reach the target
-        idx = [t[1] for t in r[0]['attrs'] if t[0] == 'RTA_OIF'][0]
-        intf = ip.get_links(idx)[0]
-        intf_name = intf.get_attr('IFLA_IFNAME')
-
-        # raw_bridge_name: Linux bridge name of the Docker bridge
-        # TODO: not sure if the linux bridge name is always given by
-        #       "br-<first 12 characters of Docker network ID>".
-        raw_bridge_name = args.bridge_name or 'br-{}'.format(network['Id'][0:12])
-
-        # raw_bridges: list of Linux bridges that match raw_bridge_name
-        raw_bridges = ip.link_lookup(ifname=raw_bridge_name)
-        if len(raw_bridges) == 0:
-            if not args.bridge_name:
-                print(('can\'t determine the Linux bridge interface name starting '
-                      'from the Docker network {}'.format(dckr_net_name)))
-            else:
-                print(('the Linux bridge name provided ({}) seems nonexistent'.format(
-                      raw_bridge_name)))
-            print(('Since the target is remote, the host interface used to '
-                    'reach the target ({}) must be part of the Linux bridge '
-                    'used by the Docker network {}, but without the correct Linux '
-                    'bridge name it\'s impossible to verify if that\'s true'.format(
-                        intf_name, dckr_net_name)))
-            if not args.bridge_name:
-                print(('Please supply the Linux bridge name corresponding to the '
-                      'Docker network {} using the --bridge-name argument.'.format(
-                          dckr_net_name)))
-            sys.exit(1)
-
-        # intf_bridge: bridge interface that intf is already member of
-        intf_bridge = intf.get_attr('IFLA_MASTER')
-
-        # if intf is not member of the bridge, add it
-        if intf_bridge not in raw_bridges:
-            if intf_bridge is None:
-                print(('Since the target is remote, the host interface used to '
-                      'reach the target ({}) must be part of the Linux bridge '
-                      'used by the Docker network {}'.format(
-                          intf_name, dckr_net_name)))
-                sys.stdout.write('Do you confirm to add the interface {} '
-                                 'to the bridge {}? [yes/NO] '.format(
-                                     intf_name, raw_bridge_name
-                                    ))
-                try:
-                    answer = input()
-                except:
-                    print('aborting')
-                    sys.exit(1)
-                answer = answer.strip()
-                if answer.lower() != 'yes':
-                    print('aborting')
-                    sys.exit(1)
-
-                print('adding interface {} to the bridge {}'.format(
-                    intf_name, raw_bridge_name
-                ))
-                br = raw_bridges[0]
-
-                try:
-                    ip.link('set', index=idx, master=br)
-                except Exception as e:
-                    print(('Something went wrong: {}'.format(str(e))))
-                    print(('Please consider running the following command to '
-                          'add the {iface} interface to the {br} bridge:\n'
-                          '   sudo brctl addif {br} {iface}'.format(
-                              iface=intf_name, br=raw_bridge_name)))
-                    print('\n\n\n')
-                    raise
-            else:
-                curr_bridge_name = ip.get_links(intf_bridge)[0].get_attr('IFLA_IFNAME')
-                print(('the interface used to reach the target ({}) '
-                      'is already member of the bridge {}, which is not '
-                      'the one used in this configuration'.format(
-                          intf_name, curr_bridge_name)))
-                print(('Please consider running the following command to '
-                        'remove the {iface} interface from the {br} bridge:\n'
-                        '   sudo brctl addif {br} {iface}'.format(
-                            iface=intf_name, br=curr_bridge_name)))
-                sys.exit(1)
-    else:
-        target_class = TARGET_CLASSES[args.target]
-        print('run', run_name(args))
-        target = target_class('{0}/{1}'.format(config_dir, args.target), conf['target'],
-                              image=target_image_name)
-
-        target.run(conf, dckr_net_name)
-
-    time.sleep(1)
-
-    output_stats['monitor_wait_time'] = m.wait_established(conf['target']['local-address'])
-    # Not folded into `monitor_wait_time`: that column is the instrument coming
-    # up, and adding the fan-out's establishment to it would make a
-    # `--receivers 20` run look like a slow monitor in every published row.
-    for r in receiver_containers:
-        r.wait_established(conf['target']['local-address'], role=r.name)
-    output_stats['cores'], output_stats['memory'] = get_hardware_info()
-    # target_class is only bound in the local branch above; a remote run used to
-    # die here with NameError. Pre-existing, but the remote path is now something
-    # bench() explicitly supports resolving for.
-    if not is_remote and target_class == EosTarget:
-        print("Waiting extra 10 seconds for EOS ")
-        time.sleep(10)
-
-    bench_clock_started_s = time.monotonic()
-    lifecycle = MonitorEventRecorder(
-        bench_clock_started_s, producer=m.name,
-        sample_interval_s=MONITOR_POLL_INTERVAL_S)
-
-    q = Queue()
-
-    # Let the previous run's samplers go before starting this run's. batch()
-    # reuses this process for every cell, so without the clear the new threads
-    # would exit immediately on a flag the last run left set.
-    controller_stop.clear()
-
-    m.stats(q, interval=MONITOR_POLL_INTERVAL_S)
-    controller_idle_percent(q)
-    controller_memory_free(q)
-    controller_foreign_cpu(q)
-    if not is_remote:
-        target.stats(q)
-        target.neighbor_stats(q)
-
-    # The export side of the run. Without it a `--receivers 20` run and a
-    # `--receivers 0` run differ in exactly one published number -- `elapsed
-    # (s)` -- and what the fan-out cost the target is inside it, indivisible
-    # from a slow daemon. The receivers were established before the clock
-    # started, so a count of 0 on the first round is a session waiting for the
-    # target rather than one still coming up.
-    export_lifecycle = None
-    export_state = {}
-    export_read_failures = {}
-    export_unmeasured = None
-    # Per run and never cleared, unlike `controller_stop`: it closes the
-    # delivery window this measurement covers, and it is what keeps a round
-    # still in flight at the end of a batch cell from finding the controller's
-    # own event clear again at the start of the next one.
-    export_stop = threading.Event()
-    export_thread = None
-    export_required = int(conf['monitor']['check-points'][0])
-    # A second workload run against the converged table and the receiver poll
-    # cannot both be measured in one run, and this is where that was settled
-    # after eight rounds of review kept finding the same seam from new sides.
-    # The poll's window closes at convergence, which is exactly where churn and
-    # the reload begin, so every way of making them coexist costs something
-    # published: letting the poll run on puts N `docker exec`s inside a burst's
-    # 1.0s-resolution withdrawal and the reload's CPU interval; waiting for it
-    # instead puts that wait inside `total time` -- a graphed column, moving
-    # with the *instrument's* fan-out -- and leaves the workload's recorder
-    # dating its first sample across the wait, so a withdrawal resolved to a
-    # second is published as "within the 25.0s poll resolution".
-    #
-    # So the run keeps the fan-out and declines to measure it, on the rule this
-    # phase has already applied twice: `--prefix-scope total` under
-    # `--path-diversity`, and churn beside a policy reload. Measuring export
-    # and a post-convergence workload in one run means fixing an order and
-    # paying for it somewhere published, and choosing that is its own change
-    # set. The receivers still exist, still hold the table and still cost the
-    # target its export work -- only the timing of it is withheld, by name.
-    export_second_workload = bool(churn_prefixes or policy_reload_blocks)
-    if receiver_containers and export_required > 0 \
-            and not export_second_workload:
-        export_lifecycle = ExportEventRecorder(
-            bench_clock_started_s,
-            [r.name for r in receiver_containers],
-            export_required,
-            sample_interval_s=RECEIVER_POLL_INTERVAL_S)
-        export_thread = controller_export_stats(
-            receiver_containers, export_lifecycle, export_state,
-            export_read_failures, controller_stop, RECEIVER_POLL_INTERVAL_S,
-            delivery_stop=export_stop)
-    elif receiver_containers and export_second_workload:
-        export_unmeasured = (
-            'this run also drives a post-convergence workload, whose intervals '
-            'are measured off the same target across the same boundary; '
-            'measuring both in one run is deferred')
-        print('export fan-out: not measured -- {0}'.format(export_unmeasured))
-    elif receiver_containers:
-        # `gen_conf()` takes 99% of the table, so `-p 1` -- the fastest
-        # end-to-end check there is -- gives a check-point of 0, and a
-        # threshold of 0 would stamp every receiver complete on the first round
-        # and publish a table nobody was seen holding. Refused here rather than
-        # inside the recorder, which would raise with the containers already
-        # up: an instrument that cannot measure must cost the measurement, not
-        # the run.
-        #
-        # This is the only *knowable* way the yardstick can be unusable. A
-        # `--filter_test` policy can also put the check-point out of reach, by
-        # dropping enough of the table that nothing re-advertises it -- but
-        # whether it does depends on the policy and the workload, not on the
-        # flag: `--filter_test transit` at 2 peers x 1000 prefixes converged at
-        # the check-point on this host, so refusing here on the flag would
-        # withhold a measurement that can be made. That case is reported from
-        # the evidence instead -- see `describe_export_metrics()`, which reads
-        # whether the *monitor* reached the count before blaming a receiver for
-        # not reaching it.
-        export_unmeasured = (
-            'the run\'s monitor check-point is {0}, so no receiver can be '
-            'observed holding the table'.format(export_required))
-        print('export fan-out: not measured -- {0}'.format(export_unmeasured))
-
-
-    # want to launch all the neighbors at the same(ish) time
-    # launch them after the test starts because as soon as they start they can send info at least for mrt
-    #  does it need to be in a different place for mrt than exabgp?
-    for i in range(len(testers)):
-        testers[i].launch()
-        if i > 0:
-            rm_line()
-        print(f"launched {i+1} testers")
-        # if args.prefix_num >= 100_000:
-        #     time.sleep(1)
-
-    # Ask the generators themselves what they have put on the wire. This is
-    # measured at the tester, so an injection interval is evidence rather than
-    # something inferred from when the monitor happened to see prefixes -- the
-    # legacy `testers (s)` column is that inference, and it cannot tell a slow
-    # generator from a slow target. Polling starts after launch because nothing
-    # is running in those containers until start.sh has been exec'd.
-    tester_lifecycles = {}
-    tester_observation_errors = {}
-    tester_read_failures = {}
-    for t in testers:
-        if not getattr(t, 'REPORTS_OFFERING', False):
-            continue
-        tester_lifecycles[t.name] = TesterEventRecorder(
-            bench_clock_started_s, producer=t.name,
-            sample_interval_s=TESTER_POLL_INTERVAL_S)
-        t.offering_stats(q, controller_stop, TESTER_POLL_INTERVAL_S)
-
-    f = open(args.output, 'w') if args.output else None
-    cpu = 0
-    mem = 0
-
-    output_stats['max_cpu'] = 0
-    output_stats['max_mem'] = 0
-    output_stats['first_received_time'] = datetime.timedelta(0)
-    output_stats['min_idle'] = 100
-    output_stats['min_free'] = UNSAMPLED_MIN_FREE
-    output_stats['max_foreign_cpu'] = 0
-    # None until a sample sets the maximum: a run that never sampled and a run
-    # whose competitors could not be named must not both read as a run that
-    # looked and found nobody.
-    output_stats['max_foreign_cpu_processes'] = None
-    # finish_bench() fills these in once the clock has stopped; a run with no
-    # testers (a remote target) never gets there, and they are printed and
-    # written into the row unconditionally.
-    output_stats['tester_errors'] = 0
-    output_stats['tester_timeouts'] = 0
-
-    output_stats['required'] = conf['monitor']['check-points'][0]
-    bench_stats = []
-    neighbors_checked = 0
-    neighbors_received_full = 0
-    percent_idle = 0
-    mem_free = 0
-
-    recved = 0
-    # The target's own account of the table it holds, refreshed by its
-    # neighbour poll and read on every monitor sample. The monitor is one BGP
-    # session's view of the target and it is the only instrument every
-    # published timing comes from, so a move in its count has nothing to be
-    # checked against; this is the second witness. Empty for a daemon that has
-    # no gauge to read, and that emptiness is what keeps such a run's artifact
-    # exactly the shape it has always had.
-    latest_witness = None
-    latest_witness_s = None
-    target_table_samples = []
-    tracker = ConvergenceTracker()
-
-    def apply_target_neighbors(info):
-        '''Fold one of the target poll's two neighbour messages into the run.
-
-        Idempotent: `pair_target_read()` may apply a read before its queued
-        copy arrives, and the queued copy then changes nothing (the checkpoint
-        is a latch). No *older* read can follow it either: the sampler sleeps a
-        full poll after each read, so a read paired within half a poll of a
-        monitor sample was preceded on the queue by its predecessor more than
-        half a poll before that sample, and FIFO delivers it first.
-        '''
-        nonlocal neighbors_checked, neighbors_received_full
-        nonlocal latest_witness, latest_witness_s
-        if 'neighbors_checked' in info:
-            # Rides on this message so the dispatch below keeps reading
-            # anything with neither neighbour key as a cpu/mem sample.
-            if 'table_witness' in info:
-                latest_witness = info['table_witness']
-                latest_witness_s = info.get('monotonic_s')
-            if len(info['neighbors_checked']) > 0 and all(value == True for value in info['neighbors_checked'].values()):
-                neighbors_checked = sum(1 if value == True else 0 for value in info['neighbors_checked'].values())
-                tracker.note_neighbors_checkpoint()
-            else:
-                neighbors_checked = sum(1 if value == True else 0 for value in info['neighbors_checked'].values())
-        elif 'neighbors_received_full' in info:
-
-            if len(info['neighbors_received_full']) >= 1 and all(value == True for value in info['neighbors_received_full'].values()):
-                neighbors_received_full = sum(1 if value == True else 0 for value in info['neighbors_received_full'].values())
-                tracker.note_neighbors_checkpoint()
-            else:
-                neighbors_received_full = sum(1 if value == True else 0 for value in info['neighbors_received_full'].values())
-
-    while True:
-        # Checked once per queue message, which is at least once a second: a
-        # cell that would otherwise run for tens of minutes past a reclaim
-        # notice gives the window back to the batch instead.
-        if stop_signal.is_set():
-            abandon_run(stop_signal.reason, target, m, testers)
-        info = q.get()
-
-        if not is_remote and info['who'] == target.name:
-            if ('neighbors_checked' in info
-                    or 'neighbors_received_full' in info):
-                apply_target_neighbors(info)
-            else:
-                cpu = info['cpu']
-                mem = info['mem']
-                output_stats['max_cpu'] = cpu if cpu > output_stats['max_cpu'] else output_stats['max_cpu']
-                output_stats['max_mem'] = mem if mem > output_stats['max_mem'] else output_stats['max_mem']
-
-        if info['who'] == 'controller':
-            if 'free' in info:
-                mem_free = info['free']
-                output_stats['min_free'] = mem_free if mem_free < output_stats['min_free'] else output_stats['min_free']
-            elif 'idle' in info:
-                percent_idle = info['idle']
-                output_stats['min_idle'] = percent_idle if percent_idle < output_stats['min_idle'] else output_stats['min_idle']
-            elif 'foreign_cpu' in info:
-                note_foreign_cpu_sample(output_stats, info)
-        if 'tester_offering' in info:
-            observe_tester_sample(info, tester_lifecycles,
-                                  tester_observation_errors)
-        elif 'tester_offering_error' in info:
-            note_tester_read_failure(info, tester_read_failures)
-
-        if info['who'] == m.name:
-
-            sample_monotonic_s = monitor_sample_monotonic_s(info)
-            elapsed = datetime.timedelta(
-                seconds=sample_monotonic_s - bench_clock_started_s)
-            output_stats['elapsed'] = elapsed
-            recved = info['afi_safis'][0]['state']['accepted'] if 'accepted' in info['afi_safis'][0]['state'] else 0
-            # `monitor_required_reached` is the monitor's count against
-            # `conf['monitor']['check-points'][0]`, and stays that and only
-            # that. A second rule keyed on the target's own export count was
-            # built here and backed out: see the plan's Block 5 record. It
-            # could be made to fire mid-delivery -- the neighbour checkpoint
-            # can be set while export is still in progress, and one poll in
-            # which the target's export count does not advance with the
-            # monitor drained to that same number stamps the event at a
-            # fraction of the table. The event is recorded once, so that
-            # mis-dates `convergence_s`, `assurance_s` and
-            # `post_injection_tail_s` permanently and silently. A wrong
-            # headline timing is worse than a missing one, which is why an
-            # MRT run on a daemon that never reaches the check-point still
-            # publishes none of the three rather than three plausible numbers.
-            lifecycle.observe(sample_monotonic_s, int(recved),
-                              info['checked'])
-            measured = monitor_metrics(lifecycle.events)
-            if measured['first_prefix_s'] is not None:
-                output_stats['first_received_time'] = datetime.timedelta(
-                    seconds=measured['first_prefix_s'])
-            
-            # Decided against the target read of this same tick, not whichever
-            # read the queue happened to deliver first; see pair_target_read().
-            if not is_remote:
-                pair_target_read(target, sample_monotonic_s,
-                                 apply_target_neighbors)
-
-            # The target's own reading of the table it holds goes in beside
-            # the monitor's count, so a decline in what one session is served
-            # can be told from a decline in what the target has. Absent for a
-            # daemon with no gauge, which is every daemon but BIRD, and such a
-            # run is decided exactly as it always was.
-            excused_before = tracker.witness_excused_samples
-            status = tracker.update(elapsed.seconds, recved, neighbors_checked,
-                                    neighbors_received_full, info['checked'],
-                                    table_witness=latest_witness,
-                                    witness_monotonic_s=latest_witness_s)
-
-            if elapsed.seconds > 0:
-                rm_line()
-
-            if latest_witness:
-                # Paired with this monitor sample rather than carried on a
-                # clock of its own: the whole point is the comparison, and the
-                # witness's own timestamp is kept beside it so a reader can see
-                # how stale the pairing is.
-                target_table_samples.append({
-                    'monotonic_s': round(
-                        sample_monotonic_s - bench_clock_started_s, 6),
-                    'witness_monotonic_s': (
-                        None if latest_witness_s is None else
-                        round(latest_witness_s - bench_clock_started_s, 6)),
-                    # How old the carried reading was when this monitor sample
-                    # took it. The target's poll is a separate thread with no
-                    # guard around its exec, so if it stops, every later sample
-                    # repeats the same reading and the series would report a
-                    # perfectly stable table for a target nobody was asking.
-                    # Signed and unclamped, on `post_injection_tail_s`'s rule:
-                    # the two loops are independent, so a target read taken
-                    # just after a monitor sample is ordinary and reads
-                    # negative. Bounded by one poll either way, and staleness
-                    # is the positive side.
-                    'witness_age_s': (
-                        None if latest_witness_s is None else
-                        round(sample_monotonic_s - latest_witness_s, 6)),
-                    'monitor_accepted': int(recved),
-                    'best_paths': latest_witness.get('best_paths'),
-                    'imported_paths': latest_witness.get('imported_paths'),
-                    'exported_to_monitor': latest_witness.get(
-                        'exported_to_monitor'),
-                    'peerings': latest_witness.get('peerings'),
-                    'peerings_expected': latest_witness.get(
-                        'peerings_expected'),
-                    'peerings_measured': latest_witness.get(
-                        'peerings_measured'),
-                })
-
-            print('elapsed: {0}sec, cpu: {1:>4.2f}%, mem: {2}, mon recved: {3}, neighbors_received: {4}, neighbors_accepted: {5}, %idle {6}, free mem {7}'.format(elapsed.seconds, 
-                    cpu, mem_human(mem), recved, neighbors_received_full, neighbors_checked, percent_idle, mem_human(mem_free))
-                  # Appended only for a target that can be asked *and*
-                  # answered: the witness dict is truthy even when the sums
-                  # were withheld, and every BIRD run withholds them during
-                  # session ramp-up, so printing unconditionally puts
-                  # `target holds: None prefixes` into the stdout log that the
-                  # decision log cites as evidence. Tested against None rather
-                  # than truthiness: a target with every session up and no
-                  # routes yet has legitimately measured 0, and collapsing that
-                  # into the withheld case hides the one this guard is for.
-                  #
-                  # Each half stands on its own, because the two daemons that
-                  # answer answer differently: FRR publishes `imported_paths`
-                  # and `exported_to_monitor` and withholds `best_paths` by
-                  # design, so gating the whole suffix on `best_paths` printed
-                  # nothing target-side for an FRR run while sampling both of
-                  # the numbers it does have once a second -- leaving an
-                  # operator watching a full-table cell unable to tell a
-                  # stalled export from an ongoing import.
-                  + target_holds_suffix(latest_witness))
-            if tracker.witness_excused_samples > excused_before \
-                    and excused_before == 0:
-                # Once, on the first sample the witness saved, and never again:
-                # a 1.5%-below-peak MRT table stays there for the rest of the
-                # run, so one line per sample would be forty copies of the same
-                # sentence in the log this decision is read from. What it
-                # excused in total is in the artifact.
-                print('the monitor is {0:.2f}% below its peak of {1} while the '
-                      'target holds {2} prefixes, {3:.2f}% below its own peak: '
-                      'reading the decline as export change, not route '
-                      'loss'.format(
-                          100.0 * tracker.max_excused_decline,
-                          tracker.peak_recved,
-                          (latest_witness or {}).get('best_paths'),
-                          100.0 * tracker.max_excused_witness_decline))
-            bench_stats.append([elapsed.seconds, float(f"{cpu:>4.2f}"), mem, recved, neighbors_checked, percent_idle, mem_free])
-            f.write('{0}, {1}, {2}, {3}\n'.format(elapsed.seconds, cpu, mem, recved)) if f else None
-            f.flush() if f else None
-
-            if status == ConvergenceTracker.FAILED:
-                # Close the export window here as well as on the converged
-                # path: what a failed run's receivers had been served is worth
-                # publishing, and the poll must not outlive the loop that
-                # feeds its samples to the recorder.
-                export_stop.set()
-                output_stats['recved'] = recved
-                output_stats['fail_msg'] = tracker.fail_msg
-                f.close() if f else None
-                print("FAILED")
-                return finish_bench(
-                    args, output_stats, bench_stats, bench_start, target, m,
-                    testers, fail=True, lifecycle_events=lifecycle.events,
-                    tester_lifecycles=tester_lifecycles,
-                    tester_observation_errors=tester_observation_errors,
-                    tester_read_failures=tester_read_failures,
-                    export_lifecycle=export_lifecycle,
-                    export_state=export_state,
-                    export_read_failures=export_read_failures,
-                    export_required=export_required,
-                    export_receiver_names=[r.name for r in receiver_containers],
-                    export_unmeasured_reason=export_unmeasured,
-                    export_thread=export_thread,
-                    target_table=target_table_samples,
-                    target_table_unmeasured_reason=target_table_unmeasured(
-                        target, target_table_samples),
-                    target_table_witness_rule=tracker.witness_rule(),
-                    convergence_rule=tracker.convergence_rule())
-
-            if status == ConvergenceTracker.CONVERGED:
-                # Before the post-convergence workloads, which take this queue
-                # over and skip anything that is not a monitor sample: a round
-                # landing during a churn burst or a reload would be dropped,
-                # and a receiver crossing the check-point in it would be
-                # published as one that was never served. The export
-                # measurement covers the delivery of the table, which is what
-                # this sample has just settled.
-                export_stop.set()
-                if churn_prefixes or policy_reload_blocks:
-                    # Whatever is in the queue at this point is stale, and the
-                    # workload about to start dates its own beginning from the
-                    # first sample it takes -- so a backlog makes the first
-                    # burst look as though it began before the `birdc` that
-                    # carried it, against a published 1.0s resolution. The main
-                    # loop keeps this queue nearly empty, so the backlog is a
-                    # message or two; that is still up to a whole poll of
-                    # mis-dating on the one measurement whose resolution is a
-                    # single poll.
-                    drain_stale_samples(q)
-                lifecycle.confirm_convergence(sample_monotonic_s)
-                assurance = tracker.assurance_samples
-                output_stats['recved'] = recved
-
-                f.close() if f else None
-
-                # Drop the trailing assurance samples: the run was already done
-                # by then, we were only confirming the count had stopped moving.
-                # TODO: recalculate all min/max stats after removing these
-                #  should move to always calculating based on bench_stats
-                print(f"last recevied: {tracker.last_recved_count}")
-                output_stats['elapsed'] = datetime.timedelta(
-                    seconds=int(output_stats['elapsed'].seconds) - assurance + 1)
-                bench_stats = bench_stats[0:len(bench_stats)-assurance]
-                # The second workload, run against the table this run has just
-                # been measured delivering. It is after every column of the row
-                # has been settled on purpose: `elapsed (s)` is the delivery,
-                # and a burst's cost belongs in the artifact where it can be
-                # read per burst rather than folded into a peak.
-                churn_events, churn_evidence = churn_phase(
-                    args, q, m, testers, sample_monotonic_s, int(recved),
-                    churn_prefixes, churn_bursts, churn_groups)
-                # The third workload, and refused alongside churn at every
-                # entry point -- so at most one of these two ever runs against
-                # a given converged table and neither takes the other's outcome
-                # as its baseline.
-                reload_events, reload_evidence = policy_reload_phase(
-                    args, q, m, target, sample_monotonic_s, int(recved),
-                    policy_reload_blocks, conf)
-                if reload_evidence and not reload_evidence['reload_complete']:
-                    # Into MSG without marking the row FAILED, exactly as an
-                    # incomplete churn sequence is: the run converged and that
-                    # measurement stands, and a batch of reload cells whose
-                    # rows all read as ordinary would say nothing about the
-                    # second workload.
-                    output_stats['fail_msg'] = reload_evidence[
-                        'incomplete_reason'] or 'the policy reload did not complete'
-                if churn_evidence and not churn_evidence['sequence_complete']:
-                    # Into the row's MSG column without setting its FAILED
-                    # flag. The run converged and that measurement stands; what
-                    # did not happen is the churn, and a CSV that said nothing
-                    # about it would be a batch of churn cells whose rows all
-                    # look ordinary. `summary.py` reads MSG only for a row
-                    # marked failed, so no summary is affected.
-                    output_stats['fail_msg'] = churn_evidence[
-                        'incomplete_reason'] or 'churn did not complete'
-                return finish_bench(
-                    args, output_stats, bench_stats, bench_start, target, m,
-                    testers,
-                    lifecycle_events=(list(lifecycle.events)
-                                      + list(churn_events)
-                                      + list(reload_events)),
-                    tester_lifecycles=tester_lifecycles,
-                    tester_observation_errors=tester_observation_errors,
-                    tester_read_failures=tester_read_failures,
-                    export_lifecycle=export_lifecycle,
-                    export_state=export_state,
-                    export_read_failures=export_read_failures,
-                    export_required=export_required,
-                    export_receiver_names=[r.name for r in receiver_containers],
-                    export_unmeasured_reason=export_unmeasured,
-                    export_thread=export_thread,
-                    churn_evidence=churn_evidence,
-                    policy_reload_evidence=reload_evidence,
-                    target_table=target_table_samples,
-                    target_table_unmeasured_reason=target_table_unmeasured(
-                        target, target_table_samples),
-                    target_table_witness_rule=tracker.witness_rule(),
-                    convergence_rule=tracker.convergence_rule())
-
-            if elapsed.seconds % 120 == 0 and elapsed.seconds > 1:
-                # The same stem the final graphs use. Built from args.target
-                # alone, these dropped the label, the version, the filter and
-                # the repetition, so a long run's in-progress graphs were
-                # overwritten by the next cell of the same daemon.
-                create_bench_graphs(bench_stats, prefix=bench_output_prefix(args),
-                                    results_dir=args.results_dir)
+    """Compatibility entry point for the extracted run lifecycle."""
+    if getattr(args, 'mrt_spec', None):
+        import native_mrt
+        return native_mrt.bench(sys.modules[__name__], args)
+    if getattr(args,'control_dir',None):
+        import native_mrt
+        return native_mrt.bench(sys.modules[__name__],args)
+    if any(getattr(args, key, None) for key in ('mrt_spec_sha256','generator_image','observer_image')):
+        raise ValueError('Native MRT image/hash/control options require --mrt-spec')
+    return run_lifecycle.bench(
+        sys.modules[__name__], args)
 
 
 def collect_provenance(args, target, monitor, testers):
@@ -3502,7 +2617,7 @@ def collect_provenance(args, target, monitor, testers):
 
     provenance = {
         'target': describe(args.target, target),
-        'monitor': describe('gobgp', monitor),
+        'monitor': describe(run_monitor(args), monitor),
         'testers': [],
     }
     if hasattr(target, 'neighbor_poll_mode'):
@@ -3645,6 +2760,13 @@ def write_provenance(args, provenance, prefix):
                            or DEFAULT_PATH_DIVERSITY),
         'receivers': (None if getattr(args, 'file', None) else
                       getattr(args, 'receivers', None) or DEFAULT_RECEIVERS),
+        # The cores each role was confined to, or None for every core. Known
+        # under `-f` too, unlike the workload keys around it: bgperf2 starts
+        # the containers whatever wrote the scenario.
+        'pin': pin_cpusets(getattr(args, 'pin', None)) or None,
+        # The instrument every timing in this run was read from. Known under
+        # `-f` too: bgperf2 starts the monitor whatever wrote the scenario.
+        'monitor': run_monitor(args),
         # What the run withdrew and put back after it converged, and how many
         # times. `None` under `-f` for the reason the two above are: the
         # scenario file states what each peer announces, and churn is refused
@@ -3671,6 +2793,7 @@ def write_provenance(args, provenance, prefix):
         'repetition': getattr(args, 'repetition', None),
         'filter_test': getattr(args, 'filter_test', None),
     }
+    if getattr(args,'defer_graphs',False):doc['run']['defer_graphs']=True
     path = results_path(args.results_dir, prefix + '.versions.json')
 
     # Through `atomic_write()`, not a plain `open(path, 'w')`. A kill landing
@@ -3679,7 +2802,7 @@ def write_provenance(args, provenance, prefix):
     # record this repository says must never guess: a half-written
     # `versions.json` beside a completed cell is a row whose target version
     # cannot be established, which `--resume` will then skip because its
-    # result is already in the progress file. See
+    # cell result is already recorded. See
     # docs/invariants/provenance-and-verify.md.
     def write(f):
         json.dump(doc, f, indent=2, sort_keys=True)
@@ -3769,7 +2892,9 @@ def sampler_read_failures(target, monitor):
     with a silent gap in exactly the evidence the verdict rests on.
 
     Absent when both read cleanly, so an ordinary run keeps the document it has
-    always written.
+    always written -- except under `--monitor sink`, where the sink's own log
+    is read once more at the end (`SinkMonitor.log_evidence()`) and published
+    as `sink_log`. A GoBGP run has no such log and its document is unchanged.
     """
     section = {}
     target_failures = getattr(target, 'neighbor_sample_failures', 0) or 0
@@ -3782,6 +2907,9 @@ def sampler_read_failures(target, monitor):
         section['monitor'] = {
             'failed_reads': monitor_failures,
             'last_error': getattr(monitor, 'monitor_sample_last_error', None)}
+    log_evidence = getattr(monitor, 'log_evidence', None)
+    if log_evidence is not None:
+        section['sink_log'] = log_evidence()
     return section or None
 
 
@@ -3799,7 +2927,8 @@ def write_event_artifact(args, events, prefix, status, testers=None,
                          export=None, target_table=None,
                          target_table_unmeasured_reason=None,
                          target_table_witness_rule=None,
-                         convergence_rule=None, instrument=None):
+                         convergence_rule=None, instrument=None,
+                         role_cpu=None):
     '''Atomically preserve lifecycle evidence before post-run collection.
 
     Returns the document it wrote, so the caller can print the findings it
@@ -3835,7 +2964,10 @@ def write_event_artifact(args, events, prefix, status, testers=None,
         # every run passes through.
         target_table_witness_rule=target_table_witness_rule,
         convergence_rule=convergence_rule,
-        instrument=instrument)
+        instrument=instrument,
+        # No fallback: a run built before this sampler, or one that never
+        # reached the clock, has no section rather than an empty one.
+        role_cpu=role_cpu)
     # Derived from the finished document rather than from the events, so the
     # policy can only ever reason about intervals this artifact published.
     #
@@ -3865,6 +2997,12 @@ def write_event_artifact(args, events, prefix, status, testers=None,
                            or DEFAULT_PATH_DIVERSITY),
         'receivers': (None if getattr(args, 'file', None) else
                       getattr(args, 'receivers', None) or DEFAULT_RECEIVERS),
+        # Both blocks, for the reason `receivers` is in both.
+        'pin': pin_cpusets(getattr(args, 'pin', None)) or None,
+        # Both blocks, for the same reason: `findings.py` and
+        # `monitor_pair_review.py` read this document, and the stem is the
+        # only other carrier.
+        'monitor': run_monitor(args),
         # Both `run` blocks carry it, for the reason recorded for
         # `path_diversity` and `repetition`: this document is what
         # `findings.py` reads and what a summary groups by, and the only other
@@ -4017,40 +3155,9 @@ def write_tester_health_artifact(args, prefix, errors, error_samples,
 
 
 def abandon_run(reason, target, m, testers=()):
-    """End a run that will not produce a result, and always raise.
-
-    The other way out of `bench()`'s loop. `finish_bench()` stops the samplers
-    on the way to publishing a row; this stops them on the way to publishing
-    nothing, and the samplers are the part that must not be skipped. They are
-    daemon threads polling `docker exec` once a second, and the one time they
-    were left running, bgperf went on sampling through the next cell and
-    **manufactured the very contention it reports** -- see
-    docs/invariants/host-and-environment.md. A reclaim that left forty of them
-    behind would do it forty times over.
-
-    Containers are deliberately *not* removed. `bench()` already calls
-    `remove_target_containers()` and `remove_old_containers()` on the way in,
-    so the next run reclaims them; removing them here instead would race the
-    SIGKILL that is two minutes away and could leave a half-removed container
-    the next run then trips over. Leaving them is also what this repository
-    does after a FAILED run, deliberately, so the wreck can be looked at.
-
-    Raises `StopRequested` rather than returning, so nothing downstream can
-    mistake an abandoned run for a row: `batch()`'s
-    `completed[cell_id] = bench(a)` never executes, and the cell stays absent
-    from the progress file rather than recorded as done.
-    """
-    m.stop_monitoring = True
-    # None on a remote run, which has no target container to sample.
-    if target is not None:
-        target.stop_monitoring = True
-    for t in testers:
-        t.stop_monitoring = True
-    controller_stop.set()
-    print('\nabandoning this run: {0}'.format(reason))
-    print('no row is recorded for it; its containers are left for the next '
-          'run to reclaim')
-    raise StopRequested(reason)
+    """Compatibility entry point for the extracted run lifecycle."""
+    return run_lifecycle.abandon_run(
+        sys.modules[__name__], reason, target, m, testers)
 
 
 def finish_bench(args, output_stats, bench_stats, bench_start, target, m, testers=(), fail=False,
@@ -4059,168 +3166,22 @@ def finish_bench(args, output_stats, bench_stats, bench_start, target, m, tester
                  export_lifecycle=None, export_state=None,
                  export_read_failures=None, export_required=None,
                  export_receiver_names=(), export_unmeasured_reason=None,
-                 export_thread=None,
+                 export_thread=None, role_cpu=None,
                  churn_evidence=None, policy_reload_evidence=None,
                  target_table=None, target_table_unmeasured_reason=None,
                  target_table_witness_rule=None,
                  convergence_rule=None):
 
-    bench_stop = time.time()
-    output_stats['total_time'] = bench_stop - bench_start
-    m.stop_monitoring = True
-    target.stop_monitoring = True
-    for t in testers:
-        # The generator pollers watch controller_stop too, but they exec into
-        # containers this run is about to walk away from, so they are told
-        # twice rather than left racing the teardown.
-        t.stop_monitoring = True
-    controller_stop.set()
-
-    # Wait for a receiver round still in flight before reading its recorder --
-    # the poll thread is that recorder's only writer, and the round that
-    # started just before convergence is the one most likely to carry the last
-    # receiver's completion. It is **after** `bench_stop` on purpose, the rule
-    # the tester log scan follows: `total time` is a published column that
-    # `create_batch_graphs()` plots, and a wait that grows with the receiver
-    # count would land in exactly the comparison the fan-out exists to make.
-    #
-    # Bounded because it is teardown patience, not a measurement: the longest
-    # round measured on this host is 3.8s for six receivers on a loaded box,
-    # and a `docker exec` that never returns must cost half a minute rather
-    # than the run. A poll that has not come back is said out loud rather than
-    # waited on further -- the events it holds are still published.
-    export_state = export_state if export_state is not None else {}
-    if export_thread is not None:
-        # The only wait for this thread. An earlier revision also waited for it
-        # before a post-convergence workload, and needed a guard here against
-        # paying the same bound twice; that wait went away with the workload
-        # interaction, and so did the guard -- a guard for a path that cannot
-        # be taken reads as protection the next change would not actually have.
-        wait_s = export_poll_teardown_wait_s(len(export_receiver_names or ()))
-        export_thread.join(timeout=wait_s)
-        if export_thread.is_alive():
-            # Its own key, never `observation_error`. That key means a round
-            # was *rejected* and the recorder retired, which is a different
-            # finding -- and writing this note there would do more than
-            # mislabel it: `observe_export_sample()` treats that key as the
-            # retirement flag, so the still-running thread would silently stop
-            # recording the round this note is about. Into the same dict the
-            # summary reads, because a note that does not reach the artifact is
-            # a note nobody gets.
-            export_state['poll_incomplete'] = (
-                'the receiver poll had not returned {0:.0f}s after the '
-                'delivery window closed; a round still in flight may be '
-                'missing from these events'.format(wait_s))
-
-    tester_events, tester_evidence = tester_lifecycle_summary(
-        tester_lifecycles or {}, tester_observation_errors or {},
-        tester_read_failures or {})
-    export_events, export_evidence = export_lifecycle_summary(
-        export_lifecycle, export_state, export_read_failures or {},
-        export_required, export_receiver_names or (),
-        export_unmeasured_reason)
-    lifecycle_events = list(lifecycle_events) + tester_events + list(export_events)
-
-    bench_prefix = bench_output_prefix(args)
-    artifact = write_event_artifact(
-        args, lifecycle_events, bench_prefix,
-        status='failed' if fail else 'converged',
-        testers=tester_evidence, host=host_evidence(output_stats),
-        churn=churn_evidence, policy_reload=policy_reload_evidence,
-        export=export_evidence, target_table=target_table,
-        target_table_unmeasured_reason=target_table_unmeasured_reason,
-        target_table_witness_rule=target_table_witness_rule,
-        convergence_rule=convergence_rule,
-        instrument=instrument_section(target, m))
-
-    # Scan the tester logs only after the clock has stopped. These used to run
-    # in bench() before bench_stop, so walking every tester log line by line --
-    # twice, once per needle, over logs that reach hundreds of MB on a 1M-prefix
-    # MRT run -- was billed to total_time, a column create_batch_graphs() plots.
-    tester_dirs = [t.host_dir for t in testers]
-    tester_class = type(testers[0]) if testers else None
-    error_samples = []
-    timeout_samples = []
-    if tester_class is not None:
-        # The matched lines are captured in the same walk that counts them.
-        # Walking twice would be two reads of hundreds of MB for the second
-        # copy of a number we already have, and -- since the logs are being
-        # deleted out from under this by the next cell -- two different reads.
-        output_stats['tester_errors'] = tester_class.find_errors(
-            tester_dirs, error_samples)
-        output_stats['tester_timeouts'] = tester_class.find_timeouts(
-            tester_dirs, timeout_samples)
-        # Inside this branch on purpose, and it was briefly outside it.
-        #
-        # The writer also *removes* a previous run's document, and a re-run
-        # into the same --results-dir must not leave one behind -- so moving
-        # the call out here looks right, and review asked for it once. It is
-        # wrong. A run reaches here with no tester class whenever it built
-        # no testers -- `-r/--repeat`, or a scenario that declares none (see
-        # the `tester_errors` defaults above, "a run with no testers (a remote
-        # target) never gets there") -- and none of those measured anything.
-        # `-r` is the sharp case: `bench()` skips both
-        # `remove_old_containers()` and the `shutil.rmtree(config_dir)` under
-        # it, so the reused tester containers are still running and still
-        # appending to the very logs nobody scanned. The zeros are the
-        # defaults set before the run, not a measurement -- and removing the
-        # file on the strength of them would delete a capture that still
-        # describes lines present in those logs, publishing
-        # `tester errors: 0` over a log that was never read.
-        #
-        # That is this repository's oldest rule twice over: a count of zero is
-        # only published when the log proves the class was on, and a pass that
-        # failed and a pass that never ran are never described by one clause.
-        # A run that scanned and found nothing supersedes an earlier document;
-        # a run that did not scan supersedes nothing. (That a `-r` row reports
-        # `tester errors: 0` at all is a separate, older gap -- bgperf2-v6x --
-        # and it is not made better by deleting the evidence.)
-        write_tester_health_artifact(
-            args, bench_prefix,
-            output_stats.get('tester_errors', 0), error_samples,
-            output_stats.get('tester_timeouts', 0), timeout_samples)
-
-    # Read every version before the containers go away -- this is the last
-    # moment any of them can be asked.
-    provenance = collect_provenance(args, target, m, testers)
-    del m
-    # A target that must be stopped to produce its evidence (a DHAT build
-    # writes its heap profile on exit) does so now: the clock has stopped and
-    # every version has been read.
-    collect_run_artifacts = getattr(target, 'collect_run_artifacts', None)
-    if collect_run_artifacts is not None:
-        collect_run_artifacts(results_path(args.results_dir, bench_prefix))
-
-    target_version = provenance['target']['version']
-
-    print_final_stats(args, target_version, output_stats)
-    pairing = target_read_pairing(target)
-    if pairing:
-        print('target read pairing: {paired_samples} samples paired, '
-              '{unpaired_samples} unpaired, start offset {min_start_offset_ms}'
-              '..{max_start_offset_ms} ms (window {window_ms} ms)'.format(**pairing))
-    print_tester_metrics(lifecycle_events, tester_evidence)
-    for line in describe_churn_metrics(artifact.get('churn')):
-        print(line)
-    for line in describe_export_metrics(artifact.get('export'),
-                                        artifact.get('status')):
-        print(line)
-    for line in describe_policy_reload_metrics(artifact.get('policy_reload')):
-        print(line)
-    # Last, because it is the one line that reads the rest of them together.
-    for line in describe_findings(artifact['findings']):
-        print(line)
-    o_s = create_output_stats(args, target_version, output_stats, fail, provenance)
-    print(stats_header())
-    print(','.join(map(str, o_s)))
-    print()
-    # it would be better to clean things up, but often I want to to investigate where things ended up
-    # remove_old_containers()
-    # remove_target_containers()
-    create_bench_graphs(bench_stats, prefix=bench_prefix, results_dir=args.results_dir)
-    write_provenance(args, provenance, bench_prefix)
-    return o_s
-
+    """Compatibility entry point for the extracted run lifecycle."""
+    return run_lifecycle.finish_bench(
+        sys.modules[__name__], args, output_stats, bench_stats, bench_start,
+        target, m, testers, fail, lifecycle_events, tester_lifecycles,
+        tester_observation_errors, tester_read_failures, export_lifecycle,
+        export_state, export_read_failures, export_required,
+        export_receiver_names, export_unmeasured_reason, export_thread,
+        role_cpu, churn_evidence, policy_reload_evidence, target_table,
+        target_table_unmeasured_reason, target_table_witness_rule,
+        convergence_rule)
 
 
 # How many problem sessions a churn failure message names before it stops.
@@ -4643,18 +3604,18 @@ def describe_export_metrics(export, status='converged'):
             # Served inside one look of each other. That is what a target
             # exporting to them in parallel looks like at this cadence; it is
             # not evidence that it did.
-            spread_text = ('; the sessions were served within the {0:.1f}s '
-                           'poll resolution of each other'.format(
-                               spread_resolution))
+            spread_text = ('; the sessions were served within the {0} '
+                           'resolution of each other'.format(
+                               duration_text(spread_resolution)))
         else:
-            spread_text = ('; {0:.1f}s between the first and last of '
-                           'them'.format(spread))
+            spread_text = ('; {0} between the first and last of '
+                           'them'.format(duration_text(spread)))
         lines.append(
             'export fan-out: {0} of {1} receiver(s) reached {2} prefix(es), '
             'the last {3}{4}'.format(
                 complete, total, required,
-                churn_interval_phrase(reached,
-                                      export.get('table_reached_resolution_s')),
+                export_interval_phrase(
+                    reached, export.get('table_reached_resolution_s')),
                 spread_text))
 
     delta = export.get('monitor_delta_s')
@@ -4671,18 +3632,20 @@ def describe_export_metrics(export, status='converged'):
         # one this cadence cannot resolve in either direction.
         lines.append(
             'export fan-out: the last receiver and the monitor reached the '
-            'table within the {0:.1f}s poll resolution of each other'.format(
-                resolution))
+            'table within the {0} resolution of each other'.format(
+                duration_text(resolution)))
     elif delta < 0:
         # Ordinary rather than a fault: the monitor is one export session among
         # several and nothing orders them.
         lines.append(
-            'export fan-out: the last receiver had the table {0:.1f}s before '
-            'the monitor reached the required count'.format(-delta))
+            'export fan-out: the last receiver had the table {0} before '
+            'the monitor reached the required count'.format(
+                duration_text(-delta)))
     else:
         lines.append(
-            'export fan-out: the last receiver had the table {0:.1f}s after '
-            'the monitor reached the required count'.format(delta))
+            'export fan-out: the last receiver had the table {0} after '
+            'the monitor reached the required count'.format(
+                duration_text(delta)))
 
     error = export.get('observation_error')
     if error:
@@ -4696,6 +3659,35 @@ def describe_export_metrics(export, status='converged'):
         # only truncates it.
         lines.append('export fan-out: {0}'.format(truncated))
     return lines
+
+
+def duration_text(seconds):
+    """A duration as a printed line carries it.
+
+    Tenths of a second were enough while every export interval came from a
+    1 s poll. A sink dates its own lines to the millisecond (measurement plan
+    7b), and `0.0s` beside a 4 ms resolution reads as an instant; anything
+    `.1f` would print as 0.0s is printed in milliseconds instead.
+    """
+    # Switched on what `.1f` would print, so a value just under the line
+    # cannot print as `100.0ms` beside a `0.1s`.
+    if abs(seconds) < 0.05:
+        return '{0:.1f}ms'.format(seconds * 1000)
+    return '{0:.1f}s'.format(seconds)
+
+
+def export_interval_phrase(seconds, resolution):
+    """`churn_interval_phrase()` for an export interval, which a sink can date.
+
+    Churn is measured by the poll alone, so its phrase names a poll; an export
+    interval under `--monitor sink` is bounded by a sink's log line, so this
+    one names only a resolution, printed through `duration_text()`.
+    """
+    if seconds is None:
+        return '(unmeasured)'
+    if resolution is not None and seconds <= resolution:
+        return 'within the {0} resolution'.format(duration_text(resolution))
+    return 'in {0}'.format(duration_text(seconds))
 
 
 def churn_interval_phrase(seconds, resolution):
@@ -4968,6 +3960,20 @@ def print_final_stats(args, target_version, stats):
     print(f"tester timeouts: {stats['tester_timeouts']}")
     print()
 
+def row_failed(row):
+    """Whether a stats row is marked failed, read by the header's column name."""
+    index = [f.strip() for f in stats_header().split(',')].index('failed')
+    return bool(row) and len(row) > index and row[index] == 'FAILED'
+
+def bench_command(args):
+    # `bench` from the command line. A run the engine marks FAILED returned
+    # normally, so the process exited 0 and no script could stop on it: the
+    # 2026-10 validation's A/B loops ran on past two failed runs. Exit 1
+    # instead, apart from 143 (a requested stop). `batch` calls bench() itself
+    # and records a failed cell as a result, so it is unaffected.
+    if row_failed(bench(args)):
+        sys.exit(1)
+
 def stats_header():
     # NOTE: must stay in sync with the row built by create_output_stats();
     # tests/test_stats_contract.py enforces that they are the same length.
@@ -5161,53 +4167,6 @@ def create_graph(stats, test_name='total time', stat_index=8, test_file='total_t
     plt.savefig(results_path(results_dir, test_file))
     plt.close()
 
-class BatchLoader(yaml.SafeLoader):
-    '''YAML loader that leaves version-shaped scalars alone.
-
-    Plain yaml reads `10.10` as the float 10.1, which would quietly bench FRR
-    10.1 when the config asked for 10.10. Nothing in a batch config is
-    legitimately a float, so dropping the implicit float resolver costs
-    nothing and keeps versions as the strings they were written as.
-    '''
-
-
-BatchLoader.yaml_implicit_resolvers = {
-    ch: [(tag, regexp) for tag, regexp in resolvers if tag != 'tag:yaml.org,2002:float']
-    for ch, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
-}
-
-
-def expand_target_versions(targets):
-    '''Turn `versions: [8.0, 9.0]` on a target into one entry per version.
-
-    Comparing releases is the common case, and writing them out by hand means
-    repeating the whole target block -- including the image tag, which is the
-    part that is easy to get wrong.
-    '''
-    expanded = []
-    for t in targets:
-        versions = t.get('versions') or [t.get('version')]
-        for v in versions:
-            entry = dict(t)
-            entry.pop('versions', None)
-            if v is None:
-                entry.pop('version', None)
-            else:
-                # yaml turns 10.1 into a float and 10 into an int; both have to
-                # survive as the string the tag was built from.
-                entry['version'] = str(v)
-                if 'label' not in t:
-                    entry['label'] = '{0} {1}'.format(t['name'], v)
-                elif len(versions) > 1:
-                    # An explicit label on a multi-version entry would name every
-                    # run the same thing: duplicate rows in the CSV, per-run PNGs
-                    # overwriting each other, and create_graph() raising a shape
-                    # mismatch because it de-duplicates labels but not data.
-                    entry['label'] = '{0} {1}'.format(t['label'], v)
-            expanded.append(entry)
-    return expanded
-
-
 def batch_repetitions(test):
     '''How many times a test asks for its whole matrix to be run.
 
@@ -5232,7 +4191,8 @@ BATCH_TEST_KEYS = ('name', 'neighbors', 'prefixes', 'filter_test', 'targets')
 # `repetitions` misspelt runs one pass of a matrix someone asked three of.
 BATCH_TEST_OPTIONAL_KEYS = ('repetitions', 'order', 'seed', 'prefix_scope',
                             'path_diversity', 'receivers', 'churn_prefixes',
-                            'churn_bursts', 'policy_reload_blocks')
+                            'churn_bursts', 'policy_reload_blocks', 'pin',
+                            'monitor')
 
 
 # Keys that mean something on a *test* and nothing on a target. There is no
@@ -5249,7 +4209,8 @@ BATCH_TEST_OPTIONAL_KEYS = ('repetitions', 'order', 'seed', 'prefix_scope',
 BATCH_TEST_ONLY_KEYS = ('prefix_scope', 'repetitions', 'order', 'seed',
                         'neighbors', 'prefixes', 'filter_test',
                         'path_diversity', 'receivers', 'churn_prefixes',
-                        'churn_bursts', 'policy_reload_blocks')
+                        'churn_bursts', 'policy_reload_blocks', 'pin',
+                        'monitor')
 
 # Target keys whose absence means something other than `None`. `batch()`
 # otherwise gives every unset field `None`, and `gen_conf()` routes anything
@@ -5397,14 +4358,25 @@ def check_batch_test(test, scenarios=None):
     # run reports CONVERGED at a tenth of the table with nothing in the row or
     # the artifacts saying so.
     for target in test['targets']:
+        if not isinstance(target, dict) or not target.get('name'):
+            sys.exit("test '{0}': every target needs a `name`, got {1!r}".format(test['name'], target))
+        if target.get('mrt_spec'):
+            import native_mrt
+            if (target.get('tester_type') != 'bgpdump2' or target.get('repeat') or target.get('file')
+                    or any(not re.fullmatch(r'sha256:[0-9a-f]{64}', target.get(k) or '')
+                           for k in ('image','generator_image','observer_image'))):
+                sys.exit('Native MRT batch requires fresh bgpdump2 cells and three immutable images')
+            for neighbors in test['neighbors']:
+                for per_peer in test['prefixes']:
+                    native_mrt.workload(target['mrt_spec'], target.get('mrt_spec_sha256'), neighbors, per_peer)
         # A name first: everything below reports against it, and
         # `', '.join()` on a target that has neither name nor label raised a
         # bare TypeError -- the traceback naming neither the test nor the key
         # that this function exists to eliminate, produced by the checks added
         # to eliminate it.
-        if not isinstance(target, dict) or not target.get('name'):
-            sys.exit("test '{0}': every target needs a `name`, got {1!r}".format(
-                test['name'], target))
+        for selected_filter in test['filter_test']:
+            check_target_workload(argparse.Namespace(**dict(
+                target, target=target['name'], filter_test=selected_filter)))
         # Every generator check below exempts a scenario target: it never
         # reaches `gen_conf()`, so its generator is inert and none of the
         # advice these print would change what runs.
@@ -5428,10 +4400,8 @@ def check_batch_test(test, scenarios=None):
         # these two keys is checked against the generator that will run.
         # `gen_conf()` derives the injector from `tester_type` and never reads
         # `mrt_injector`, so one that disagrees is not a second opinion -- it
-        # is a line the run ignores. `tester_type: gobgp` beside
-        # `mrt_injector: bgpdump2` played back through gobgp, against a 0.93
-        # check-point factor instead of 0.99, and wrote a row that reads as a
-        # bgpdump2 run.
+        # is a line the run ignores: a row would read as one injector's run
+        # when another played the table back.
         injector = target.get('mrt_injector')
         if not scenario and injector and injector != tester:
             sys.exit(
@@ -5659,6 +4629,80 @@ def check_batch_test(test, scenarios=None):
                              for f in churn_flags),
                 ', '.join(repeated),
                 'has' if len(repeated) == 1 else 'have'))
+    check_batch_pin(test, repeated)
+    monitor = test.get('monitor')
+    if monitor is not None and monitor not in MONITOR_TYPES:
+        # `batch()` bypasses argparse's `choices`, and `MONITOR_CLASSES[...]`
+        # at the cell would end the matrix there with a bare KeyError.
+        sys.exit("test '{0}': unknown monitor {1!r}; the monitors are {2}".format(
+            test['name'], monitor, ', '.join(MONITOR_TYPES)))
+
+
+def check_batch_pin(test, repeated):
+    '''`--pin`'s guards for a batch test, against every target it names.
+
+    Each target is checked rather than the first: whether `receivers` must be
+    named depends on the target -- a `file:` target's scenario states its own
+    -- and a remote scenario target has no container to pin. Refused at its
+    cell instead, the `SystemExit` would end the matrix there.
+    '''
+    pin = test.get('pin')
+    if pin in (None, ''):
+        return
+    if repeated:
+        sys.exit("test '{0}': pin cannot be honoured with repeat, which {1} "
+                 '{2} set: the reused tester containers keep the cores they '
+                 'were created with'.format(
+                     test['name'], ', '.join(repeated),
+                     'has' if len(repeated) == 1 else 'have'))
+    cpus = host_cpus()
+    for target in test['targets']:
+        receivers = test.get('receivers') or DEFAULT_RECEIVERS
+        try:
+            if target.get('file') and os.path.isfile(target['file']):
+                with open(target['file']) as f:
+                    scenario = render_scenario(f.read())
+                if (scenario.get('target') or {}).get('remote'):
+                    raise ValueError('--pin cannot be honoured for a remote '
+                                     'target: bgperf2 does not start it')
+                receivers = len(scenario.get('receivers') or [])
+            resolve_pin(pin, receivers, cpus)
+        except ValueError as e:
+            sys.exit("test '{0}': target {1!r}: {2}".format(
+                test['name'], target.get('label') or target['name'], e))
+
+
+def check_batch_pin_and_repeat(tests):
+    """`--pin` against `repeat` across a whole batch, before its first cell.
+
+    `check_batch_pin()` sees one test at a time, so a pinned test followed by
+    a test with a `repeat` target passed it -- and the second test's first
+    cell then met `bench()`'s refusal to reuse pinned generators, ending the
+    matrix partway through. Refused in either order: `order: shuffle` and
+    `--resume` both decide what runs first. A batch with `repeat` targets and
+    no pin is checked once against the host, for generators an earlier pinned
+    run left behind; the same Docker call `bench()` makes, made early.
+    """
+    pinned = [t['name'] for t in tests if t.get('pin')]
+    repeating = [t['name'] for t in tests
+                 if any(target.get('repeat') for target in t['targets'])]
+    if pinned and repeating:
+        sys.exit('batch: {0} {1} pin and {2} {3} a repeat target. A repeat '
+                 'reuses whatever tester containers the run before it left, '
+                 'and a pinned test leaves pinned ones. Split them into '
+                 'separate batches'.format(
+                     ', '.join(pinned), 'sets' if len(pinned) == 1 else 'set',
+                     ', '.join(repeating),
+                     'has' if len(repeating) == 1 else 'have'))
+    if repeating:
+        left = pinned_tester_containers(
+            get_ctn_names(),
+            lambda name: dckr.inspect_container(name)['HostConfig'].get('CpusetCpus'))
+        if left:
+            sys.exit('batch: {0} would reuse tester containers a pinned run '
+                     'created ({1}), and they keep its cores. Run one bench '
+                     'without -r to rebuild them'.format(
+                         ', '.join(repeating), ', '.join(left)))
 
 
 def target_run_name(target):
@@ -5724,7 +4768,6 @@ def expand_batch_cells(test, targets, scenarios=None):
     '''
     check_batch_test(test, scenarios=scenarios)
     repetitions = batch_repetitions(test)
-    scope = test.get('prefix_scope')
     # Carried on the cell rather than read from the test at run time, because
     # the cell is what `--resume` matches on: a test whose `path_diversity` is
     # edited between runs describes a different workload, and a cell id that
@@ -5743,35 +4786,21 @@ def expand_batch_cells(test, targets, scenarios=None):
     # measured against the old one.
     reload_blocks = (test.get('policy_reload_blocks')
                      or DEFAULT_POLICY_RELOAD_BLOCKS)
-    cells = []
-    for repetition in range(1, repetitions + 1):
-        ordinal = 0
-        for n in test['neighbors']:
-            for p in test['prefixes']:
-                for filter_test in test['filter_test']:
-                    for t in targets:
-                        cells.append({
-                            'repetition': repetition if repetitions > 1 else None,
-                            'ordinal': ordinal,
-                            'neighbors': n,
-                            # The per-peer count, resolved here rather than
-                            # carried as a scope: `-n 50 -p 100000` under
-                            # `total` and `-n 50 -p 2000` are the same
-                            # workload, so they must produce the same cell
-                            # identity, the same row, the same artifact names
-                            # and the same bar. `check_batch_test()` has
-                            # already refused an inexact division.
-                            'prefixes': resolve_prefix_scope(scope, n, p),
-                            'filter': filter_test,
-                            'path_diversity': diversity,
-                            'receivers': receivers,
-                            'churn_prefixes': churn_prefixes,
-                            'churn_bursts': churn_bursts,
-                            'policy_reload_blocks': reload_blocks,
-                            'target': t,
-                        })
-                        ordinal += 1
-    return cells
+    # And the core layout, canonicalised so two spellings of one layout are
+    # one cell: a pinned run and an unpinned run are different cells, and an
+    # edited layout is a different run rather than more of the same one.
+    pin = test.get('pin')
+    pin = format_pin(parse_pin(pin)) if pin else None
+    # And the instrument: a cell measured with the sink and the same cell
+    # re-checked under GoBGP are different cells, and an edited monitor is a
+    # different run.
+    monitor = batch_test_monitor(test)
+    return construct_batch_cells(
+        test, targets, repetitions=repetitions,
+        prefix_resolver=resolve_prefix_scope, path_diversity=diversity,
+        receivers=receivers, churn_prefixes=churn_prefixes,
+        churn_bursts=churn_bursts, policy_reload_blocks=reload_blocks,
+        pin=pin, monitor=monitor)
 
 
 # How a test may sequence its cells. `matrix` is the enumeration order
@@ -5797,8 +4826,9 @@ def batch_order(test):
     that names a seed is asking to be permuted. An omitted seed is generated,
     not fixed at a constant: a default seed shared by every batch is one
     permutation, and a permutation nobody chose is exactly the pattern this
-    exists to break. It is recorded in the progress file, so the sequence stays
-    reproducible after the fact and a resumed batch keeps the order it planned.
+    exists to break. It is recorded in every cell result, so the sequence stays
+    reproducible after the fact. `--resume` requires a stated seed, since a
+    drawn one would deal the remaining cells in a different order.
     """
     order = test.get('order', 'matrix')
     if order not in BATCH_ORDERS:
@@ -5819,8 +4849,8 @@ def batch_order(test):
 
 
 def describe_batch_sequence(order, seed):
-    """One phrase for a sequence, so the planned one and a superseded one read
-    the same way. Matrix order has no seed to name."""
+    """One phrase for a sequence, so every message names one the same way.
+    Matrix order has no seed to name."""
     if order == 'matrix' or seed is None:
         return order
     return '{0} seed {1}'.format(order, seed)
@@ -5992,10 +5022,6 @@ def check_batch_images(targets):
         RustBGPdTarget._neighbor_poll_mode()
     missing = []
     for t in targets:
-        try:
-            GoBGP.require_image(t.get('monitor_version'))
-        except (ImageNotBuilt, VersionNotSupported) as e:
-            missing.append('monitor: {}'.format(e))
         if t.get('file'):
             # A hand-written scenario can declare the target remote, in which
             # case there is no local image to check. bench() sorts it out once
@@ -6017,37 +5043,72 @@ def check_batch_images(targets):
         sys.exit('\n'.join(['this batch cannot run:'] + ['  ' + m for m in missing]))
 
 
-def batch(args):
-    """ runs several tests together, produces all the stats together and creates graphs
-    requires a yaml file to describe the batch of tests to run
+def check_batch_monitor_images(tests):
+    '''Fail before the first run if any test's monitor image is missing.
 
-    it iterates through a list of targets, number of neighbors and number of prefixes
-    other variables can be set, but not iterated through
+    The batch counterpart of the check in `bench()`, for the reason
+    `check_batch_images()` exists: a missing image at the cell is the matrix
+    ending there.
+    '''
+    wanted = set()
+    missing = []
+    for test in tests:
+        monitor = batch_test_monitor(test)
+        native = [t for t in test['targets'] if t.get('mrt_spec') or (t.get('generator_image') and t.get('observer_image'))]
+        for target in native:
+            for field in ('generator_image','observer_image'):
+                if not img_exists(target.get(field) or ''):
+                    sys.exit('Native MRT image unavailable: '+str(target.get(field)))
+        if len(native) == len(test['targets']):
+            pass
+        elif monitor == 'gobgp':
+            # The fork pins the GoBGP monitor per target with `monitor_version`;
+            # a native MRT target is observed by its `observer_image` instead.
+            for t in test['targets']:
+                if t.get('mrt_spec'):
+                    continue
+                try:
+                    GoBGP.require_image(t.get('monitor_version'))
+                except (ImageNotBuilt, VersionNotSupported) as e:
+                    missing.append('monitor: {}'.format(e))
+        else:
+            wanted.add(MONITOR_CLASSES[monitor])
+            for t in test['targets']:
+                if t.get('monitor_version'):
+                    missing.append('{0}: monitor_version selects the GoBGP '
+                                   'monitor image; it does not apply to '
+                                   'monitor: {1}'.format(t['name'], monitor))
+        # A `file:` target's scenario may state receivers of its own, so any
+        # such target counts as having them; asking for an image a run turns
+        # out not to need costs a build, not a matrix.
+        if (test.get('receivers') or DEFAULT_RECEIVERS) != DEFAULT_RECEIVERS \
+                or any(t.get('file') for t in test['targets']):
+            wanted.add(RECEIVER_CLASSES[monitor])
+    for cls in sorted(wanted, key=lambda c: c.__name__):
+        try:
+            cls.require_image()
+        except ImageNotBuilt as e:
+            if str(e) not in missing:
+                missing.append(str(e))
+    if missing:
+        sys.exit('\n'.join(['this batch cannot run:'] + ['  ' + m for m in missing]))
+
+
+def expand_batch_config(path, defer_graphs=False, scenarios=None):
+    """Read a batch config and expand and check every test in it.
+
+    Every test is checked before any of them runs. Checking each test as it
+    came up still let a missing axis in test 3 surface only after tests 1 and 2
+    had run, which is the multi-hour wait this is meant to prevent. Docker-free,
+    so `--list-cells` and `--report` can use it on any machine.
     """
-    # Before anything long-running, and before the first cell: a reclaim that
-    # arrives during cell 1 should already have somewhere to be recorded.
-    install_stop_handlers()
-    start_interruption_watch()
-
-    # An interrupted checkpoint leaves its temp file behind -- `atomic_write()`
-    # cleans up in a `finally`, which SIGKILL never reaches. Swept here rather
-    # than ignored, and *reported*, because a resumed batch carrying one is the
-    # only visible trace that the last attempt was killed rather than finished.
-    swept = sweep_stale_temp_files(args.results_dir)
-    if swept:
-        print('found {0} unfinished checkpoint file(s) from an interrupted '
-              'run, removed: {1}'.format(len(swept), ', '.join(swept)))
-
-    with open(args.batch_config, 'r') as f:
+    with open(path, 'r') as f:
         batch_config = yaml.load(f, Loader=BatchLoader)
-
-    # Expand and check every test before running any of them. Checking each test
-    # as it came up still let a missing image in test 3 surface only after tests
-    # 1 and 2 had run, which is the multi-hour wait this is meant to prevent.
     expanded = []
-    # Freeze each file's template once for this invocation. Keep these parsed
-    # objects outside target/cell identity and give each run its own copy.
-    scenarios = {}
+    # Each scenario file is rendered once per invocation into `scenarios`;
+    # `batch_cell_args()` hands each cell its own copy.
+    if scenarios is None:
+        scenarios = {}
     for test in batch_config['tests']:
         # Before anything reads the test, including `test['targets']` itself:
         # `check_batch_test()` exists so a missing or mistyped axis is named
@@ -6059,57 +5120,152 @@ def batch(args):
         order, seed = batch_order(test)
         expanded.append((test, targets, expand_batch_cells(
             test, targets, scenarios=scenarios), order, seed))
+    # A test's name is the stem of its CSV, summary and cell
+    # results, and part of every cell id, so two tests sharing one would write
+    # over each other's evidence and give their cells the same keys.
+    names = [test['name'] for test, _t, _c, _o, _s in expanded]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        sys.exit('{0}: test name(s) used more than once: {1}'.format(
+            path, ', '.join(map(str, repeated))))
+    if defer_graphs:
+        for _test,_targets,cells,_order,_seed in expanded:
+            for cell in cells:cell['defer_graphs']=True
+    return expanded
+
+
+def native_preflight(args):
+    """Check all controlled native prerequisites, without creating a worker."""
+    expanded=expand_batch_config(args.batch_config,getattr(args,'defer_graphs',False))
+    import native_mrt
+    inputs={};images=set();count=0
+    for _test,_targets,cells,_order,_seed in expanded:
+        for cell in cells:
+            selected=batch_cell_args(args,cell);count+=1
+            if getattr(selected,'mrt_spec',None):
+                spec=native_mrt.validate(selected)
+                key=json.dumps(spec['input'],sort_keys=True)
+                if key not in inputs:inputs[key]=native_mrt.mrt.verify_input(dict(mrt=spec))
+            else:native_mrt.synthetic_spec(selected)
+            images.update((selected.image,selected.generator_image,selected.observer_image))
+    for image in sorted(images):
+        if not img_exists(image):raise ValueError('Native image unavailable: '+image)
+    print(json.dumps(dict(schema='bgperf2/native-preflight/v1',status='verified',cells=count,
+        images=sorted(images),inputs=list(inputs.values())),indent=2,sort_keys=True))
+
+
+def batch(args):
+    """ runs several tests together, produces all the stats together and creates graphs
+    requires a yaml file to describe the batch of tests to run
+
+    it iterates through a list of targets, number of neighbors and number of prefixes
+    other variables can be set, but not iterated through
+
+    `--resume` skips every cell that already has a result in --results-dir.
+    The opt-in durable native mode also owns attempts, calibration dependencies
+    and explicit interruption recovery. External supervisors retain their
+    `--list-cells`, `--cells`, `--report` and cell-control interface. Cloud
+    watching and host provisioning remain outside the engine.
+    """
+    if any(getattr(args, flag, None) is not None for flag in
+           ('maximum_originals', 'timeout_seconds', 'operational_policy_sha256')):
+        if not (getattr(args, 'durable', False) or getattr(args, 'calibrate', False)
+                or getattr(args, 'recover', False)
+                or os.path.isfile(os.path.join(args.results_dir, 'native-batch.json'))):
+            raise ValueError('Durable invocation controls require --durable')
+    if getattr(args, 'batch_status', False):
+        if any(getattr(args, flag, False) for flag in ('list_cells', 'report', 'preflight')):
+            raise ValueError('--status cannot run another batch operation')
+        import native_batch
+        if not args.batch_config:
+            return native_batch.inspect_saved(args)
+        return native_batch.run(sys.modules[__name__], args,
+            expand_batch_config(args.batch_config, getattr(args, 'defer_graphs', False)))
+    # Neither runs a cell, and both print documents a caller parses, so they
+    # return before anything below can print anything of its own.
+    if getattr(args, 'list_cells', False):
+        if getattr(args, 'durable', False) or getattr(args, 'calibrate', False):
+            import native_batch
+            return native_batch.list_plan(sys.modules[__name__], args,
+                expand_batch_config(args.batch_config, getattr(args, 'defer_graphs', False)))
+        return list_batch_cells(expand_batch_config(args.batch_config, getattr(args,'defer_graphs',False)))
+    if getattr(args, 'report', False):
+        return report_batch_from_cell_results(
+            expand_batch_config(args.batch_config, getattr(args,'defer_graphs',False)), args.results_dir, getattr(args,'defer_graphs',False))
+
+    if getattr(args, 'no_report', False) and not getattr(args, 'cells', None):
+        sys.exit('--no-report applies only to --cells')
+
+    if getattr(args,'preflight',False):
+        return native_preflight(args)
+
+    if (getattr(args, 'durable', False) or getattr(args, 'calibrate', False) or getattr(args, 'recover', False)
+            or os.path.isfile(os.path.join(args.results_dir, 'native-batch.json'))):
+        import native_batch
+        return native_batch.run(sys.modules[__name__], args,
+            expand_batch_config(args.batch_config, getattr(args, 'defer_graphs', False)))
+
+    # Before the first cell: a SIGTERM during cell 1 must already abandon it.
+    install_stop_handlers()
+
+    # A SIGKILL never reaches `atomic_write()`'s cleanup. Swept and *reported*,
+    # because a resumed batch carrying one is the only visible trace that the
+    # last attempt was killed rather than finished.
+    swept = sweep_stale_temp_files(args.results_dir)
+    if swept:
+        print('found {0} unfinished write(s) from an interrupted run, removed: '
+              '{1}'.format(len(swept), ', '.join(swept)))
+
+    # Freeze each file's template once for this invocation. Keep these parsed
+    # objects outside target/cell identity and give each run its own copy.
+    scenarios = {}
+    expanded = expand_batch_config(args.batch_config, getattr(args,'defer_graphs',False),
+                                   scenarios=scenarios)
+    if getattr(args,'control_dir',None):
+        for _test,_targets,cells,_order,_seed in expanded:
+            for cell in cells:
+                if not cell['target'].get('mrt_spec'):
+                    __import__('native_mrt').synthetic_spec(batch_cell_args(args,cell))
+    if getattr(args, 'cells', None):
+        return run_selected_batch_cells(args, expanded, scenarios)
+    resume = getattr(args, 'resume', False)
+    recorded = {}
+    if resume:
+        # Reads only local files, so before anything that asks Docker: its
+        # remedy can make an image check moot.
+        expanded, recorded = check_resumable(expanded, args.results_dir)
     # One entry per target, not per cell: a repeated matrix asks about the same
     # images every pass, and reporting a missing image once per repetition
     # buries the list this exists to print.
     check_batch_images([t for _, targets, _, _, _ in expanded for t in targets])
+    check_batch_monitor_images([test for test, _, _, _, _ in expanded])
+    check_batch_pin_and_repeat([test for test, _, _, _, _ in expanded])
 
     for test, _targets, cells, order, seed in expanded:
         repetitions = batch_repetitions(test)
-        progress_path = results_path(args.results_dir, f"{test['name']}.progress.json")
         summary_path = results_path(args.results_dir, f"{test['name']}.summary.json")
-        resume = getattr(args, 'resume', False)
-        document = load_batch_progress_document(progress_path) if resume else {'cells': {}}
-        completed = document['cells']
-        if not resume and os.path.exists(progress_path):
-            os.unlink(progress_path)
+        if resume:
+            completed = recorded[test['name']]
+        else:
+            completed = {}
+            # A fresh batch is a new set of observations, so its predecessor's
+            # cell results go: left behind, a later `--report` would mix two
+            # runs' rows under one config.
+            cleared = clear_batch_cell_results(args.results_dir, test['name'])
+            if cleared:
+                print("test '{0}': starting fresh, removed {1} recorded cell "
+                      'result(s); use --resume or --report to keep them'.format(
+                          test['name'], cleared))
         if not resume and os.path.exists(summary_path):
             # The rows of a discarded batch are replaced by its successor's
-            # first checkpoint, but a summary that then fails to write would
-            # leave the previous run's document -- three passes that no longer
-            # exist -- beside the rewritten CSV.
+            # first cell, but a summary that then fails to write would leave
+            # the previous run's document -- passes that no longer exist --
+            # beside the rewritten CSV.
             os.unlink(summary_path)
-        # A progress file written before ordering existed names no order, and
-        # there was only one to have run in: reading it as matrix is what makes
-        # the comparison below honest rather than vacuous.
-        recorded = {'order': document.get('order') or 'matrix',
-                    'seed': document.get('seed')}
-        superseded = list(document.get('previous_seeds') or [])
-        if (resume and test.get('seed') is None
-                and recorded['order'] == order and recorded['seed'] is not None):
-            # Recover the drawn seed rather than dealing the remaining cells
-            # again: an interrupted run resumed under a fresh permutation has
-            # run two orders, and neither of them is the one it recorded. A
-            # seed the config states is left alone -- changing it by hand is an
-            # instruction to re-sequence, not a resume to be corrected.
-            seed = recorded['seed']
-        elif (resume and completed
-                and (recorded['order'], recorded['seed']) != (order, seed)):
-            # The cells already on disk ran under the recorded sequence. The
-            # document is rewritten from scratch on every checkpoint, so a
-            # superseded seed that is simply dropped leaves the file describing
-            # an order that some of its own rows did not run in.
-            superseded.append(recorded)
-            print('order: {0} completed cell(s) ran under {1}; keeping that as '
-                  'a superseded sequence'.format(
-                      len(completed), describe_batch_sequence(**recorded)))
         if order != 'matrix':
-            print('order: {0} (recorded in {1})'.format(
-                describe_batch_sequence(order, seed), progress_path))
-        # Written before the first cell so the seed survives a batch that dies
-        # in it, and so --resume finds the sequence rather than drawing another.
-        write_batch_progress(progress_path, completed, order=order, seed=seed,
-                             previous_seeds=superseded)
+            # Also stored in every cell result, so a drawn seed survives a
+            # batch that dies early and the sequence can be rebuilt.
+            print('order: {0}'.format(describe_batch_sequence(order, seed)))
         # Written before the first cell too, so the file describes *this*
         # batch's cells from the outset rather than leaving a previous run's
         # summary in place -- a stale document claiming three passes that were
@@ -6119,108 +5275,29 @@ def batch(args):
                                           describe=False):
             print(line)
         for cell in order_batch_cells(test['name'], cells, order, seed):
-            t = cell['target']
             cell_id = batch_cell_id(test['name'], cell)
             if cell_id in completed:
-                print("resume: skipping completed cell: {0}".format(
+                print('resume: skipping recorded cell: {0}'.format(
                     batch_cell_description(cell, repetitions)))
                 continue
 
-            # The cell boundary, and the whole point of the two-minute
-            # warning: a cell begun here cannot finish before the host goes
-            # away, so beginning it spends the window on a row nobody will
-            # keep. Everything already in `completed` is on disk and
-            # `--resume` picks up exactly here.
-            #
-            # **Raised, not `break`ed**, and the difference is the whole
-            # contract. A `break` leaves only this cell loop: `batch()` then
-            # finishes this test normally, walks on to the *next* test in the
-            # config, and returns -- so the process exits 0, which is exactly
-            # what the 143 below exists to distinguish from a run that was
-            # taken away. `run_batch()` in the campaign runner reads that 0 as
-            # success and the block stamps RAN over a truncated matrix. Worse,
-            # each remaining test re-enters the preamble above, which on a
-            # batch without `--resume` unlinks that test's progress and summary
-            # documents -- so a stop would discard the previous results of
-            # tests it never ran.
-            #
-            # Nothing is lost by unwinding here: the CSV, the summary and the
-            # progress file are rewritten after every completed cell, so what
-            # is on disk is current as of the last cell that finished.
+            # **Raised, not `break`ed.** A `break` leaves only this cell loop:
+            # `batch()` would finish this test normally, walk on to the next
+            # test, and return -- so the process exits 0 over a truncated
+            # matrix, and each remaining test's preamble would discard its
+            # predecessor's results for tests that never ran. Every completed
+            # cell is already on disk, so nothing is lost by unwinding.
             if stop_signal.is_set():
                 print('\nstopping before {0}: {1}'.format(
                     batch_cell_description(cell, repetitions),
                     stop_signal.reason))
-                print('re-invoke the identical command with --resume to '
-                      'continue from this cell')
                 raise StopRequested(stop_signal.reason)
 
-            a = argparse.Namespace(**vars(args))
-            a.func = bench
-            if 'image' in t:
-                a.image = t['image']
-            else:
-                a.image = None
-            a.output = None
-            a.target = t['name']
-            a.prefix_num = cell['prefixes']
-            a.neighbor_num = cell['neighbors']
-            # Already per-peer: `expand_batch_cells()` applied the test's
-            # `prefix_scope` when it built the cell, because the cell identity,
-            # the CSV row and the artifact names all have to be the per-peer
-            # count. Passing the scope through as well would divide twice.
-            a.prefix_scope = 'per-peer'
-            # From the cell, not from the test: the cell is what the id, the
-            # row and the artifact names were built from, and reading the test
-            # again here would let a config edited mid-batch run a cell under a
-            # diversity its own id does not record.
-            a.path_diversity = cell.get('path_diversity') or DEFAULT_PATH_DIVERSITY
-            a.receivers = cell.get('receivers') or DEFAULT_RECEIVERS
-            # From the cell for the same reason the two above are: the cell is
-            # what the id, the row and the artifact names were built from.
-            a.churn_prefixes = cell.get('churn_prefixes') or DEFAULT_CHURN_PREFIXES
-            a.churn_bursts = cell.get('churn_bursts') or DEFAULT_CHURN_BURSTS
-            a.policy_reload_blocks = (cell.get('policy_reload_blocks')
-                                      or DEFAULT_POLICY_RELOAD_BLOCKS)
-            a.filter_test = cell['filter'] if cell['filter'] != 'None' else None
-            # None for a single-pass test, so its rows, graphs and event
-            # artifacts keep the names they have always had; set for every pass
-            # of a repeated one, including the first, because a run named
-            # `bird 2.19.2` sitting beside `bird 2.19.2 #2` reads as a
-            # different thing rather than as the first of three.
-            a.repetition = cell['repetition']
-            # read any config attribute that was specified in the yaml batch file
-            a.local_address_prefix = t['local_address_prefix'] if 'local_address_prefix' in t else '10.10.0.0/16'
-            # Refused by `check_batch_test()` when true, so it is never copied.
-            a.single_table = False
-            for field in ['docker_network_name', 'repeat', 'file', 'target_local_address',
-                            'label', 'target_local_address', 'monitor_local_address', 'target_router_id',
-                            'monitor_router_id', 'target_config_file', 'filter_type','mrt_injector', 'mrt_file',
-                            'tester_type', 'license_file', 'version', 'monitor_version', 'threads',
-                            'tester_trace_io']:
-                # Keyed on the value, not on the key being present: a target
-                # written `tester_type:` with nothing after it parses as None,
-                # which is the very slip the default exists to catch, and a
-                # presence test skips the default for exactly that case.
-                value = t.get(field)
-                setattr(a, field,
-                        batch_target_defaults(t).get(field) if value is None
-                        else value)
-
-            for field in ['as_path_list_num', 'prefix_list_num', 'community_list_num', 'ext_community_list_num']:
-                setattr(a, field, t[field]) if field in t else setattr(a, field, 0)
-            if a.file in scenarios:
-                copy_start = time.monotonic()
-                a._batch_scenario = deepcopy(scenarios[a.file])
-                a._batch_scenario_copy_s = time.monotonic() - copy_start
-            completed[cell_id] = bench(a)
-
-            # Checkpoint both files atomically after every cell. If the process
-            # dies later, --resume can skip every cell whose result made it to
-            # disk -- including a repetition interrupted part way through, since
-            # a cell's identity does not depend on how many of its siblings ran.
-            write_batch_progress(progress_path, completed, order=order, seed=seed,
-                                 previous_seeds=superseded)
+            selected_args=batch_cell_args(args,cell,scenarios)
+            selected_args.native_cell_id=cell_id
+            completed[cell_id] = bench(selected_args)
+            write_batch_cell_result(args.results_dir, test['name'], cell_id,
+                                    completed[cell_id], order=order, seed=seed)
             write_batch_csv(results_path(args.results_dir, f"{test['name']}.csv"),
                             batch_report_rows(test['name'], cells, completed))
             # Kept current cell by cell, like the CSV: a batch that dies in its
@@ -6230,78 +5307,372 @@ def batch(args):
                                               describe=False):
                 print(line)
 
-        # A crash after the progress checkpoint but before its matching CSV
-        # replacement can leave the CSV one cell behind. Rebuild it even when
-        # resume skipped every cell.
+            if getattr(args, 'stop_on_failure', False) and row_failed(completed[cell_id]):
+                raise StopRequested('Recorded failed batch cell; --stop-on-failure')
+
         results = batch_report_rows(test['name'], cells, completed)
         write_batch_csv(results_path(args.results_dir, f"{test['name']}.csv"), results)
-
-        print()
-        print(stats_header())
-        for stat in results:
-            print(','.join(map(str, stat)))
-
-        # Every pass's row is above; this says what they do and do not agree
-        # about. The rows are never replaced by it -- a summary that hid the
-        # observations behind it would be a number nobody could check. A
-        # single-pass test with nothing to report prints nothing at all.
-        summary_lines = publish_batch_summary(summary_path, test['name'], cells,
-                                              completed, repetitions)
-        if summary_lines:
-            print()
-            for line in summary_lines:
-                print(line)
-
-        create_batch_graphs(results, test['name'], results_dir=args.results_dir)
+        print_batch_report(test['name'], results, summary_path, cells, completed,
+                           repetitions)
+        if not getattr(args,'defer_graphs',False):
+            create_batch_graphs(results, test['name'], results_dir=args.results_dir)
 
 
-def batch_cell_id(test_name, cell):
-    """Return a stable, human-inspectable identity for one batch matrix cell.
+def check_resumable(expanded, results_dir):
+    """Refuse a `--resume` the recorded results cannot honestly continue.
 
-    Keyed by what the cell is, never by when it ran: `ordinal` is its position
-    within one pass over the matrix and `repetition` says which pass, so
-    resume keeps matching when the execution order changes and two passes of
-    one cell are told apart by the one field that differs.
+    Returns the expanded tests, with a drawn shuffle seed replaced by the one
+    the recorded cells ran under, and each test's recorded results.
 
-    A single-pass test carries no `repetition` key at all, which is what a cell
-    id looked like before repetitions existed. That is deliberate: an in-flight
-    batch written by an older build resumes exactly as it did, instead of
-    finding no id it recognises and silently re-running hours of finished work.
+    Every recorded result must be a cell this config lists: an edited axis,
+    target, monitor or repetition count changes cell ids, and continuing would
+    put rows measured under the old config beside rows measured under the new
+    one. Every result must have run under the sequence this resume will
+    continue: a stated seed or order edited since is refused, since the batch
+    would have run two sequences with nothing naming the switch. A progress
+    file from an older bgperf2 holds rows this version does not read, so it is
+    refused rather than silently re-measured.
     """
-    identity = {
-        'test': test_name,
-        'ordinal': cell['ordinal'],
-        'neighbors': cell['neighbors'],
-        'prefixes': cell['prefixes'],
-        'filter': cell['filter'],
-        'target': cell['target'],
-    }
-    if cell['repetition'] is not None:
-        identity['repetition'] = cell['repetition']
-    # Omitted at the default for the same reason `repetition` is omitted for a
-    # single-pass test: a disjoint cell's id keeps exactly the shape it had
-    # before this flag existed, so an in-flight batch written by an older build
-    # resumes instead of costing the operator every completed cell, and
-    # `BATCH_PROGRESS_SCHEMA_VERSION` does not have to move.
-    diversity = cell.get('path_diversity') or DEFAULT_PATH_DIVERSITY
-    if diversity != DEFAULT_PATH_DIVERSITY:
-        identity['path_diversity'] = diversity
-    receivers = cell.get('receivers') or DEFAULT_RECEIVERS
-    if receivers != DEFAULT_RECEIVERS:
-        identity['receivers'] = receivers
-    # Both keys or neither, and only away from the default: a burst count with
-    # no block is not a workload, so recording one on a cell that churns
-    # nothing would put a key in the id that says nothing about what ran.
-    churn_prefixes = cell.get('churn_prefixes') or DEFAULT_CHURN_PREFIXES
-    if churn_prefixes != DEFAULT_CHURN_PREFIXES:
-        identity['churn_prefixes'] = churn_prefixes
-        identity['churn_bursts'] = (cell.get('churn_bursts')
-                                    or DEFAULT_CHURN_BURSTS)
-    reload_blocks = (cell.get('policy_reload_blocks')
-                     or DEFAULT_POLICY_RELOAD_BLOCKS)
-    if reload_blocks != DEFAULT_POLICY_RELOAD_BLOCKS:
-        identity['policy_reload_blocks'] = reload_blocks
-    return json.dumps(identity, sort_keys=True, separators=(',', ':'), default=str)
+    resumable = []
+    recorded = {}
+    for test, targets, cells, order, seed in expanded:
+        name = test['name']
+        legacy = results_path(results_dir, f"{name}.progress.json")
+        if os.path.exists(legacy):
+            sys.exit("test '{0}': {1} was written by an older bgperf2, whose rows this "
+                     'version does not read. Resume it with that version, or measure '
+                     'into a new --results-dir'.format(name, legacy))
+        listed = {batch_cell_id(name, cell) for cell in cells}
+        completed = load_batch_cell_results(results_dir, name)
+        foreign = set(completed) - listed
+        if foreign:
+            sys.exit("test '{0}': {1} holds {2} result(s) for cells this config does "
+                     'not list (an edited axis, target, monitor or repetition count '
+                     'changes cell ids). Use a new --results-dir to measure the edited '
+                     'config'.format(name, batch_cell_results_dir(results_dir, name),
+                                     len(foreign)))
+        stored = load_batch_cell_sequences(results_dir, name)
+        # A result written before sequences were stored names none; it is
+        # unknown, not evidence of matrix order.
+        sequences = {(s.get('order'), s.get('seed')) for s in stored if s}
+        unknown = len(stored) - sum(1 for s in stored if s)
+        if completed and order == 'shuffle' and test.get('seed') is None:
+            # A drawn seed: continue the one the recorded cells ran under.
+            drawn = {s for o, s in sequences if o == 'shuffle'}
+            if unknown or len(sequences) != 1 or len(drawn) != 1:
+                sys.exit("test '{0}': its recorded cells do not name one shuffle "
+                         'seed to continue; state `seed:` to choose the '
+                         'sequence'.format(name))
+            seed = drawn.pop()
+            print("test '{0}': resuming shuffle seed {1}".format(name, seed))
+        elif completed and sequences - {(order, seed)}:
+            ran = ', '.join(sorted(describe_batch_sequence(o, s)
+                                   for o, s in sequences - {(order, seed)}))
+            sys.exit("test '{0}': recorded cells ran under {1}, and this config "
+                     'runs {2}. Restore it, or measure into a new '
+                     '--results-dir'.format(name, ran,
+                                            describe_batch_sequence(order, seed)))
+        resumable.append((test, targets, cells, order, seed))
+        recorded[name] = completed
+    return resumable, recorded
+
+
+def batch_cell_args(args, cell, scenarios=None):
+    """The `bench` arguments for one batch cell, built from the cell alone.
+
+    A `file:` scenario already rendered into `scenarios` is passed as a private
+    copy, so the template is not executed again for the cell.
+    """
+    t = cell['target']
+    a = argparse.Namespace(**vars(args))
+    a.func = bench
+    if 'image' in t:
+        a.image = t['image']
+    else:
+        a.image = None
+    a.output = None
+    a.target = t['name']
+    a.prefix_num = cell['prefixes']
+    a.neighbor_num = cell['neighbors']
+    # Already per-peer: `expand_batch_cells()` applied the test's
+    # `prefix_scope` when it built the cell, because the cell identity,
+    # the CSV row and the artifact names all have to be the per-peer
+    # count. Passing the scope through as well would divide twice.
+    a.prefix_scope = 'per-peer'
+    # From the cell, not from the test: the cell is what the id, the
+    # row and the artifact names were built from, and reading the test
+    # again here would let a config edited mid-batch run a cell under a
+    # diversity its own id does not record.
+    a.path_diversity = cell.get('path_diversity') or DEFAULT_PATH_DIVERSITY
+    a.receivers = cell.get('receivers') or DEFAULT_RECEIVERS
+    # From the cell for the same reason the two above are: the cell is
+    # what the id, the row and the artifact names were built from.
+    a.churn_prefixes = cell.get('churn_prefixes') or DEFAULT_CHURN_PREFIXES
+    a.churn_bursts = cell.get('churn_bursts') or DEFAULT_CHURN_BURSTS
+    a.policy_reload_blocks = (cell.get('policy_reload_blocks')
+                              or DEFAULT_POLICY_RELOAD_BLOCKS)
+    a.pin = cell.get('pin')
+    # Read directly: `expand_batch_cells()` always sets it, from the
+    # same reading of the test that `check_batch_monitor_images()`
+    # checked the image for. A fallback here would be a second reading
+    # of an absent key that could disagree with that check.
+    a.monitor = cell['monitor']
+    a.filter_test = cell['filter'] if cell['filter'] != 'None' else None
+    # None for a single-pass test, so its rows, graphs and event
+    # artifacts keep the names they have always had; set for every pass
+    # of a repeated one, including the first, because a run named
+    # `bird 2.19.2` sitting beside `bird 2.19.2 #2` reads as a
+    # different thing rather than as the first of three.
+    a.repetition = cell['repetition']
+    a.defer_graphs = bool(cell.get('defer_graphs'))
+    # read any config attribute that was specified in the yaml batch file
+    a.local_address_prefix = t['local_address_prefix'] if 'local_address_prefix' in t else '10.10.0.0/16'
+    # Refused by `check_batch_test()` when true, so it is never copied.
+    a.single_table = False
+    for field in ['docker_network_name', 'repeat', 'file', 'target_local_address',
+                    'label', 'target_local_address', 'monitor_local_address', 'target_router_id',
+                    'monitor_router_id', 'target_config_file', 'filter_type','mrt_injector', 'mrt_file',
+                    'tester_type', 'license_file', 'version', 'monitor_version', 'threads',
+                    'tester_trace_io', 'mrt_spec', 'mrt_spec_sha256', 'generator_image', 'observer_image']:
+        # Keyed on the value, not on the key being present: a target
+        # written `tester_type:` with nothing after it parses as None,
+        # which is the very slip the default exists to catch, and a
+        # presence test skips the default for exactly that case.
+        value = t.get(field)
+        setattr(a, field,
+                batch_target_defaults(t).get(field) if value is None
+                else value)
+
+    for field in ['as_path_list_num', 'prefix_list_num', 'community_list_num', 'ext_community_list_num']:
+        setattr(a, field, t[field]) if field in t else setattr(a, field, 0)
+    if scenarios and a.file in scenarios:
+        copy_start = time.monotonic()
+        a._batch_scenario = deepcopy(scenarios[a.file])
+        a._batch_scenario_copy_s = time.monotonic() - copy_start
+    return a
+
+
+def print_batch_report(test_name, results, summary_path, cells, completed,
+                       repetitions):
+    print()
+    print(stats_header())
+    for stat in results:
+        print(','.join(map(str, stat)))
+
+    # Every pass's row is above; this says what they do and do not agree
+    # about. The rows are never replaced by it -- a summary that hid the
+    # observations behind it would be a number nobody could check. A
+    # single-pass test with nothing to report prints nothing at all.
+    summary_lines = publish_batch_summary(summary_path, test_name, cells,
+                                          completed, repetitions)
+    if summary_lines:
+        print()
+        for line in summary_lines:
+            print(line)
+
+
+def list_batch_cells(expanded):
+    """Print every test's cells, in the order a batch would run them, as JSON.
+
+    Each cell carries its `key`, the short name `--cells` accepts, beside its
+    full id. A shuffled test must state `seed:`: a drawn one would list an
+    order that neither a later listing nor `--resume` follows.
+    """
+    for test, _targets, _cells, order, _seed in expanded:
+        if order == 'shuffle' and test.get('seed') is None:
+            sys.exit("test '{0}': --list-cells needs `seed:` under order: shuffle; "
+                     'a drawn seed would list an order no later invocation '
+                     'reproduces'.format(test['name']))
+    document = {'tests': []}
+    for test, _targets, cells, order, seed in expanded:
+        repetitions = batch_repetitions(test)
+        listed = []
+        for cell in order_batch_cells(test['name'], cells, order, seed):
+            cell_id = batch_cell_id(test['name'], cell)
+            listed.append({'key': batch_cell_key(cell_id),
+                           'id': cell_id,
+                           'description': batch_cell_description(cell, repetitions),
+                           'ordinal': cell['ordinal'],
+                           'repetition': cell['repetition']})
+        document['tests'].append({'name': test['name'], 'order': order,
+                                  'seed': seed, 'repetitions': repetitions,
+                                  'cells': listed})
+    print(json.dumps(document, indent=2, sort_keys=True))
+
+
+def run_selected_batch_cells(args, expanded, scenarios=None):
+    """Run only the cells named by `--cells`, in the order they were named.
+
+    Every key is resolved before any container starts, so a typo costs nothing.
+    The caller chose which cells to run, so deciding what is left is the
+    caller's. Each cell writes its result document, and every test touched is
+    then reported from all the results its directory holds -- unless
+    `--no-report` leaves that to a later `--report`.
+    """
+    index = {}
+    sequences = {}
+    for test, _targets, cells, order, seed in expanded:
+        if order == 'shuffle' and test.get('seed') is None:
+            sys.exit("test '{0}': --cells needs `seed:` under order: shuffle; a drawn "
+                     'seed would be recorded for an order no invocation '
+                     'follows'.format(test['name']))
+        sequences[test['name']] = (order, seed)
+        for cell in cells:
+            index[batch_cell_key(batch_cell_id(test['name'], cell))] = (test, cell)
+    unknown = [key for key in args.cells if key not in index]
+    if unknown:
+        sys.exit('--cells: no cell in {0} has key(s) {1}; `batch --list-cells` '
+                 'prints them'.format(args.batch_config, ', '.join(unknown)))
+    repeated = sorted({key for key in args.cells if args.cells.count(key) > 1})
+    if repeated:
+        sys.exit('--cells: key(s) named more than once: {0}'.format(', '.join(repeated)))
+    selected = [index[key] for key in args.cells]
+    # A recorded result is an observation, and running its cell again would
+    # replace it without a trace. Re-measuring is a decision to say out loud:
+    # remove the document first.
+    recorded = [os.path.join(batch_cell_results_dir(args.results_dir, test['name']),
+                             key + '.json')
+                for key, (test, _cell) in zip(args.cells, selected)]
+    recorded = [path for path in recorded if os.path.exists(path)]
+    if recorded:
+        sys.exit('--cells: already recorded, remove to measure again: {0}'.format(
+            ', '.join(recorded)))
+    tests = list({id(test): test for test, _cell in selected}.values())
+    check_batch_images([cell['target'] for _test, cell in selected])
+    check_batch_monitor_images(tests)
+    check_batch_pin_and_repeat(tests)
+    for test, cell in selected:
+        repetitions = batch_repetitions(test)
+        if stop_signal.is_set():
+            print('\nstopping before {0}: {1}'.format(
+                batch_cell_description(cell, repetitions), stop_signal.reason))
+            raise StopRequested(stop_signal.reason)
+        cell_id = batch_cell_id(test['name'], cell)
+        order, seed = sequences[test['name']]
+        selected_args=batch_cell_args(args,cell,scenarios)
+        selected_args.native_cell_id=cell_id
+        row = bench(selected_args)
+        write_batch_cell_result(args.results_dir, test['name'], cell_id, row,
+                                order=order, seed=seed)
+        if getattr(args, 'stop_on_failure', False) and row_failed(row):
+            raise StopRequested('Recorded failed batch cell; --stop-on-failure')
+    if getattr(args, 'no_report', False):
+        return
+    touched = {test['name'] for test, _cell in selected}
+    report_batch_from_cell_results(
+        [entry for entry in expanded if entry[0]['name'] in touched],
+        args.results_dir, getattr(args,'defer_graphs',False))
+
+
+def report_batch_from_cell_results(expanded, results_dir, defer_graphs=False):
+    """Rebuild each test's CSV, summary and graphs from its cell results.
+
+    Missing cells are named, never filled. The summary already tells a pass
+    that has not run from one that failed; the graphs are skipped while any
+    cell is missing, since `create_graph()` pairs bar heights with labels by
+    position within each group and a group short of a target would put bars
+    under the wrong names.
+    """
+    for test, _targets, cells, _order, _seed in expanded:
+        name = test['name']
+        repetitions = batch_repetitions(test)
+        completed = load_batch_cell_results(results_dir, name)
+        missing = [cell for cell in cells
+                   if batch_cell_id(name, cell) not in completed]
+        if len(missing) == len(cells):
+            print("test '{0}': no cell results in {1}; nothing reported".format(
+                name, batch_cell_results_dir(results_dir, name)))
+            continue
+        results = batch_report_rows(name, cells, completed)
+        write_batch_csv(results_path(results_dir, f"{name}.csv"), results)
+        summary_path = results_path(results_dir, f"{name}.summary.json")
+        print_batch_report(name, results, summary_path, cells, completed,
+                           repetitions)
+        if missing:
+            print()
+            print("test '{0}': {1} of {2} cell(s) have no result; graphs not "
+                  'drawn:'.format(name, len(missing), len(cells)))
+            for cell in missing:
+                print('  missing: {0}'.format(
+                    batch_cell_description(cell, repetitions)))
+            stale = [path for path in batch_graph_paths(name, results_dir)
+                     if os.path.exists(path)]
+            if stale:
+                print('  graphs already in {0} were drawn from other rows and '
+                      'are not updated'.format(results_dir))
+            continue
+        if not defer_graphs:
+            create_batch_graphs(results, name, results_dir=results_dir)
+
+
+BATCH_CELL_RESULT_SCHEMA_VERSION = 1
+
+
+def batch_cell_results_dir(results_dir, test_name):
+    return results_path(results_dir, f"{test_name}.cells")
+
+
+def write_batch_cell_result(results_dir, test_name, cell_id, row, order=None,
+                            seed=None):
+    """Record one cell's row in its own document, atomically.
+
+    This is the durable record a report is built from, whichever invocation
+    ran the cell. The full id is stored inside, so the file name is only an
+    index and a renamed or misplaced file is caught on reading. The sequence
+    the cell ran under is stored too, so a drawn seed is never lost.
+    """
+    directory = batch_cell_results_dir(results_dir, test_name)
+    os.makedirs(directory, exist_ok=True)
+    document = {'schema_version': BATCH_CELL_RESULT_SCHEMA_VERSION,
+                'cell_id': cell_id, 'row': row}
+    if order is not None:
+        document['sequence'] = {'order': order, 'seed': seed}
+
+    atomic_write_json(os.path.join(directory, batch_cell_key(cell_id) + '.json'),
+                      document)
+
+
+def load_batch_cell_results(results_dir, test_name):
+    """Every recorded cell of one test, as {cell id: row}.
+
+    A document whose schema, shape or name does not match is refused rather
+    than skipped: a report quietly missing a row it was given reads as a cell
+    that never ran.
+    """
+    directory = batch_cell_results_dir(results_dir, test_name)
+    completed = {}
+    for path in sorted(glob.glob(os.path.join(directory, '*.json'))):
+        with open(path, 'r') as f:
+            document = json.load(f)
+        if not isinstance(document, dict):
+            raise ValueError('unsupported or malformed batch cell result: {0}'.format(path))
+        cell_id = document.get('cell_id')
+        if (document.get('schema_version') != BATCH_CELL_RESULT_SCHEMA_VERSION
+                or not isinstance(cell_id, str) or 'row' not in document
+                or os.path.basename(path) != batch_cell_key(cell_id) + '.json'):
+            raise ValueError('unsupported or malformed batch cell result: {0}'.format(path))
+        completed[cell_id] = document['row']
+    return completed
+
+
+def load_batch_cell_sequences(results_dir, test_name):
+    """The sequence each recorded cell ran under; `{}` for one that names none."""
+    directory = batch_cell_results_dir(results_dir, test_name)
+    sequences = []
+    for path in sorted(glob.glob(os.path.join(directory, '*.json'))):
+        with open(path, 'r') as f:
+            document = json.load(f)
+        sequences.append(document.get('sequence') or {})
+    return sequences
+
+
+def clear_batch_cell_results(results_dir, test_name):
+    """Remove one test's recorded cell results; return how many there were."""
+    directory = batch_cell_results_dir(results_dir, test_name)
+    results = glob.glob(os.path.join(directory, '*.json'))
+    for path in results + glob.glob(os.path.join(directory, '*.tmp')):
+        os.unlink(path)
+    return len(results)
 
 
 def batch_cell_description(cell, repetitions=1):
@@ -6330,36 +5701,15 @@ def batch_cell_description(cell, repetitions=1):
     if reload_blocks != DEFAULT_POLICY_RELOAD_BLOCKS:
         described = '{0}, policy reload={1} block(s)'.format(
             described, reload_blocks)
+    if cell.get('pin'):
+        described = '{0}, pin={1}'.format(described, cell['pin'])
+    monitor = cell_monitor(cell)
+    if monitor != UNMARKED_MONITOR:
+        described = '{0}, monitor={1}'.format(described, monitor)
     if repetitions > 1:
         described = '{0}, repetition {1}/{2}'.format(
             described, cell['repetition'], repetitions)
     return described
-
-
-# Unchanged by repetitions: a single-pass cell id has the shape it always had,
-# so a file written by an older build still resumes rather than costing the
-# operator every completed cell.
-BATCH_PROGRESS_SCHEMA_VERSION = 1
-
-
-def load_batch_progress_document(path):
-    """The whole progress file: the completed cells, and how they were sequenced.
-
-    The sequencing keys are optional, so a file written before ordering existed
-    still loads at the same schema version and resumes as it always did.
-    """
-    if not os.path.exists(path):
-        return {'cells': {}}
-    with open(path, 'r') as f:
-        document = json.load(f)
-    if (document.get('schema_version') != BATCH_PROGRESS_SCHEMA_VERSION
-            or not isinstance(document.get('cells'), dict)):
-        raise ValueError('unsupported or malformed batch progress file: {0}'.format(path))
-    return document
-
-
-def load_batch_progress(path):
-    return load_batch_progress_document(path)['cells']
 
 
 def fsync_directory(path):
@@ -6367,8 +5717,8 @@ def fsync_directory(path):
 
     `os.replace()` orders the rename against the data already fsynced into the
     temp file, so a reader never sees a half-written document. It does not make
-    the *directory entry* durable: on a hard termination -- an EC2 spot
-    instance being terminated is one -- the entry can still point at the old
+    the *directory entry* durable: on a hard termination -- a host being shut
+    down is one -- the entry can still point at the old
     file, or at neither. One `fsync` on the containing directory closes that,
     and it is the whole difference between a checkpoint and a document that
     was probably written.
@@ -6410,20 +5760,22 @@ def sweep_stale_temp_files(directory):
     never reaches -- so a hard termination leaves one behind, and nothing
     removed it. Harmless in itself (nothing reads them, and the next write to
     the same document truncates), but it is the visible trace of an interrupted
-    checkpoint, and a resumed batch that carries one looks exactly as clean as
-    one that was never interrupted.
+    write, and a resumed batch that carries one looks exactly as clean as one
+    that was never interrupted.
 
     Returns what it removed, so a resumed run can *say* it was interrupted
     rather than quietly tidying the evidence away. Best-effort: a file that
     vanishes underneath this, or a directory that cannot be listed, is not
     worth failing a run for.
 
-    Only `<results>/*.tmp` -- not recursive, and never a bench work directory,
-    whose files belong to containers that may still be running.
+    Only `<results>/*.tmp` and `<results>/<test>.cells/*.tmp` -- never a
+    bench work directory, whose files belong to containers that may still be
+    running.
     """
     swept = []
     try:
-        names = sorted(glob.glob(os.path.join(directory, '*.tmp')))
+        names = sorted(glob.glob(os.path.join(directory, '*.tmp'))
+                       + glob.glob(os.path.join(directory, '*.cells', '*.tmp')))
     except OSError:
         return swept
     for name in names:
@@ -6431,26 +5783,11 @@ def sweep_stale_temp_files(directory):
             os.unlink(name)
         except OSError:
             continue
-        swept.append(os.path.basename(name))
+        swept.append(os.path.relpath(name, directory))
     return swept
 
 
-def write_batch_progress(path, completed, order=None, seed=None, previous_seeds=None):
-    document = {'schema_version': BATCH_PROGRESS_SCHEMA_VERSION, 'cells': completed}
-    if order is not None:
-        document['order'] = order
-    if previous_seeds:
-        # Sequences some of these rows ran under before the config was edited.
-        # Kept because the file is rewritten whole on every checkpoint, so
-        # anything not carried forward is gone.
-        document['previous_seeds'] = previous_seeds
-    if seed is not None:
-        # The one durable record of the sequence a batch ran in. It is written
-        # before the first cell, not after it: a seed that only appeared once a
-        # cell had finished would be missing from exactly the runs that died
-        # early, and a resumed batch would draw a new one.
-        document['seed'] = seed
-
+def atomic_write_json(path, document):
     def write(f):
         json.dump(document, f, indent=2, sort_keys=True)
         f.write('\n')
@@ -6464,10 +5801,9 @@ def write_batch_csv(path, results):
             f.write(','.join(map(str, stat)) + '\n')
     atomic_write(path, write)
 
-def create_batch_graphs(results, name, results_dir=DEFAULT_RESULTS_DIR):
-    # stat_index values are positions in the row built by create_output_stats();
-    # changing that row's layout silently mislabels every graph below.
-    for test_name, stat_index, suffix, ylabel in [
+# stat_index values are positions in the row built by create_output_stats();
+# changing that row's layout silently mislabels every graph below.
+BATCH_GRAPHS = [
         ('total time', 11, 'total_time', 'seconds'),
         ('elapsed', 8, 'elapsed', 'seconds'),
         # index 7 is monitor_wait_time -- the wait for the monitor's session to
@@ -6481,7 +5817,16 @@ def create_batch_graphs(results, name, results_dir=DEFAULT_RESULTS_DIR):
         ('min free mem', 15, 'min_free', 'GB'),
         ('tester errors', 20, 'tester_error', 'errors'),
         ('prefixes at monitor', 6, 'monitor_prefixes', 'seconds'),
-    ]:
+]
+
+
+def batch_graph_paths(name, results_dir=DEFAULT_RESULTS_DIR):
+    return [os.path.join(results_dir or DEFAULT_RESULTS_DIR, f"bgperf_{name}_{suffix}.png")
+            for _test_name, _stat_index, suffix, _ylabel in BATCH_GRAPHS]
+
+
+def create_batch_graphs(results, name, results_dir=DEFAULT_RESULTS_DIR):
+    for test_name, stat_index, suffix, ylabel in BATCH_GRAPHS:
         create_graph(results, test_name=test_name, stat_index=stat_index,
                      test_file=f"bgperf_{name}_{suffix}.png", ylabel=ylabel,
                      results_dir=results_dir)
@@ -6580,18 +5925,13 @@ def gen_conf(args):
                                                         diversity)],
     }
 
-    mrt_injector = None
-    if tester_type == 'gobgp' or tester_type == 'bgpdump2':
-        mrt_injector = tester_type
-        
+    mrt_injector = tester_type if tester_type in MRT_TESTER_TYPES else None
 
     if mrt_injector:
         conf['monitor']['check-points'] = [prefix]
 
-    if mrt_injector == 'gobgp': #gobgp doesn't send everything with mrt
-        conf['monitor']['check-points'][0] = int(conf['monitor']['check-points'][0] * 0.93)
-    else: #args.target == 'bird': # bird seems to reject severalhandfuls of routes
-        conf['monitor']['check-points'][0] = int(conf['monitor']['check-points'][0] * 0.99)
+    # bird seems to reject several handfuls of routes
+    conf['monitor']['check-points'][0] = int(conf['monitor']['check-points'][0] * 0.99)
 
     it = netaddr.iter_iprange('90.0.0.0', '100.0.0.0')
 
@@ -6786,7 +6126,25 @@ def check_generator_matches_workload(args):
             '--mrt-file was given'.format(tester))
 
 
+def check_target_workload(args):
+    """Reject unsupported adapter controls before config writes or teardown."""
+    target = getattr(args, 'target', None)
+    # The fork's rustbgpd adapter is not listed: it accepts scenario
+    # files and refuses policy itself (RustBGPdTarget.reject_unsupported_policy()).
+    if target not in ('holo', 'zebra-rs', 'bio-routing', 'maghemite'):
+        return
+    if (getattr(args, 'filter_test', None) not in (None, 'None')
+            or getattr(args, 'threads', None) is not None
+            or any(getattr(args, field, 0) not in (None, 0) for field in (
+                'as_path_list_num', 'prefix_list_num', 'community_list_num', 'ext_community_list_num'))
+            or getattr(args, 'file', None)
+            or getattr(args, 'target_config_file', None)):
+        sys.exit(f'{target} supports permit-all IPv4 loading without filters, '
+                 'thread overrides or custom configuration/scenario files')
+
+
 def config(args):
+    check_target_workload(args)
     try:
         refuse_single_table(getattr(args, 'single_table', False),
                             '-s/--single-table')
@@ -7042,13 +6400,39 @@ def create_args_parser(main=True):
                                    'Only a target with a reload mechanism can '
                                    'do this, and not with an MRT generator, a '
                                    'policy filter or a churn workload')
+    # On `bench` only, for the reason `--policy-reload-blocks` is: a cpuset is
+    # a property of the containers, not of the scenario, so `config` would
+    # print a file that reads as though it encoded the layout.
+    parser_bench.add_argument('--pin', metavar='ROLE=CPUS[,ROLE=CPUS...]',
+                              help='confine each role to its own cores, e.g. '
+                                   'target=0-7,monitor=8-9,testers=10-15 '
+                                   '(add receivers=... when --receivers is '
+                                   'set). Every role the run has must be '
+                                   'named and the sets must not overlap, or '
+                                   'an unnamed role would run on the pinned '
+                                   'cores. Default: unpinned, every role on '
+                                   'every core. Not with -r/--repeat or a '
+                                   'remote target')
+    # On `bench` only, for the reason `--pin` is: the monitor is a container,
+    # not part of the scenario, so `config` would print a file that reads as
+    # though it encoded the instrument.
+    parser_bench.add_argument('--monitor', choices=MONITOR_TYPES,
+                              default=DEFAULT_MONITOR,
+                              help='the instrument the run is measured with: '
+                                   'gobgp, polled once a second, or sink, the '
+                                   'purpose-built counter that writes its own '
+                                   'timestamped count (measurement plan Phase '
+                                   '7). Default: %(default)s')
     parser_bench.add_argument('-f', '--file', metavar='CONFIG_FILE')
     parser_bench.add_argument('-o', '--output', metavar='STAT_FILE')
     parser_bench.add_argument('--results-dir', default=DEFAULT_RESULTS_DIR,
                               help='directory for generated graphs and CSVs; '
                                    'default: {}'.format(DEFAULT_RESULTS_DIR))
     add_gen_conf_args(parser_bench)
-    parser_bench.set_defaults(func=bench)
+    parser_bench.add_argument('--defer-graphs',action='store_true',help='Save bench graph inputs and defer rendering')
+    for name in ('mrt-spec', 'mrt-spec-sha256', 'generator-image', 'observer-image', 'control-dir'):
+        parser_bench.add_argument('--'+name, help='Explicit native fixed-input MRT performance binding/control')
+    parser_bench.set_defaults(func=bench_command)
 
     parser_config = s.add_parser('config', help='generate config')
     parser_config.add_argument('-o', '--output', default='bgperf.yml', type=str)
@@ -7071,9 +6455,39 @@ def create_args_parser(main=True):
     parser_batch.add_argument('--results-dir', default=DEFAULT_RESULTS_DIR,
                               help='directory for generated graphs and CSVs; '
                                    'default: {}'.format(DEFAULT_RESULTS_DIR))
-    parser_batch.add_argument('--resume', action='store_true',
-                              help='resume a partial batch by skipping cells with durable results')
+    batch_mode = parser_batch.add_mutually_exclusive_group()
+    batch_mode.add_argument('--preflight',action='store_true',help='Verify all native role images, exact inputs and workload bindings without starting workers')
+    batch_mode.add_argument('--resume', action='store_true',
+                            help='skip every cell that already has a result in --results-dir; '
+                                 'a shuffled test must state seed:')
+    batch_mode.add_argument('--list-cells', action='store_true',
+                            help='print every cell, in run order, with the key --cells accepts, '
+                                 'as JSON; runs nothing and needs no Docker')
+    batch_mode.add_argument('--cells', nargs='+', metavar='KEY',
+                            help='run only these cells, in this order, then report from every '
+                                 'cell result in --results-dir')
+    parser_batch.add_argument('--no-report', action='store_true',
+                              help='with --cells: record the cells only; build the report '
+                                   'later with --report')
+    batch_mode.add_argument('--report', action='store_true',
+                            help='rebuild the CSV, summary and graphs from the cell results '
+                                 'in --results-dir; runs nothing')
+    parser_batch.add_argument('--defer-graphs', action='store_true', help='Save complete bench plot inputs; render graphs offline after measurement')
+    parser_batch.add_argument('--control-dir', help='Existing absolute directory for external native-cell admission/replay control')
+    parser_batch.add_argument('--stop-on-failure', action='store_true', help='Stop after a recorded failed cell; never retry')
+    parser_batch.add_argument('--operational-policy-sha256', help='Bind managed durable attempts to the selected host policy')
+    parser_batch.add_argument('--recover', action='store_true', help='Recover retained durable attempts without starting measurements')
+    parser_batch.add_argument('--maximum-originals', type=int, help='Durable invocation fresh-original ceiling')
+    parser_batch.add_argument('--timeout-seconds', type=int, help='Durable invocation time ceiling checked between originals')
+    parser_batch.add_argument('--durable', action='store_true', help='Run one durable native batch with explicit interruption recovery')
+    parser_batch.add_argument('--calibrate', action='store_true', help='Durable batch: separate calibration before each configuration/workload')
+    parser_batch.add_argument('--status', dest='batch_status', action='store_true', help='Inspect saved durable batch state without running')
     parser_batch.set_defaults(func=batch)
+
+    render_parser=s.add_parser('render-bench',help='Render saved bench graph data without Docker')
+    render_parser.add_argument('--input',required=True)
+    render_parser.add_argument('--results-dir',required=True)
+    render_parser.set_defaults(func=lambda args: __import__('deferred_graphs').render(sys.modules[__name__],args))
 
     return parser
 
@@ -7096,11 +6510,10 @@ if __name__ == '__main__':
     try:
         args.func(args)
     except StopRequested as e:
-        # An orderly stop, not a crash: a spot reclaim or a SIGTERM asked for
-        # it, everything already checkpointed is on disk, and re-invoking the
-        # identical command resumes. Exit 143 -- 128 + SIGTERM -- so a shell
-        # driver can tell "the host was taken away" from "the run failed",
-        # which a 0 would hide and a 1 would misattribute to the benchmark.
+        # An orderly stop, not a crash: a SIGTERM asked for it, and every cell
+        # result already written is on disk. Exit 143 -- 128 + SIGTERM -- so a
+        # caller can tell "stopped" from "failed", which a 0 would hide and a
+        # 1 would misattribute to the benchmark.
         print('stopped: {0}'.format(e.reason))
         sys.exit(143)
     except (ImageNotBuilt, VersionNotSupported, ImageBuildFailed) as e:

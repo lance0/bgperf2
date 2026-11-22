@@ -56,6 +56,8 @@ class TestResolveRef:
 
     @pytest.mark.parametrize('version,ref', [
         ('2026-02', '0cc685c'),   # date labels map onto the commit they name
+        ('2026-08', '9eeeebbd50'),
+        ('2026-09', '783d6dfd00'),
         ('master', 'master'),     # raw refs still pass through
         ('16cc827', '16cc827'),
     ])
@@ -81,6 +83,16 @@ class TestResolveRef:
         assert (RustyBGP.build_vars(spelling)['gobgp_version']
                 == RustyBGP.build_vars('2026-02')['gobgp_version'])
 
+    @pytest.mark.parametrize('spelling', ['2026-08', '9eeeebbd50',
+                                          '2026-09', '783d6dfd00'])
+    def test_rustybgp_2026_08_keeps_the_default_recipe(self, spelling):
+        '''9eeeebbd50 was built by the default recipe (master on 2026-08-21),
+        which serves the v4.7 API the default CLI speaks. 783d6dfd00 changes
+        nothing under api/ since, so it keeps that recipe too.
+        '''
+        assert (RustyBGP.build_vars(spelling)['gobgp_version']
+                == RustyBGP.BUILD_VARS['gobgp_version'])
+
     @pytest.mark.parametrize('spelling', ['master', '0', '16cc827', ''])
     def test_rustybgp_other_refs_keep_the_default_recipe(self, spelling):
         '''A too-short or unrelated ref must not claim the pinned commit.'''
@@ -92,7 +104,7 @@ class TestResolveRef:
         startup with "GLIBC_2.xx not found" -- a bench that will not come up
         rather than a build error.
         '''
-        for v in (None, '2026-02'):
+        for v in (None, '2026-02', '2026-08', '2026-09'):
             build = RustyBGP.build_vars(v)
             assert build['base_image'].endswith('-bookworm')
             assert build['runtime_image'] == 'debian:bookworm'
@@ -122,7 +134,7 @@ class TestOpenBGP:
         '''
         assert OpenBGP.pulls_base(OpenBGP.image_tag()) is True
 
-    @pytest.mark.parametrize('version', ['8.8', '9.2'])
+    @pytest.mark.parametrize('version', ['8.8', '9.2', '9.3'])
     def test_pinned_versions_are_not_re_pulled(self, version):
         '''`FROM openbgpd/openbgpd:9.2` is immutable, so a pull cannot find
         anything new -- and it is fatal when the registry is unreachable even
@@ -562,6 +574,30 @@ class TestRecipeDrift:
 
         Dummy.build_dockerfile(dockerfile, force=False, tag='bgperf/x:latest')
         assert captured['labels'] == {base.RECIPE_LABEL_KEY: base.recipe_hash(dockerfile)}
+
+    def test_the_proxy_reaches_every_build_stage(self, monkeypatch):
+        """A multi-stage recipe fetches in its build stage, and each stage
+        starts with a clean environment: splicing the proxy after only the
+        last FROM left `go mod download` in the sink's build stage without it.
+        """
+        captured = {}
+
+        def fake_build(fileobj, **kwargs):
+            captured['dockerfile'] = fileobj.read().decode('utf-8')
+            return iter([])
+
+        monkeypatch.setattr(base.dckr, 'build', fake_build)
+        monkeypatch.setattr(base, 'img_exists', lambda tag: False)
+        monkeypatch.setenv('http_proxy', 'http://proxy.example:3128')
+
+        class Dummy(base.Container):
+            pass
+
+        Dummy.build_dockerfile('FROM golang AS build\nRUN fetch\nFROM debian\nCOPY --from=build /x /x\n',
+                               force=False, tag='bgperf/x:latest')
+        lines = captured['dockerfile'].split('\n')
+        env = 'ENV http_proxy http://proxy.example:3128'
+        assert lines[:5] == ['FROM golang AS build', env, 'RUN fetch', 'FROM debian', env]
 
     def test_labels_are_withheld_below_the_api_version_that_supports_them(self, monkeypatch):
         '''docker-py raises InvalidVersion for `labels` below API 1.23

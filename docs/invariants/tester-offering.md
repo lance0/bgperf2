@@ -2,7 +2,7 @@
 
 Tester offering polls, the fleet summary, and what a bgpdump2 injector reports about itself.
 
-**Read this before editing:** `bgperf2.py` (the offering poll), `base.py` (`Tester.offering_stats()`), `tester.py`, `mrt_tester.py`, `measurements.py` (`TesterOffering`, `TesterEventRecorder`, `tester_metrics()`, `tester_fleet_metrics()`), `bird.py`, `bgpdump2.py`, `exabgp.py`, `monitor.py` (`Monitor.stats()`'s cadence and the rule that
+**Read this before editing:** `run_lifecycle.py` (run orchestration), `bgperf2.py` (the offering poll), `base.py` (`Tester.offering_stats()`), `tester.py`, `mrt_tester.py`, `measurements.py` (`TesterOffering`, `TesterEventRecorder`, `tester_metrics()`, `tester_fleet_metrics()`), `bird.py`, `bgpdump2.py`, `exabgp.py`, `monitor.py` (`Monitor.stats()`'s cadence and the rule that
 both poll loops stamp the sample before the read)
 
 These are invariants, not background: every rule here was written because the obvious alternative was tried and published a wrong number quietly. `CLAUDE.md` carries the one-line index; this file carries the argument.
@@ -70,6 +70,14 @@ could not resolve it, not an instant first prefix. `convergence_confirmed`
 carries the resolution of the sample its verdict ruled on, not a gap to the
 moment it was stamped: assurance is a decision about a sample, not a fresh
 look.
+
+**Under `--monitor sink` the monitor's events are dated by the sink's log**, not by its
+poll (measurement plan 7b). Each event goes to the C line that showed the change, and its
+resolution is the gap from the line before. The before-the-read stamp rule above still
+governs the poll that *decides* each event, and the generator side is unchanged. The tail
+therefore runs from a poll-dated completion to a sink-dated crossing. The completion is
+late by up to a generator poll, so the tail leans negative by that much, and
+`post_injection_tail_resolution_s`, the wider of the two looks, still bounds it.
 
 **A span nothing crossed is not a rate of zero**, at either level. Each MRT
 injector's sub-millisecond walk is over before its own first poll, so a fleet
@@ -269,6 +277,22 @@ shorter than the 1.0s poll resolution; the generator measured its own send at
 0.001017s`.
 
 ## Tester health counts — a partial final line is not read
+
+New BIRD generators filter the existing `<RMT>` exclusions (`NEXT_HOP` and
+`Invalid route`) through a transient FIFO before writing their ordinary log.
+Other remote messages and every other selected severity remain enabled and are
+flushed immediately. The scanner still applies its exclusions to older logs.
+The FIFO is unlinked after BIRD opens it, leaving ordinary retained files; its
+reader and BIRD live inside the owned generator container and end at cleanup.
+GNU awk (already in BIRD images) preserves the original record terminator, so
+EOF does not turn an incomplete message into a complete scanner input. Its
+dedicated `bgperf-bird-log` process name attributes its CPU to the harness; other
+awk processes remain foreign. Filter CPU is included in generator cgroup usage.
+The finite FIFO can backpressure BIRD if the reader falls behind; that overhead
+is part of this fresh engine cohort and requires fresh sizing, not an assumed
+speedup. Startup failures also terminate a reader waiting for the FIFO to open.
+This changes logging overhead for fresh source identities, not acceptance or
+offering semantics. MRT generator logs are unchanged.
 
 `find_errors()` and `find_timeouts()` decide `tester_health`, and
 `check_timing_evidence.py` rejects a row on any nonzero count, so one line

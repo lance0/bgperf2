@@ -1,9 +1,16 @@
 venv/
+/.dev-checks/
 __pycache__/
 *.pyc
 
 # generated graphs and CSVs
 results/
+# and any archive of them: a tarball of results/ is the obvious backup, and a
+# `git add -A` would then stage binary that a later `git rm` cannot shrink out
+# of the pack.
+results*.tgz
+results*.tar.gz
+results*.tar.zst
 
 # MRT files downloaded by new_vm.sh, and out-of-band NOS images/licenses
 mrt/
@@ -13,19 +20,9 @@ nos/
 benchmarks/local/
 .pytest_cache/
 
-# Beads / Dolt files (added by bd init)
+# Retired Beads state is private recovery material, never source or evidence output.
+/.beads/
+/.retired-beads/
 .dolt/
 *.db
 .beads-credential-key
-.beads/proxieddb/
-# bd's issue database, its backups and its runtime append log. Kept here rather than in
-# .beads/.gitignore, which bd rewrites on drift -- an ignore rule inside a tool-managed file
-# is one the tool can take away, and what it would expose is the whole issue store.
-/.beads/embeddeddolt/
-/.beads/dolt/
-/.beads/proxieddb/
-/.beads/backup/
-/.beads/interactions.jsonl
-/.beads/*.db
-/.beads/.env
-/.beads/ephemeral.sqlite3*

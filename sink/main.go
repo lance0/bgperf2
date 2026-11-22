@@ -1,0 +1,215 @@
+// bgperf-sink is bgperf2's monitor: a BGP speaker that holds one session to
+// the target, counts the IPv4 unicast prefixes it is sent, and writes every
+// change to a timestamped log. It replaces a GoBGP monitor that was polled
+// once a second by `docker exec`; why, and what the change must preserve, is
+// Phase 7 of docs/bgperf2-measurement-implementation-plan.md and its entry in
+// the decision log.
+//
+// The source lives in bgperf2's repository and is embedded in the image recipe
+// (sink.py), so the recipe hash that marks an image stale covers this code too.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"math/rand"
+	"net"
+	"net/netip"
+	"os"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"time"
+)
+
+const sinkVersion = "0.4.0"
+
+// sourceHash is set at build time from the files compiled (see sink.py). An
+// image built some other way says so rather than reporting nothing.
+var sourceHash = "unknown"
+
+// Builds report whether they applied the source-bound dependency correction.
+var gobgpParserProfile = "unpatched"
+
+func gobgpVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, d := range info.Deps {
+			if d.Path == "github.com/osrg/gobgp/v4" {
+				return d.Version + "+" + gobgpParserProfile
+			}
+		}
+	}
+	return "unknown"
+}
+
+func versionString() string {
+	return fmt.Sprintf("bgperf-sink %s (src %s) gobgp/v4 %s %s",
+		sinkVersion, sourceHash, gobgpVersion(), runtime.Version())
+}
+
+func parseAS(s string) (uint32, error) {
+	v, err := strconv.ParseUint(s, 10, 32)
+	return uint32(v), err
+}
+
+func main() {
+	var (
+		localAS      = flag.String("local-as", "", "the sink's AS")
+		peerAS       = flag.String("peer-as", "", "the target's AS")
+		routerID     = flag.String("router-id", "", "the sink's BGP identifier")
+		localAddr    = flag.String("local-address", "", "address to listen on and connect from")
+		peerAddr     = flag.String("peer-address", "", "the target's address")
+		holdTime     = flag.Uint("hold-time", 90, "hold time to offer, seconds (GoBGP's default)")
+		connectRetry = flag.Duration("connect-retry", 10*time.Second, "outbound connect interval (the monitor's connect-retry)")
+		coalesce     = flag.Duration("coalesce", 10*time.Millisecond, "at most one count line per interval")
+		heartbeat    = flag.Duration("heartbeat", time.Second, "write a heartbeat after this long with nothing written")
+		logPath      = flag.String("log", "", "the event log to append to")
+		snapshotPath = flag.String("snapshot-socket", "", "optional local Unix socket for bounded accepted-prefix snapshots")
+		snapshotMax  = flag.Int("snapshot-max-prefixes", maxSnapshotPrefixes, "held/accepted snapshot prefix limit (1 to 5000000; requires snapshot socket)")
+		version      = flag.Bool("version", false, "print the version and exit")
+	)
+	flag.Parse()
+	if *version {
+		fmt.Println(versionString())
+		return
+	}
+
+	fail := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "bgperf-sink: "+format+"\n", args...)
+		os.Exit(2)
+	}
+	var cfg config
+	var err error
+	if cfg.localAS, err = parseAS(*localAS); err != nil || cfg.localAS == 0 {
+		fail("-local-as: %q", *localAS)
+	}
+	if cfg.peerAS, err = parseAS(*peerAS); err != nil || cfg.peerAS == 0 {
+		fail("-peer-as: %q", *peerAS)
+	}
+	for _, a := range []struct {
+		dst  *netip.Addr
+		src  string
+		name string
+	}{{&cfg.routerID, *routerID, "router-id"}, {&cfg.localAddr, *localAddr, "local-address"},
+		{&cfg.peerAddr, *peerAddr, "peer-address"}} {
+		if *a.dst, err = netip.ParseAddr(a.src); err != nil || !a.dst.Is4() {
+			fail("-%s: %q is not an IPv4 address", a.name, a.src)
+		}
+	}
+	if *holdTime > 0xffff || *holdTime == 1 || *holdTime == 2 {
+		fail("-hold-time: %d", *holdTime)
+	}
+	// A zero or negative coalesce interval panics the ticker; a zero
+	// connect-retry would redial with no pause and burn the instrument's CPU.
+	if *coalesce <= 0 || *heartbeat <= 0 || *connectRetry <= 0 {
+		fail("-coalesce, -heartbeat and -connect-retry must be positive")
+	}
+	if *logPath == "" {
+		fail("-log is required")
+	}
+	cfg.holdTime = uint16(*holdTime)
+	cfg.snapshotSocket = *snapshotPath
+	if err := validateSnapshotLimit(*snapshotPath, *snapshotMax); err != nil {
+		fail("%v", err)
+	}
+	cfg.snapshotMaxPrefixes = *snapshotMax
+	cfg.connectRetry, cfg.coalesce, cfg.heartbeat = *connectRetry, *coalesce, *heartbeat
+	if cfg.hostname, err = os.Hostname(); err != nil {
+		cfg.hostname = "bgperf-sink"
+	}
+
+	f, err := os.OpenFile(*logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		fail("%v", err)
+	}
+	s := &sink{cfg: cfg, log: newEventLog(f, monotonicNS)}
+	if cfg.snapshotSocket != "" {
+		ln, err := listenSnapshots(cfg.snapshotSocket)
+		if err != nil {
+			fail("snapshot socket: %v", err)
+		}
+		defer ln.Close()
+		go s.serveSnapshots(ln)
+	}
+	s.log.Line('V', logFormat, versionString())
+	s.log.Line('B', time.Now().UnixNano())
+
+	ln, err := net.Listen("tcp", netip.AddrPortFrom(cfg.localAddr, 179).String())
+	if err != nil {
+		fail("%v", err)
+	}
+	go s.accept(ln)
+	go s.connect()
+
+	t := time.NewTicker(cfg.coalesce)
+	defer t.Stop()
+	for range t.C {
+		s.log.Tick(cfg.heartbeat)
+		if err := s.log.Err(); err != nil {
+			// An instrument that cannot record is not measuring.
+			fail("writing %s: %v", *logPath, err)
+		}
+	}
+}
+
+func (s *sink) accept(ln net.Listener) {
+	for {
+		nc, err := ln.Accept()
+		if err != nil {
+			s.log.Line('S', "accept_failed", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		remote, _ := netip.ParseAddrPort(nc.RemoteAddr().String())
+		if remote.Addr().Unmap() != s.cfg.peerAddr {
+			s.log.Line('S', "rejected", nc.RemoteAddr().String())
+			nc.Close()
+			continue
+		}
+		go s.serve(nc, false)
+	}
+}
+
+// minConnectRetry is GoBGP's minConnectRetryInterval (pkg/server/fsm.go).
+const minConnectRetry = 2 * time.Second
+
+// connectDelay is how long GoBGP v4.9.0's connectLoop waits before an attempt:
+// 0.75 to 1.0 of a tick, where the first tick is minConnectRetry and every
+// later one the configured connect-retry, floored at the same minimum. r is
+// uniform in [0, 1).
+//
+// The schedule is copied rather than simplified because it decides when a
+// passive target's session comes up. BIRD's `neighbor range` never
+// initiates, so the monitor's dial is the only way in, and the monitor starts
+// before the target: an attempt at once is refused, and a sink that then
+// waited a whole connect-retry came up ~9 s after a GoBGP monitor that tried
+// again at ~2 s. `monitor (s)` is a published column.
+func connectDelay(attempt int, retry time.Duration, r float64) time.Duration {
+	tick := minConnectRetry
+	if attempt > 0 && retry > tick {
+		tick = retry
+	}
+	return time.Duration((0.75 + r*0.25) * float64(tick))
+}
+
+func (s *sink) connect() {
+	// GoBGP's dial timeout: connect-retry less a second, floored at the
+	// minimum interval.
+	timeout := s.cfg.connectRetry - time.Second
+	if timeout < minConnectRetry {
+		timeout = minConnectRetry
+	}
+	d := net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: s.cfg.localAddr.AsSlice()},
+		Timeout:   timeout,
+	}
+	target := netip.AddrPortFrom(s.cfg.peerAddr, 179).String()
+	for attempt := 0; ; attempt++ {
+		time.Sleep(connectDelay(attempt, s.cfg.connectRetry, rand.Float64()))
+		if !s.established() {
+			if nc, err := d.Dial("tcp", target); err == nil {
+				s.serve(nc, true)
+			}
+		}
+	}
+}

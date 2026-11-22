@@ -26,6 +26,8 @@ class TestVersionMatches:
         # ...and where it does not, the resolved ref does. RustyBGP files
         # builds under a date label but reports the commit.
         ('rustybgpd v0.2.0-0cc685c882', '2026-02', '0cc685c'),
+        ('rustybgpd v0.2.0-9eeeebbd50', '2026-08', '9eeeebbd50'),
+        ('rustybgpd v0.2.0-783d6dfd00', '2026-09', '783d6dfd00'),
     ])
     def test_a_matching_build_is_accepted(self, reported, version, ref):
         assert bgperf2.version_matches(reported, version, ref) is True
@@ -144,7 +146,7 @@ class TestProbeUsesTheClassBenchUses:
         MRO and correct when the daemon base was asked directly, so probing the
         base class would have missed it entirely.
         '''
-        for name in ('rustybgp', 'bird', 'gobgp', 'openbgp', 'frr_c'):
+        for name in ('rustybgp', 'bird', 'openbgp', 'frr_c'):
             assert name in bgperf2.TARGET_CLASSES
 
     def test_frr_declares_that_its_version_needs_a_daemon(self):
@@ -154,9 +156,14 @@ class TestProbeUsesTheClassBenchUses:
         '''
         assert bgperf2.TARGET_CLASSES['frr_c'].VERSION_NEEDS_DAEMON is True
 
-    @pytest.mark.parametrize('name', ['rustybgp', 'bird', 'gobgp', 'openbgp', 'frr_c'])
+    @pytest.mark.parametrize('name', ['rustybgp', 'bird', 'openbgp', 'frr_c'])
     def test_daemons_declare_the_binary_under_test(self, name):
         assert bgperf2.TARGET_CLASSES[name].DAEMON_BINARY
+
+    def test_the_monitor_declares_its_binary(self):
+        '''Every timing is read from the monitor, so an instrumented one
+        answers more slowly and that is published as the target's time.'''
+        assert bgperf2.MONITOR_CLASSES['gobgp'].DAEMON_BINARY
 
     def test_the_mrt_injector_declares_its_binary(self):
         '''The generator's build has to survive the same hygiene check as a
@@ -177,8 +184,35 @@ class TestProbeUsesTheClassBenchUses:
         assert issubclass(cls, bgperf2.BUILDABLE_IMAGES[name])
 
     def test_images_that_are_both_roles_are_probed_as_both(self):
-        '''bird and gobgp run as target and as load generator, and the two have
+        '''bird runs as target and as load generator, and the two have
         different MROs.
         '''
-        for name in ('bird', 'gobgp'):
-            assert bgperf2.TARGET_CLASSES[name] is not bgperf2.TESTER_CLASSES[name]
+        assert bgperf2.TARGET_CLASSES['bird'] is not bgperf2.TESTER_CLASSES['bird']
+
+    def test_gobgp_is_a_target_and_the_monitor_but_not_a_generator(self):
+        '''This fork keeps GoBGP as a benchmark target; upstream dropped it.
+        It is no longer an MRT generator. Its image serves the target, the
+        monitor and the receivers, and is probed through Monitor as well.'''
+        assert bgperf2.TARGET_CLASSES['gobgp'] is bgperf2.GoBGPTarget
+        assert 'gobgp' not in bgperf2.TESTER_CLASSES
+        assert 'gobgp' in bgperf2.BUILDABLE_IMAGES
+        assert bgperf2.MONITOR_CLASSES['gobgp'] is bgperf2.Monitor
+        assert bgperf2.Monitor is not bgperf2.BUILDABLE_IMAGES['gobgp']
+
+
+class TestScenarioMrtInjector:
+    '''A `-f` scenario names its injector itself. The old default was gobgp,
+    which is no longer a generator, and substituting another silently would run
+    a different workload than the file describes.'''
+
+    def test_bgpdump2_and_exabgp_resolve(self):
+        assert bgperf2.scenario_mrt_tester_class(
+            {'mrt_injector': 'bgpdump2'}) is bgperf2.Bgpdump2Tester
+        assert bgperf2.scenario_mrt_tester_class(
+            {'mrt_injector': 'exabgp'}) is bgperf2.ExaBGPMrtTester
+
+    @pytest.mark.parametrize('tester', [{}, {'mrt_injector': 'gobgp'},
+                                        {'mrt_injector': 'brid'}])
+    def test_anything_else_is_refused(self, tester):
+        with pytest.raises(ValueError):
+            bgperf2.scenario_mrt_tester_class(tester)

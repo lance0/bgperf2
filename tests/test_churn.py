@@ -511,7 +511,7 @@ class TestResolvingTheWorkload:
     def test_the_whole_per_peer_table_may_be_churned(self):
         assert self.resolve(churn_prefixes=1000) == (1000, 1)
 
-    @pytest.mark.parametrize('generator', ['exa', 'gobgp', 'bgpdump2'])
+    @pytest.mark.parametrize('generator', ['exa', 'bgpdump2'])
     def test_only_the_bird_generator_can_churn(self, generator):
         '''The block is switched with that generator's own `birdc disable` on
         a static protocol bgperf2 wrote. Accepting another would start a
@@ -864,7 +864,7 @@ class TestTheRowCannotBeShifted:
 
 class TestNamingTheRun:
     def stem(self, **overrides):
-        args = Namespace(target='bird', label=None, version=None,
+        args = Namespace(monitor='gobgp', target='bird', label=None, version=None,
                          tester_type='bird', prefix_num=100, neighbor_num=10,
                          filter_test=None, path_diversity=1, receivers=0,
                          churn_prefixes=0, churn_bursts=1)

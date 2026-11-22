@@ -110,9 +110,10 @@ class TestCheckBatchImages:
             return name in ('bgperf/gobgp:4.8.0', 'bgperf/bird:latest')
 
         fake_img_exists(exists)
-        bgperf2.check_batch_images([
-            {'name': 'bird', 'monitor_version': '4.8.0'},
-        ])
+        bgperf2.check_batch_monitor_images([{
+            'name': 't', 'monitor': 'gobgp',
+            'targets': [{'name': 'bird', 'monitor_version': '4.8.0'}],
+        }])
         assert 'bgperf/gobgp:4.8.0' in seen
 
     def test_unknown_target_name(self, fake_img_exists):
@@ -152,18 +153,24 @@ def test_stats_row_names_the_version(bench_args, bench_stats):
 
 
 def test_batch_passes_version_through_to_bench():
-    '''batch() builds its Namespace from a field list; a field missing from
-    that list is silently dropped at runtime.
+    '''batch_cell_args() builds its Namespace from a field list; a field missing
+    from that list is silently dropped at runtime.
     '''
-    import inspect
-    source = inspect.getsource(bgperf2.batch)
-    assert "'version'" in source, 'batch() must copy version onto the bench args'
+    from argparse import Namespace
+    test = {'name': 't', 'neighbors': [1], 'prefixes': [10], 'filter_test': ['None'],
+            'targets': [{'name': 'bird', 'version': '2.17.1'}]}
+    [cell] = bgperf2.expand_batch_cells(test, test['targets'])
+    assert bgperf2.batch_cell_args(Namespace(), cell).version == '2.17.1', \
+        'batch_cell_args() must copy version onto the bench args'
 
 
 def test_batch_passes_monitor_version_through_to_bench():
-    import inspect
-    source = inspect.getsource(bgperf2.batch)
-    assert "'monitor_version'" in source
+    from argparse import Namespace
+    test = {'name': 't', 'neighbors': [1], 'prefixes': [10], 'filter_test': ['None'],
+            'targets': [{'name': 'bird', 'monitor_version': '4.8.0'}]}
+    [cell] = bgperf2.expand_batch_cells(test, test['targets'])
+    assert bgperf2.batch_cell_args(Namespace(), cell).monitor_version == '4.8.0', \
+        'batch_cell_args() must copy monitor_version onto the bench args'
 
 
 def test_bench_cli_accepts_monitor_version():
@@ -318,6 +325,8 @@ class TestSecondRoundFixes:
         --version destroyed the previous run's containers before failing.
         CLAUDE.md keeps those around deliberately for investigation.
         '''
+        # This case tests ordering, independent of installed monitor images.
+        monkeypatch.setattr(base, 'img_exists', lambda *a, **k: True)
         order = []
         monkeypatch.setattr(bgperf2, 'remove_target_containers',
                             lambda: order.append('teardown'))
@@ -327,6 +336,10 @@ class TestSecondRoundFixes:
         monkeypatch.setattr(
             bgperf2.GoBGP, 'require_image',
             lambda *a, **k: order.append('resolve-monitor') or 'monitor-img')
+        # `repeat=True` asks Docker for leftover pinned testers; without this
+        # the test read the host's real containers, and failed whenever a
+        # pinned run had left its testers behind.
+        monkeypatch.setattr(bgperf2, 'get_ctn_names', lambda: [])
 
         # The workload fields are valid: resolution now sits *after* the
         # guards that read only the command line, so that a mistyped -p or
@@ -352,6 +365,10 @@ class TestSecondRoundFixes:
         seen = {}
 
         class FakeMonitor:
+            # The GoBGP monitor's image is resolved through its class, which
+            # inherits `GoBGP.require_image()`.
+            require_image = staticmethod(lambda version: bgperf2.GoBGP.require_image(version))
+
             def __init__(self, host_dir, conf, image):
                 seen['host_dir'] = host_dir
                 seen['image'] = image
@@ -374,7 +391,9 @@ class TestSecondRoundFixes:
         monkeypatch.setattr(
             bgperf2.dckr, 'networks',
             lambda names: [{'Name': 'row-br'}])
-        monkeypatch.setattr(bgperf2, 'Monitor', FakeMonitor)
+        monkeypatch.setitem(bgperf2.MONITOR_CLASSES, 'gobgp', FakeMonitor)
+        # `repeat=True` asks Docker for leftover pinned testers.
+        monkeypatch.setattr(bgperf2, 'get_ctn_names', lambda: [])
 
         # Parsed rather than hand-built, so the test keeps every bench()
         # default as upstream adds workload flags.
@@ -395,14 +414,16 @@ class TestSecondRoundFixes:
                                                                fake_img_exists):
         '''A remote scenario has no target image, but still has a monitor.
         '''
+        test = {'name': 't', 'monitor': 'gobgp',
+                'targets': [{'name': 'bird', 'file': 'scenario.yaml'}]}
         fake_img_exists(lambda name: name == 'bgperf/gobgp:latest')
-        bgperf2.check_batch_images([{'name': 'bird', 'file': 'scenario.yaml'}])
+        bgperf2.check_batch_images(test['targets'])
+        bgperf2.check_batch_monitor_images([test])
 
         fake_img_exists(lambda name: False)
+        bgperf2.check_batch_images(test['targets'])
         with pytest.raises(SystemExit, match='monitor'):
-            bgperf2.check_batch_images([
-                {'name': 'bird', 'file': 'scenario.yaml'},
-            ])
+            bgperf2.check_batch_monitor_images([test])
 
     def test_batch_still_checks_normal_targets(self, fake_img_exists):
         fake_img_exists(lambda name: False)

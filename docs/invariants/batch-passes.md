@@ -2,7 +2,7 @@
 
 How a matrix becomes an ordered list of runs, and what the passes of one cell are allowed to say about each other.
 
-**Read this before editing:** `bgperf2.py` (`expand_batch_cells()`, `batch_report_rows()`, `bench_output_prefix()`, `create_batch_graphs()`), `summary.py`, `graphs.py`, `scripts/timing_variance_review.py`, `scripts/check_repetition_configs.py`, `scripts/build_timing_report.py`
+**Read this before editing:** `batch_cells.py` (pure matrix construction, prefix scope and legacy identities), `native_batch.py` (durable attempts, calibration dependencies and explicit recovery), `native_mrt.py` (reserved native attempt identity and interruption status), `bgperf2.py` (`expand_batch_cells()`, `batch_report_rows()`, `bench_output_prefix()`, `create_batch_graphs()`, `report_batch_from_cell_results()`, `load_batch_cell_results()`), `summary.py`, `graphs.py`
 
 These are invariants, not background: every rule here was written because the obvious alternative was tried and published a wrong number quietly. `CLAUDE.md` carries the one-line index; this file carries the argument.
 
@@ -52,156 +52,55 @@ run the matrix unfiltered.
   have to move and an in-flight batch from an older build still resumes instead of costing the
   operator every completed cell.
 
-## Pooling the passes of a partial repetition
+## Cell results and running in pieces
 
-A campaign block does not always repeat the whole of what an earlier block ran. Block 10 repeats
-three of Block 8's five screen scenarios, and within the peer sweep only the three 250-peer cells —
-the 50-peer comparison lies inside the 1s resolution of `elapsed (s)` and no number of passes can
-separate it, and the 500-peer comparison had two of its three rows excluded on `tester_health`,
-which the plan does not allow expanding. Two rules hold that together, and each replaces something
-that used to be implicit.
+Every cell writes its row to `<test>.cells/<key>.json`, where `key` is the first 16 hex digits of
+the SHA-256 of its cell id and the full id is stored inside. `--list-cells`, `--cells` and
+`--report` let a caller run a batch in pieces and rebuild the CSV, summary and graphs from those
+documents.
 
-- **A cell's cross-pass identity is its axes and its target, never its ordinal.**
-  `cell_identity_key()` drops `test`, `repetition` *and* `ordinal`. The first two are obvious; the
-  third is the one that bites. `ordinal` is a cell's position within its own matrix, so it is stable
-  across passes over the same matrix and only across those: dropping six of nine cells moves the
-  survivors from ordinals 3–5 to 0–2 while they stay the same three cells, and keyed on ordinal they
-  pool with nothing — each pass reporting three cells missing from the other two, every comparison
-  stuck at one observation, which is the exact opposite of what a repetition block is for. Two cells
-  of one matrix cannot share axes and target, because `check_batch_run_names()` refuses two targets
-  in one test that share a run name, so nothing is lost by dropping it. Report order is unaffected:
-  `build_groups()` takes the ordinal from the first pass that holds the cell.
-- **A pass that runs part of a series must declare what it covers**, and the declaration is checked
-  in both directions. Dropping ordinal from the key also drops what ordinal was quietly doing —
-  catching a matrix that moved between passes with nothing saying so — so that check moves somewhere
-  it can be stated rather than inferred. A pass entry's `covers` names the identity fields its cells
-  all share; a cell inside that coverage which the pass does not hold is still missing work and is
-  reported, and a cell the pass holds which its coverage excludes is refused, because otherwise the
-  declaration is decoration and a config that ran more than was asked has its extra row pooled into
-  a comparison nobody planned. A pass with no `covers` is expected to hold every cell of its series,
-  exactly as before.
+- **A batch run in pieces reports exactly what one invocation reports.** The report is built from
+  the same rows by the same `batch_report_rows()` and summary path, in matrix order, so neither the
+  invocation a cell ran in nor its execution order reaches the output.
+  `tests/test_batch_cell_results.py` pins the equality for a shuffled, repeated matrix.
+- **A missing cell is named, never filled**, and the graphs wait until no cell is missing:
+  `create_graph()` pairs bar heights with labels by position, so a group short of one target puts
+  bars under the wrong names. A test with no results at all writes nothing, rather than
+  replacing an existing CSV with an empty one.
+- **A malformed or misnamed result document is refused, not skipped.** A report quietly missing a
+  row reads as a cell that never ran.
+- **The cell results are the only record, and `--resume` reads them.** It skips every cell with a
+  result, whichever invocation or mode wrote it, and runs the rest in the planned order. There is
+  no separate progress file to disagree with them. Each result also stores the sequence (`order`,
+  `seed`) it ran under. Recording attempts, refusing to continue after a failure and watching for a
+  host being reclaimed belong to whatever drives the batch.
+- **`--resume` refuses what it cannot honestly continue** (`check_resumable()`), before anything
+  asks Docker: results for cells the config no longer lists, results that ran under a different
+  stated order or seed, and a `<test>.progress.json` from an older bgperf2, whose rows it does not
+  read. A cell id names every dimension that changes what runs, including the monitor, so an
+  edited axis, target, monitor or repetition count turns its old results into unlisted ones rather
+  than rows mixed beside new ones. A shuffled test with a drawn seed continues the one its
+  recorded cells name, and is refused when they do not name exactly one.
+- **A killed write is reported.** `sweep_stale_temp_files()` removes and names `*.tmp` left in the
+  results directory and its `<test>.cells/` by a SIGKILL, at the start of any batch that runs
+  cells, since a resumed batch carrying one is the only trace that the last attempt was killed.
+- **SIGTERM stops at the next check, records nothing for the cell in flight and exits 143.** The
+  stop raises through the whole batch rather than breaking one test's loop, which would exit 0 over
+  a truncated matrix and let later tests' preambles clear results that were still wanted.
+- **A recorded result is never replaced in silence.** `--cells` refuses a cell that already has a
+  document; re-measuring means removing it first. A plain `batch` starts fresh and says how many
+  recorded results it removed; `--resume`, `--cells` and `--report` keep them.
+- **A shuffled test listed for running in pieces states its seed.** `--list-cells` refuses a drawn
+  one, since it would list an order no later invocation follows. Two tests in one config may not
+  share a name: it is the stem of every file they write and part of every cell id and key.
+- A withheld graph set leaves earlier PNGs in place, and the report says they were drawn from
+  other rows.
 
-Three consequences follow from dropping `ordinal`, and each was found by review rather than
-foreseen.
+## Campaign analysis
 
-- **A matrix axis lists each value once.** `neighbors: [250, 250]` produced two cells with distinct
-  ids and *one* cross-pass identity, so `build_groups()` kept whichever it read last and published
-  `n` as though the other run never happened — where `ordinal` used to keep them apart.
-  `check_batch_test()` refuses a repeated value now (`repetitions:` is the mechanism for measuring a
-  cell twice, and it names its passes), and `build_groups()` reports a collision anyway, because a
-  progress file written before that guard can still hold one.
-- **An execution position is comparable only across passes of the same length.** Pass 1 of the peer
-  sweep has positions 1–9 and passes 2–3 have 1–3; sorted onto one scale, the pass that ran first
-  can come out "latest" purely because its matrix was larger, and `order_relation()` would publish
-  "rises with position" off an artifact of matrix size. It is withheld by name for a series whose
-  passes ran different-sized matrices — a relation that cannot be read is not a relation of
-  `neither`.
-- **What a series' caption promises has to be true of every cell under it.** `screen-peers` is
-  repeated *in part*, so three of its nine cells have three observations and six still have one.
-  Dropping "(one observation per cell)" because the scenario gained passes promises a dispersion for
-  rows that do not have one; the caveat says which cells were repeated instead.
-
-And one about the selection document: **a selection is a plan, and what may be asked of it depends on
-whether the block it plans has run.** Before, the question is whether it adds an observation — asking
-for three where three already ran is refused. After, the question is whether it was *carried out*,
-and asking the first question again fires on the selection being executed: Block 10 **is** passes 2
-and 3 of the scenarios its own selection names, so every entry reported "asks for 3 passes and 3
-already ran". Simply excluding the planned block's passes fixes that and costs the guard entirely —
-the count would be pinned at 1 forever and a later selection could never be refused. The check
-changes question instead, and the second question catches a block that ran fewer passes than the
-selection asked for, which nothing else here would notice.
-
-The same split shows up one level out. `review_blocks()` checks COMPLETE markers, host class and
-image ids for **the blocks the reviewed series actually read**, not for every block in the campaign:
-under `--series`, demanding a marker on blocks whose rows nobody opened is a refusal about evidence
-the review never looked at. And a block's own passes cannot be in the pooled read until that block
-is accepted — which is why Blocks 10 and 11 guard their matrices with `check_repetition_configs.py`,
-a pure document check that the cells each config runs are exactly the cells its selection names and
-that the passes of a comparison differ in the test `name` and the seed and nothing else. The pooled
-read of those passes happens at acceptance, not during the block. One script and one table for both
-blocks, with a `--block` it refuses to default: the block and its selection are two halves of one
-statement, a defaulted half is the mistake the script exists to catch made by the script itself, and
-a copied check is one that stops being run against the block it was copied for.
-
-**A regenerated review is staged, never deleted first.** `run_variance_review()` rebuilds the whole
-of `review/` because a leftover series document is a statistic nobody computed sitting beside ones
-somebody did — but it refuses whenever a later block has been built and not yet accepted, which is
-the ordinary state of the campaign, since a pass is declared as soon as its block is built. Deleting
-first meant a `block-9 --force` destroyed an accepted block's published review and could not rebuild
-it; the next block's own decision document cites that review by path as its evidence. It is written
-to staging and moved into place once it has qualified.
-
-**A block that has not run and a block whose rows nobody reviewed are different refusals**, at this
-level as at every other. The first is work to do and the second is work to review, and the host and
-image checks read only the blocks that ran: a block with no directory recorded no host and no image,
-and reporting that as a provenance gap describes work that has not happened in the words used for
-work that happened unrecorded.
-
-**A selection's arithmetic is counted through its own planned block, never over every pass the
-series will ever have.** A series can be expanded twice — `screen-peers` has passes 1, 2–3 and 4–5 in
-three different blocks — and counting all five against Block 10's selection reported "asks for 3
-passes and 5 ran", a later block falsifying an earlier one that was carried out exactly as written.
-What a selection can be held to is the campaign up to the end of the block it planned; the document
-names that block (`planned_block`), and an absent one means Block 10's, which is the only selection
-written before there was a second. The same shape holds in the config check: what a block adds is
-`len(configs)`, and what already exists is `prior_passes`, so the Block 10 form of the arithmetic —
-a literal `+ 1` — would have accepted a Block 11 selection asking for three passes, satisfied by a
-block that added no observation at all.
-
-## Publishing the passes — the report
-
-The campaign's report is the last thing to read these documents, and it is the place where a number
-that has drifted becomes a sentence somebody quotes. Four rules hold it, and the first is what the
-other three are for.
-
-- **The report computes no statistic of its own.** Not a median, not a percentage, not a difference
-  between two medians. Every figure is read from a series document, which read it from
-  `summary.py`, which is the module each block used on its own passes. A report that re-derived its
-  numbers would disagree with the blocks eventually, on exactly the rows a reader cared about, and
-  nothing would say which of the two was wrong.
-- **Every claim cites the figures it rests on, and the citations are resolved before the report is
-  written.** The prose is the part that cannot be derived from the rows, so it is written by hand in
-  a claims document naming series, cell, metric, field and the value the author believes is there; a
-  citation that is absent or disagrees refuses the build and names both numbers. This is not
-  hypothetical hygiene — the first real build refused eight citations, every one of them a figure
-  transcribed from a rounded table into prose that would have been published beside a table
-  contradicting it.
-- **A citation is matched exactly, never rounded into agreement.** The review has already rounded
-  these; a tolerance here would be the report deciding how far a published number may sit from the
-  one it cites, which is the judgement the whole arrangement exists to remove.
-- **`testers (s)` is neither published nor cited.** It is a real column in every stats row and it is
-  the legacy field whose reading this campaign replaced, so the plan's exit criterion is that no
-  claim depends on it. The decomposition is published in its place, and a claim whose *text* names
-  the field is refused along with one that cites it.
-
-Two refusals that look like polish and are not. **A citation must state the value it rests on**, or
-nothing compares the prose to the review — the citation resolves, publishes whatever the review says,
-and the claim above it is unchecked while looking checked. And **a claim may not rest on a figure the
-review withheld**: that citation resolves too, and renders as "= withheld" directly beneath the
-conclusion it supposedly supports. **A claim's section must be one the page actually renders**, for
-the same family of reason: a section that is neither the summary nor a series name passes every
-check, is counted, is written to the machine-readable artifact, and then never appears — a validated
-invisible conclusion, which is worse than a missing one.
-
-And the withholding carries all the way to the page: a dispersion over one observation is printed as
-the reason it has none, an interval a cell never published is `withheld` rather than blank, and
-everything the report declined to publish is gathered into a section of its own — a reader should
-not have to find every empty cell to learn what is missing. **The reason is the review's own**, never
-one derived from the observation count: `summary.py` distinguishes five, and four of them are not
-"fewer than two observations" — the never-sampled sentinel in particular has a full set of
-observations and is the case that sentinel exists for. **A withheld figure and a published figure
-with no dispersion are separate statements**, or the inventory fills with notes about a withholding
-the report does not make: 132 of the first build's 207 were that.
-
-**An interval is a duration of something only if something crossed it.** `injection_s` comes back
-`0.0` from a BIRD 2.19 generator whose offered count is queue-side and saturates before the first
-poll, so the span is one nothing crossed and not a send that took no time. The witness
-(`offered_in_interval`) is published beside it and the interval is withheld by name where that
-witness is zero — the first real build printed the bare `0` on 34 cells, under a column header
-promising "where a table crossed it", on a page whose own preamble promises no absent figure is
-printed as a zero. An optional interval appears only in the
-series that measured it, because a column of `withheld` in six other series says nothing except that
-a policy reload is not part of an MRT playback.
+The partial-series and publication contracts moved with their implementations to
+[research analysis contracts](https://github.com/jopietsch/second-looks-lab-research/blob/main/bgp/2026/docs/analysis-contracts.md)
+(private, optional context). Engine repetition, order and summary contracts stay here.
 
 ## Order
 
@@ -222,13 +121,12 @@ Shuffling does not remove that drift; it stops it lining up with one axis.
   recording a seed is that the sequence can be rebuilt later, and a Mersenne Twister draw is a
   property of the interpreter as much as of the seed. `tests/test_batch_order.py` pins one seed's
   order so changing the keying scheme has to be deliberate.
-- **The seed is recorded in the progress file before the first cell runs**, and `--resume` uses
-  the recorded one. A seed written only on a cell's completion would be missing from exactly the
-  batches that died early, and a resumed batch drawing a fresh permutation has run two orders,
-  neither of which is the one it recorded. Only a *drawn* seed is recovered that way — a seed the
-  config states is left alone, since editing it by hand is an instruction to re-sequence. An
-  omitted seed is drawn rather than defaulted to a constant: one shared default is itself a
-  permutation nobody chose. A `seed` under `order: matrix` is rejected rather than ignored.
+- **The seed is recorded with every cell result**, so the order a batch ran in can be rebuilt
+  from its results even when the seed was drawn, and `--resume` continues that seed. `--list-cells`
+  and `--cells` need a stated seed: each invocation would otherwise draw its own, and record a
+  sequence no invocation followed. An omitted seed is drawn rather than
+  defaulted to a constant: one shared default is itself a permutation nobody chose. A `seed` under
+  `order: matrix` is rejected rather than ignored.
 - **Execution order is not report order.** `batch_report_rows()` emits the CSV and the graphs in
   matrix order whatever order the cells ran in, because `create_graph()` keys the x axis off the
   row names it sees and appends one bar height per row, pairing the two positionally — that only
@@ -237,12 +135,9 @@ Shuffling does not remove that drift; it stops it lining up with one axis.
   length mismatch, at the end of a batch that has already run for hours.
 - Identity is untouched by the order: `ordinal` stays a cell's place in the matrix, so `--resume`
   matches its completed cells whichever way either pass ran.
-- **A superseded sequence stays in the file.** The progress document is rewritten whole on every
-  checkpoint, so a sequence dropped when the config is edited mid-batch leaves the record
-  describing an order that some of its own completed rows did not run in. It moves to
-  `previous_seeds` instead, and only when rows exist to describe. That covers a matrix pass
-  resumed as a shuffle, not just a changed seed — a file naming no order at all was written before
-  ordering existed, and is read as matrix, because that was the only order there was.
+- A changed seed does not change any cell id, so `--resume` compares the sequence each recorded
+  result names with the config's and refuses a mismatch. A driver that deliberately continues
+  under a new sequence records that itself.
 
 ## Summarising the passes — `summary.py`
 
@@ -275,8 +170,7 @@ would be arithmetic nobody could check. `docs/measurement-dictionary.md` has the
   its walk, with a `mem` that comes from a `.get('usage', 0)`. `min idle%` and `max cpu %` are
   deliberately excluded: 100 and a peak rounding to 0 are both values a real run can report.
 - **A stored row that is not the header's width costs its own pass, not the document.** `--resume`
-  onto a progress file written before a column was appended is a supported path — the schema version
-  deliberately did not move for `max foreign cpu %` — and one short row indexed against the current
+  onto a cell result written before a column was appended is a supported path, and one short row indexed against the current
   header raises, which the wrapper turns into *no summary at all* for that test. Such a pass is
   `unreadable`, kept apart from `failed`. A right-width, wrong-layout row cannot be caught here at
   all, which is why `stats_header()` is the contract.
@@ -291,7 +185,7 @@ would be arithmetic nobody could check. `docs/measurement-dictionary.md` has the
 - **A summariser that raises costs the summary, not the rows.** It runs after the CSV is on disk and
   `publish_batch_summary()` catches — same rule as `write_event_artifact()` and its findings.
 - **It is written before the first cell, then after each one**, and a non-resumed batch unlinks its
-  predecessor's summary along with its progress file — otherwise a write that then fails leaves the
+  predecessor's summary along with its cell results — otherwise a write that then fails leaves the
   previous run's document beside a rewritten CSV. Every call site prints a failure line, including
   the two that do not ask for the description: it is the only report that the document beside the
   CSV is not the one describing it.
@@ -345,6 +239,27 @@ already does the same thing along the version axis by labelling each version. Th
 two identical target entries are refused rather than treated as two observations — that is what
 `repetitions` is for, and it names its passes.
 
-Note the container work directory (`<--dir>/<bench-name>`) is wiped at the start of every cell, so
+In legacy execution the container work directory (`<--dir>/<bench-name>`) is wiped at the start of every cell, so
 raw daemon and tester logs only ever survive for the run in progress — that is true across cells
 already, and repetitions do not change it. The published artifacts are the durable record.
+Native execution uses fresh attempt-specific directories and retains earlier work.
+
+## Selected durable native mode
+
+The 2026-11-17 operator decision selects engine-owned attempt accounting and
+recovery for opt-in native batches, superseding the earlier rule assigning all
+attempt intelligence to external callers for this mode. Legacy batches and their
+cell-result identity/resume semantics remain unchanged. Cloud watching and
+instance launching still belong to infrastructure tooling.
+
+`native_batch.py` freezes the existing finite matrix, keeps calibrations apart
+from measured repetitions, records every reserved attempt before its worker,
+and holds one exclusive results lease. A native receipt remains the original;
+state/CSV/summary publication cannot make an interrupted or failed attempt a
+successful timing. A completion receipt can survive loss of its parent's
+publication; explicit resume adopts it only with matching cell/workload/images
+and verified terminal cleanup. Failed calibration blocks only its dependents.
+Unknown cleanup stops independent work. Recovery retains inspect/log evidence
+before deleting only the interrupted attempt's owned objects; original work and
+receipts stay retained. The [public guide](../native-batches.md) owns the CLI,
+status meanings, supported scope and preservation limits.

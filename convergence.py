@@ -18,23 +18,50 @@
 # poll that produced none, decides exactly what it decided before.
 #
 # This lives apart from bench() so the rules can be tested without Docker.
+#
+# Every window below is a duration, and the tracker turns it into a number of
+# samples at the cadence the monitor is *asked* for (`sample_interval_s`,
+# measurement plan 7b). It used to be a sample count fixed at a 1 s poll, which
+# a monitor that reports ten times a second would have read as a window ten
+# times shorter. Counting samples rather than measuring elapsed time is
+# deliberate: the GoBGP poll overruns its cadence under load, and a window of
+# real seconds would converge such a run in fewer samples than it does today,
+# changing the old instrument's decisions -- and GoBGP stays selectable as the
+# reference a sink result is re-checked against, so they must be the ones it
+# always made. At the 1 s cadence every count is exactly what it was.
 
-# A run is converged once the received count has been unchanged for this many
-# consecutive samples (samples arrive about once a second).
-ASSURANCE_SAMPLES = 20
+import math
 
-# ...but only this many if the configured check-point was already reached, since
+# The cadence the windows were written for: the GoBGP monitor's 1 s poll.
+DEFAULT_SAMPLE_INTERVAL_S = 1.0
+
+# A run is converged once the received count has been unchanged this long.
+ASSURANCE_S = 20.0
+
+# ...but only this long if the configured check-point was already reached, since
 # we already know enough prefixes arrived.
-ASSURANCE_SAMPLES_AFTER_CHECKPOINT = 5
+ASSURANCE_AFTER_CHECKPOINT_S = 5.0
 
 # A count that stops moving for this long is stuck, not converging. High because
 # under heavy load some stacks genuinely pause this long.
-STUCK_SAMPLES = 600
+STUCK_S = 600.0
 
 # A sustained drop in the received count means the target is losing routes.
-# Both conditions must hold: enough consecutive drops, and a big enough one.
-DROP_SAMPLES = 10
+# Both conditions must hold: a drop sustained this long, and a big enough one.
+DROP_S = 10.0
 DROP_FRACTION = 0.01
+
+
+def samples_for(duration_s, sample_interval_s):
+    '''How many consecutive samples at this cadence span `duration_s`.
+
+    Rounded up, so a window is never shorter than its duration, and never
+    below one sample. The epsilon keeps 20.0 / 0.1 from rounding up to 201.
+    '''
+    if not sample_interval_s > 0:
+        raise ValueError('sample interval must be positive, got {0!r}'.format(
+            sample_interval_s))
+    return max(1, int(math.ceil(duration_s / sample_interval_s - 1e-9)))
 
 # How many monitor samples may re-use one target-side reading before it stops
 # counting as evidence.
@@ -63,7 +90,7 @@ DROP_FRACTION = 0.01
 # four 10 x 1,050,000 runs) would quietly switch the rule off on the larger
 # runs that need it most -- turning them back into the deterministic failures
 # it exists to prevent.
-WITNESS_CARRY_SAMPLES = ASSURANCE_SAMPLES_AFTER_CHECKPOINT
+WITNESS_CARRY_S = ASSURANCE_AFTER_CHECKPOINT_S
 
 # How long a run may be kept alive by the witness alone before it is failed
 # anyway.
@@ -81,7 +108,18 @@ WITNESS_CARRY_SAMPLES = ASSURANCE_SAMPLES_AFTER_CHECKPOINT
 # this long is not converging -- and because the alternative is a budget fitted
 # to how many samples the MRT shape happens to need (7 to 11 in the eight runs
 # measured, against 600 here).
-WITNESS_EXCUSED_LIMIT = STUCK_SAMPLES
+WITNESS_EXCUSED_S = STUCK_S
+
+# The windows as sample counts at the 1 s cadence: what every comment in this
+# file and every test has always called them. The tracker computes its own
+# from its cadence; these are that computation at the default one.
+ASSURANCE_SAMPLES = samples_for(ASSURANCE_S, DEFAULT_SAMPLE_INTERVAL_S)
+ASSURANCE_SAMPLES_AFTER_CHECKPOINT = samples_for(
+    ASSURANCE_AFTER_CHECKPOINT_S, DEFAULT_SAMPLE_INTERVAL_S)
+STUCK_SAMPLES = samples_for(STUCK_S, DEFAULT_SAMPLE_INTERVAL_S)
+DROP_SAMPLES = samples_for(DROP_S, DEFAULT_SAMPLE_INTERVAL_S)
+WITNESS_CARRY_SAMPLES = samples_for(WITNESS_CARRY_S, DEFAULT_SAMPLE_INTERVAL_S)
+WITNESS_EXCUSED_LIMIT = samples_for(WITNESS_EXCUSED_S, DEFAULT_SAMPLE_INTERVAL_S)
 
 # If nothing at all has arrived by this point, fail fast instead of waiting out
 # STUCK_SAMPLES -- it means the session never came up.
@@ -99,7 +137,23 @@ class ConvergenceTracker(object):
     CONVERGED = 'converged'
     FAILED = 'failed'
 
-    def __init__(self):
+    def __init__(self, sample_interval_s=DEFAULT_SAMPLE_INTERVAL_S, *,
+                 zero_route_startup_seconds=NO_PROGRESS_DEADLINE_SECONDS):
+        if (type(zero_route_startup_seconds) is not int
+                or not 15 <= zero_route_startup_seconds <= 120):
+            raise ValueError("Zero-route startup allowance must be an integer from 15 to 120 seconds")
+        self.zero_route_startup_seconds = zero_route_startup_seconds
+        # Every window, as a sample count at the cadence the monitor is asked
+        # for. See the note at the top of this module for why it is the
+        # cadence asked for and not the gaps achieved.
+        self.sample_interval_s = sample_interval_s
+        self.assurance_samples_full = samples_for(ASSURANCE_S, sample_interval_s)
+        self.assurance_samples_short = samples_for(
+            ASSURANCE_AFTER_CHECKPOINT_S, sample_interval_s)
+        self.stuck_samples = samples_for(STUCK_S, sample_interval_s)
+        self.drop_samples = samples_for(DROP_S, sample_interval_s)
+        self.witness_carry_samples = samples_for(WITNESS_CARRY_S, sample_interval_s)
+        self.witness_excused_limit = samples_for(WITNESS_EXCUSED_S, sample_interval_s)
         # True once the monitor has seen at least the configured check-point.
         self.recved_checkpoint = False
         # True once every tester neighbor has sent everything it was going to.
@@ -139,6 +193,11 @@ class ConvergenceTracker(object):
         # converged on one account of itself rather than two, and waited the
         # full assurance window for it.
         self.converged_without_neighbors_checkpoint = False
+        # Consecutive samples on which every generator had reported offering
+        # its whole table, and the latest sample's answer. Read only by the
+        # one-witness path of the convergence gate; see update().
+        self.offering_complete_samples = 0
+        self.last_offering_complete = None
 
     @property
     def assurance_samples(self):
@@ -156,8 +215,8 @@ class ConvergenceTracker(object):
         window it would have used never came up.
         '''
         if self.recved_checkpoint and self.neighbors_checkpoint:
-            return ASSURANCE_SAMPLES_AFTER_CHECKPOINT
-        return ASSURANCE_SAMPLES
+            return self.assurance_samples_short
+        return self.assurance_samples_full
 
     def note_neighbors_checkpoint(self):
         '''Called when the target reports every neighbor has finished sending.'''
@@ -224,7 +283,7 @@ class ConvergenceTracker(object):
             return False, None
         if best_paths > self.peak_best_paths:
             self.peak_best_paths = best_paths
-        if self.witness_carried_samples >= WITNESS_CARRY_SAMPLES:
+        if self.witness_carried_samples >= self.witness_carry_samples:
             return False, None
         if not self.peak_best_paths:
             # Nothing held and nothing ever held: a target that has not started
@@ -282,23 +341,41 @@ class ConvergenceTracker(object):
                        'reported full, so the run was decided on the '
                        'monitor\'s check-point alone, after the full '
                        'assurance window rather than the shortened one'),
-            'assurance_samples_required': ASSURANCE_SAMPLES,
-            'assurance_samples_after_checkpoint': (
-                ASSURANCE_SAMPLES_AFTER_CHECKPOINT),
+            'assurance_samples_required': self.assurance_samples_full,
+            'assurance_samples_after_checkpoint': self.assurance_samples_short,
+            'assurance_s': ASSURANCE_S,
+            'assurance_after_checkpoint_s': ASSURANCE_AFTER_CHECKPOINT_S,
+            'sample_interval_s': self.sample_interval_s,
             'neighbors_checked_at_convergence': self.last_neighbors_checked,
             'monitor_peak': self.peak_recved,
+            # Whether the generators' own offering gated the verdict: True when
+            # every one had reported completion for the whole window, None when
+            # the deciding sample had no such evidence and was decided as runs
+            # were before the gate existed.
+            'offering_complete': self.last_offering_complete,
         }
 
     def update(self, elapsed_seconds, recved, neighbors_checked,
                neighbors_received_full, checked,
-               table_witness=None, witness_monotonic_s=None):
+               table_witness=None, witness_monotonic_s=None,
+               offering_complete=None):
         '''Fold in one monitor sample and return the resulting status.
 
         `table_witness` is the target's own reading of the table it holds, as
         `bird.table_witness()` returns it, and `witness_monotonic_s` is when
         that reading was taken. Both default to absent, and a run that supplies
         neither is decided exactly as it was before this witness existed.
+
+        `offering_complete` is whether every generator has reported offering
+        its whole table: True, False, or None where the run has no such
+        evidence. It gates only a run decided on the monitor's check-point
+        alone; see the convergence gate below.
         '''
+        self.last_offering_complete = offering_complete
+        if offering_complete:
+            self.offering_complete_samples += 1
+        else:
+            self.offering_complete_samples = 0
         previous_recved = self.last_recved
         # Read first, and on every sample: the carry counter this rule depends
         # on advances per monitor sample, so a witness consulted only inside
@@ -382,7 +459,7 @@ class ConvergenceTracker(object):
                 self.less_last_received += 1
             else:
                 self.less_last_received = 0
-            if self.less_last_received >= DROP_SAMPLES:
+            if self.less_last_received >= self.drop_samples:
                 self.fail_msg = (f"FAILED: dropping received count {recved} "
                                  f"neighbors_checked {neighbors_checked}")
                 return self.FAILED
@@ -501,8 +578,35 @@ class ConvergenceTracker(object):
         # monitor having actually reached the configured count, so a target
         # that never delivered still has neither checkpoint and still fails --
         # nothing here converges a run on stability alone.
+        #
+        # And the one-witness path waits for the generators. The check-point is
+        # a fraction of one injector's declared table, so on an MRT RIB where
+        # every peer carries most of the union, one peer's table clears it.
+        # Seen for real: rrc00 at 24 peers, RustyBGP 2026-08. Generator 0's
+        # session came up first, the monitor reached 1,049,977 against a
+        # required 1,039,500 at 6s, and held there for twenty samples while the
+        # other 23 generators were still connecting and sending and the target
+        # was still ingesting them. RustyBGP's neighbour counters lagged, so
+        # there was no second witness, and the run was published at 7s. Here,
+        # with offering evidence, such a run converges only once the count has
+        # held for the full window *after* every generator reported
+        # completion, which is the window the old gate's "every generator
+        # reported done" used to buy. A run whose deciding sample has no
+        # offering evidence (`None`: no generator reports it, or a recorder
+        # was retired) is decided as before, and a two-witness run is
+        # untouched: the target saying every neighbour is full already says
+        # the offering arrived.
+        offering_holds = (self.neighbors_checkpoint
+                          or offering_complete is None
+                          or self.offering_complete_samples
+                          >= self.assurance_samples)
         if ((self.neighbors_checkpoint or self.recved_checkpoint)
+                # Target receipt can complete while export is still buffered.
+                # Stability at zero is no observer delivery, even when the
+                # target checkpoint opened this branch before no-progress.
+                and recved > 0
                 and self.last_recved_count >= self.assurance_samples
+                and offering_holds
                 and (dropped <= DROP_FRACTION
                      or (witness_holds and checked
                          and self.witness_carried_samples == 0))):
@@ -516,17 +620,23 @@ class ConvergenceTracker(object):
                 self.converged_without_neighbors_checkpoint = True
             return self.CONVERGED
 
-        if (elapsed_seconds > NO_PROGRESS_DEADLINE_SECONDS
+        if (elapsed_seconds > self.zero_route_startup_seconds
                 and not self.recved_checkpoint
-                and self.last_recved_count == 0
                 and recved == 0):
             # Nothing has arrived at all; trip the stuck check immediately
             # rather than waiting out STUCK_SAMPLES.
-            self.last_recved_count = STUCK_SAMPLES
+            self.last_recved_count = self.stuck_samples
 
-        if self.last_recved_count >= STUCK_SAMPLES:
+        if self.last_recved_count >= self.stuck_samples:
             self.fail_msg = (f"FAILED: stuck received count {recved} "
                              f"neighbors_checked {neighbors_checked}")
+            if (self.recved_checkpoint and dropped <= DROP_FRACTION
+                    and not offering_holds):
+                # The gate above was held by the generators, not the count:
+                # say so, or this reads as a target that stopped. Only then:
+                # a run that never reached the check-point was held by that,
+                # and blaming the generators would point at the wrong role.
+                self.fail_msg += " with the generators' offering incomplete"
             return self.FAILED
 
         # Below the stuck check, so a run that is merely slow is still
@@ -534,7 +644,7 @@ class ConvergenceTracker(object):
         # because the two point somewhere different: a stuck count says the
         # target stopped, this says the target holds its table and the session
         # the run is measured through has been losing it for ten minutes.
-        if self.witness_excused_streak >= WITNESS_EXCUSED_LIMIT:
+        if self.witness_excused_streak >= self.witness_excused_limit:
             self.fail_msg = (
                 f"FAILED: monitor count {recved} has been declining below its "
                 f"peak {self.peak_recved} for "

@@ -109,6 +109,33 @@ stamped once per run before the testers are launched.
 | `assurance_s` | seconds | Required count to the sample at which the assurance policy declared the run complete. `null` for a run that failed or was still in assurance. |
 | `assurance_resolution_s` | seconds | The wider of the two monitor polls bounding it. The confirmation carries the resolution of the sample it ruled on, not a gap to the moment the verdict was stamped: assurance is a decision about a sample, not a fresh look at the monitor. |
 
+**Under `--monitor sink` the three monitor events are dated by the sink, not the
+poll** (measurement plan 7b). The poll still decides *that* `monitor_first_prefix`
+and `monitor_required_reached` happened. Each is then dated to the sink line that
+began the stretch the poll saw: the count's return from zero, or its last rise
+across the check-point. A crossing that a dropped session lost is not the one
+dated. `monitor_last_change` is the log's last change of the count, so it
+includes a move and return between two polls that two equal samples cannot show.
+Each event's `poll_resolution_s` is its line's distance from the line before it. A count
+first shown on a C line became true after the previous line and no later than
+its own. That is typically 10 ms under load and up to the 1 s heartbeat after a
+quiet stretch, with no poll cadence flooring it. Such an event carries
+`"dated_by": "sink_log"`, and the three intervals above inherit its resolution.
+`assurance_s` still ends on the poll's verdict, so its resolution stays the
+poll's. An event the sink could not date falls back to the poll's date. It then
+says `"dated_by": "poll"` and names the reason in `sink_dates_refused`. The
+reasons are: a sink clock more than 1 ms from the host's
+(`SINK_CLOCK_OFFSET_LIMIT_NS`, measured once per sink process), no clock line, no
+such line in the log, a line dated before the clock origin or after the sample
+that saw it, or a line whose predecessor is dated later. The last comes from a
+heartbeat racing an UPDATE's stamp, and it is refused rather than published as
+a resolution of zero. A sample describes the log as of its own stamp, and lines
+dated after it are read by the next one. A GoBGP run's events carry neither key and are exactly what
+they were. Sink receivers' `receiver_first_prefix` and `receiver_table_reached`
+are dated the same way, so the `export` section's intervals and resolutions
+follow them. `prefix received (s)` follows `first_prefix_s`, so a sink run's
+legacy column is the sink's date. `elapsed (s)` is still counted off the poll.
+
 ## Event artifact: the `testers` section
 
 Each run also writes `<prefix>.events.json` (`bgperf2/measurement-events/v1alpha1`).
@@ -557,6 +584,29 @@ it to three decimal places. The target lost no routes and the monitor was not
 miscounting; what changed was which of the prefixes it held the target chose to
 export, as the last injectors delivered and best paths moved.
 
+## Event artifact: the `role_cpu` section
+
+Each role's CPU through the run, read from every container's cgroup v2
+`cpu.stat` on the controller's monotonic clock (`role_cpu.py`, comparison plan
+§6 item 1). It is evidence only, and no finding reads it.
+
+| field | meaning |
+|---|---|
+| `clock`, `origin` | `monotonic`, measured from `bench_clock_started`. That is the same clock as `events`, so an interval can be laid beside any event. |
+| `source` | `cgroup v2 cpu.stat usage_usec`. Each interval is the delta between two reads, never a cumulative value. |
+| `sample_interval_s` | The cadence asked for. The cadence achieved is each interval's own `start_s`/`end_s`. |
+| `unit` | `percent of one core`, so 800 is eight cores busy. |
+| `roles.<role>` | `target`, `monitor`, `testers`, `receivers`. A role this run did not have is absent. A role it had but could not read carries only `unmeasured_reason`: a remote target, a generator set reused by `-r/--repeat`, or a container whose cgroup was not found. |
+| `.containers[]` | Each member's `name`, `cpuset_requested` (what `--pin` asked for, `null` unpinned), `cpuset_effective` (what the kernel reported when the run started), and `first_error` (its first failed read). |
+| `.pinned`, `.cpuset_effective`, `.cores` | Whether every member was pinned, plus the role's one effective cpuset and its core count. The last two are `null` when members disagree. |
+| `.intervals[]` | `start_s`, `end_s` and `cpu_percent`, the sum over the role's members. `cpu_percent` is `null`, with `unread` naming the missing members, when any member was not read at both ends. A role sum missing one generator would read as less work, so it is not published. It is also `null` with an `unread_reason` when a counter went backwards. |
+| `.peak_cpu_percent`, `.intervals_read`, `.intervals_unread` | Over the read intervals only. |
+| `.cpu_seconds` | Total CPU from first read to last. `null` unless every member was read on every poll. |
+| `poll_incomplete` | Present only when the final pass had not returned within `ROLE_CPU_TEARDOWN_WAIT_S`. |
+
+The series runs from the bench clock until `finish_bench()`, so it covers churn and policy
+reload. It is not routed through the run's queue, for the reason the receiver poll is not.
+
 ## Both documents: the `bgperf2` section
 
 `<prefix>.events.json` and `<prefix>.versions.json` each carry a `bgperf2`
@@ -618,7 +668,7 @@ interval supports).
 
 | Finding | Kind | When it fires |
 |---|---|---|
-| `tester_limited` | attribution | The generators were measured sending for longer than the poll that bounds the interval, at a rate this instrument could observe, and the monitor reached the required count within one poll of their completion or before it. It requires that at least `INJECTION_COVERAGE` (half) of the offered table crossed the measured interval, which is what keeps a queue-side counter from being read as a send rate — BIRD 2.19 puts at most about 15% of its table inside that interval, and where the first poll lands decides how much. |
+| `tester_limited` | attribution | The generators were measured sending for longer than the poll that bounds the interval, at a rate this instrument could observe, and the monitor reached the required count within one poll of their completion or before it. It requires that at least `INJECTION_COVERAGE` (half) of the offered table crossed the measured interval, which is what keeps a queue-side counter from being read as a send rate — BIRD 2.19 puts at most about 15% of its table inside that interval, and where the first poll lands decides how much. **It says the run was waiting for the generators to deliver; it does not say the generators were the weak component.** A generator throttled from outside and a generator blocked writing to a target that is not draining produce the same evidence, and this finding names `tester` for both — see "What `tester_limited` does not separate" below. |
 | `post_injection_tail` | attribution | The run continued past the last generator's completion by more than the polls bounding that interval. The time was spent somewhere between the target and the monitor, and nothing published here separates the two: the monitor is the instrument, so its own polling is inside the number. |
 | `injection_unresolved` | qualification | The fleet injection was no wider than the look that bounds it. Every MRT run has this shape — a 10,000-prefix walk is over in about a millisecond — so it forbids reading the injection as the run's cost and forbids nothing about the tail. |
 | `injection_boundary_unresolved` | confounder | Neither most of the table crossed the measured interval nor did any generator time its own send, so the generator's completion may sit anywhere inside its real sending and the boundary between injection and tail cannot be trusted. This is the BIRD 2.19 case. |
@@ -626,9 +676,82 @@ interval supports).
 | `tester_incomplete` | missing_evidence | A generator never reported completion, so the workload was never fully offered and no interval bounded by it can be read. |
 | `missing_timing_evidence` | missing_evidence | No generator in the run could be asked what it offered (ExaBGP and GoBGP playback), or the monitor never reached the required count, which is also every failed run. |
 | `backpressure_observed` | confounder | A generator reported cumulative blocked writes or send stalls. Which end of a blocked write was at fault is not in these numbers, so it withholds an attribution rather than supplying one. BIRD 3's `TX pending` queue depths are deliberately **not** read as backpressure: a session with something queued at the instant it is polled is what a working session looks like, and treating it as backpressure would withhold every BIRD 3 verdict there is. |
-| `host_cpu_saturated` | confounder | Host idle fell to `HOST_IDLE_PERCENT` (5%) or below. `min idle%` is host-wide and includes bgperf2's own load, so it says the machine had nothing spare and not whose work that was — see the CPU attribution boundary in the implementation plan. Per-role, time-aligned CPU would be needed to say more, and no such measurement exists. |
+| `host_cpu_saturated` | confounder | Host idle fell to `HOST_IDLE_PERCENT` (5%) or below. `min idle%` is host-wide and includes bgperf2's own load, so it says the machine had nothing spare and not whose work that was — see the CPU attribution boundary in the implementation plan. Per-role, time-aligned CPU would be needed to say more. It is published in the `role_cpu` section below, and this finding does not read it yet. |
 | `foreign_cpu_contention` | confounder | `max foreign cpu %` reached `contention.CONTENTION_PERCENT` (one core). A run sharing the machine is not comparable with one that did not, and a version ranking read off it would be an artifact of the neighbour. Its `evidence.processes` names the heaviest competing commands from the sample that set that maximum — aggregated by command name with a `process_count`, since the canonical competitor is a parallel build of thousands of short-lived processes rather than one large one. They are recorded during the run and never re-derived here: a competitor that has since exited is exactly the case this fires on. An artifact written before that was recorded carries no `processes` key at all, which is deliberately not an empty list. |
 | `low_free_memory` | confounder | Free memory fell below `LOW_FREE_MEMORY_FRACTION` (5%) of the host's total, so the intervals include page pressure. A fraction rather than a constant because the column is also moved by bgperf2's own logging when the bench directory is tmpfs. |
+
+### What `tester_limited` does not separate
+
+**A slow generator and a back-pressured one are the same measurement, and
+`tester_limited` names `tester` for both.** The verdict is not false either way
+-- the run really was waiting for the generators to deliver -- but a reader
+takes `tester` to mean the generator was the weak component, and half the time
+it was the target.
+
+Three controlled runs make the point, all BIRD 3.3.2 with two bgpdump2
+injectors at 2 x 500,000, differing only in what was constrained from outside
+bgperf2. bgperf2 was told about none of it:
+
+| run | what was constrained | offered rate | generator's own send | verdict |
+|---|---|---:|---:|---|
+| `block1-generator-calibration/tester-baseline` | nothing | 253,773 pps | 2.021s | `tester` / `tester_limited` |
+| `block1-generator-calibration/slow-tester` | generator egress, 4 mbit | 24,940 pps | 32.390s | `tester` / `tester_limited` |
+| `phase6-calibration/target-starved-probe-500k` | **target**, 0.25 CPU | 61,291 pps | 11.907s | `tester` / `tester_limited` |
+
+One verdict, three situations: a generator that was the constraint, a target
+that was the constraint, and a shape that is generator-bound with nothing
+constrained at all. The starved target does not drain its sessions, so the
+injectors block on their writes and their measured send rate falls exactly as a
+throttled generator's does.
+
+**Nothing a run publishes today separates them**, and two things that look like
+they would, do not:
+
+- **Blocked-write counters do not, because shaping blocks writes too.** A
+  generator blocked on write tells you its peer is not reading *only* when the
+  path to that peer is otherwise clear; an egress cap produces the identical
+  counter. That is the same reason `backpressure_observed` is a confounder
+  rather than an attribution, and bgpdump2 reports those counters only under
+  `--tester-trace-io`, which inflates the interval beside them by 56%.
+- **Comparing offered against what the target holds does not**, because TCP
+  bounds the backlog to the socket buffers. A blocked generator cannot run far
+  ahead of a slow target, so the two curves stay together in both cases.
+
+**What would separate them: per-role, time-aligned CPU** -- the target at its
+own ceiling through the interval is a target that was the constraint; a target
+with headroom while the generators sent slowly is not. That is the
+[historical CPU attribution boundary (optional private context)](https://github.com/jopietsch/second-looks-lab/blob/main/bgp/docs/engine-development/bgperf2-measurement-implementation-plan.md#cpu-attribution-boundary),
+and until a rule reads that series this finding may not be read as a
+statement about the generator. The series is published as the
+[`role_cpu` section](#event-artifact-the-role_cpu-section); no rule reads it yet.
+
+**A second, cheaper and weaker, is implemented: `generator_headroom` in
+`scripts/timing_variance_review.py`** (`bgperf2-ylb`). It is a cross-cell
+comparison within one series, which `findings.py` cannot make from one artifact.
+Cells are grouped by the generator's recorded identity:
+- the `run` dict minus name and repetition, so `pin` separates cells;
+- tester count, offered prefixes and `tester version`.
+
+Within a group, the reference is the fastest `reported_injection_s` of any pass,
+which is the generator's own timing. Each cell's fastest uncontended pass is
+published as a ratio to it. `headroom_shown` is set only when that pass is
+slower than the reference cell's *slowest* pass. Durations are compared, never
+rates, for the reason `tester_metrics()` derives no rate from them.
+
+It is withheld by name in each of these cases:
+- a series whose generator never timed itself (every BIRD-generator series);
+- a cell whose every timed pass was contended;
+- a reference cell with one timed pass (the ratio is still published);
+- a reference that reads 0.0;
+- a group with no second cell to compare.
+
+**Its premise is that the generator's environment is what the record says, and
+the controlled runs above show it is load-bearing.** It reports the starved
+target as 6.0× the baseline's own-timed send, which is correct. It reports the
+4 mbit-capped generator as 16.33× in exactly the same way, which is wrong,
+because the cap was applied outside the record. `tests/test_variance_review.py`
+pins both, so nobody later reads it as separating the two. What it does is
+bound: the identical fleet, on this host, was shown able to go this much faster.
 
 A run whose policy raised still writes its artifact: `write_event_artifact()`
 catches, and publishes `limiting_component: inconclusive` with the exception in
@@ -683,7 +806,7 @@ One entry per matrix cell, in matrix order whatever order the cells ran in.
 | `passes_expected` | count | How many passes this cell has, i.e. the test's `repetitions`. |
 | `observations` | count | How many of them produced a usable row. |
 | `observed_passes` | list | Which repetitions those were, in the same order as every metric's `values`, so a reader can say which pass produced which number. |
-| `passes` | list of objects | Every pass, in repetition order, with `state` `observed`, `failed` (plus the run's `MSG`), `not run`, or `unreadable`. A failed pass and a pass that has not run are counted apart: one is a result and the other is unfinished work. `unreadable` is a stored row that is not the current header's width — `--resume` onto a progress file written before a column was appended is a supported path, and such a row is one field short. It costs its own pass and nothing else; indexed against this header it would otherwise raise and cost the whole test's document. |
+| `passes` | list of objects | Every pass, in repetition order, with `state` `observed`, `failed` (plus the run's `MSG`), `not run`, or `unreadable`. A failed pass and a pass that has not run are counted apart: one is a result and the other is unfinished work. `unreadable` is a stored row that is not the current header's width — `--resume` onto a cell result written before a column was appended is a supported path, and such a row is one field short. It costs its own pass and nothing else; indexed against this header it would otherwise raise and cost the whole test's document. |
 | `metrics` | object | One entry per column in `summary.METRIC_COLUMNS`, keyed by the CSV column name. |
 | `variance` | object | Whether this cell's passes separate it from the cells drawn beside it, and so whether it has earned more of them. Decided against the *binding* rival, not the nearest — see [The variance rule](#the-variance-rule) below. |
 
@@ -918,7 +1041,7 @@ hours, the rows are the evidence and this is an opinion about them. That line is
 printed from every one of the three call sites, including the two that do not
 ask for the description, because it is the only report that the document beside
 the CSV is not the one describing it. A non-resumed batch also unlinks its
-predecessor's summary along with its progress file, so a write that then fails
+predecessor's summary along with its cell results, so a write that then fails
 cannot leave a document describing passes that no longer exist.
 
 Values are written with `allow_nan=False`, and a non-finite observation is

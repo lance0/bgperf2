@@ -456,6 +456,10 @@ class FakeReceiver:
             raise answer
         return answer
 
+    def read_export(self, sampled_at):
+        # `Receiver.read_export()`'s shape: a count, and no sink dates.
+        return self.accepted_prefixes(), None
+
 
 def poll_until_stopped(receivers, required=REQUIRED, interval=0.01, rounds=2):
     '''Run the real poll loop over fake receivers and return what it recorded.'''
@@ -726,7 +730,7 @@ def test_a_served_fan_out_reports_its_span_and_its_lag_behind_the_monitor():
 
     assert '2 of 2 receiver(s) reached 100 prefix(es), the last in 4.0s' \
         in lines[0]
-    assert 'within the 1.0s poll resolution of each other' in lines[0]
+    assert 'within the 1.0s resolution of each other' in lines[0]
     assert '3.0s after the monitor reached the required count' in lines[1]
 
 
@@ -739,7 +743,7 @@ def test_a_spread_wider_than_one_look_is_reported_as_a_duration():
 def test_a_delta_inside_one_look_is_not_reported_as_a_lag():
     lines = describe(monitor_delta_s=0.5)
 
-    assert 'within the 1.0s poll resolution of each other' in lines[1]
+    assert 'within the 1.0s resolution of each other' in lines[1]
 
 
 def test_a_receiver_that_beat_the_monitor_is_said_so_rather_than_clamped():
@@ -1001,7 +1005,7 @@ class FakeComponent:
 def test_finish_bench_publishes_the_export_section(tmp_path, monkeypatch):
     '''The fan-out reaches the artifact by the same path the churn and reload
     sections do, on a run that failed as well as one that converged.'''
-    args = Namespace(target='bird', label=None, neighbor_num=2,
+    args = Namespace(monitor='gobgp', target='bird', label=None, neighbor_num=2,
                      prefix_num=100, tester_type='bird', single_table=False,
                      filter_test=None, receivers=2, results_dir=str(tmp_path))
     output_stats = {

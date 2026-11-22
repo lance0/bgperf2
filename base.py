@@ -59,7 +59,7 @@ def normalize_image_name(name):
 
 
 def _find_image(name, images=None):
-    '''The local image dict carrying exactly this repository:tag, or None.
+    '''The local image dict with this exact full ID or repository:tag, or None.
 
     The one scan img_exists() and img_recipe_label() both need -- kept in one
     place so a future fix to the matching itself (this already replaced one
@@ -74,13 +74,16 @@ def _find_image(name, images=None):
     '''
     name = normalize_image_name(name)
     for img in (dckr.images() if images is None else images):
-        if name in (img.get('RepoTags') or []):
+        immutable = re.fullmatch(r'sha256:[0-9a-f]{64}', name)
+        if immutable and img.get('Id') == name:
+            return img
+        if not immutable and name in (img.get('RepoTags') or []):
             return img
     return None
 
 
 def img_exists(name, images=None):
-    '''True if a local image carries exactly this repository:tag.
+    '''True if a local image has this exact full ID or repository:tag.
 
     This used to compare only the repository half of RepoTags[0], so
     'bgperf/frr_c:10.1' looked present the moment any bgperf/frr_c image
@@ -464,6 +467,10 @@ class Container(object):
         self.command = None
         self.environment = None
         self.volumes = [self.guest_dir]
+        # The cores this container may run on (`--pin`), as a Docker cpuset
+        # string, or None for every core. Applied in run() rather than in
+        # get_host_config(), which three classes override.
+        self.cpuset = None
         if not os.path.exists(host_dir):
             os.makedirs(host_dir)
             os.chmod(host_dir, 0o777)
@@ -550,16 +557,19 @@ class Container(object):
         if _RenderOnly.active:
             return
         def insert_after_from(dockerfile, line):
-            lines = dockerfile.split('\n')
-            i = -1
-            for idx, l in enumerate(lines):
-                elems = [e.strip() for e in l.split()]
-                if len(elems) > 0 and elems[0] == 'FROM':
-                    i = idx
-            if i < 0:
+            # After *every* FROM, not just the last: each stage of a
+            # multi-stage build starts with a clean environment, and it is the
+            # build stage that fetches (sink's `go mod download`, rustybgp's
+            # cargo), not the runtime stage the last FROM begins.
+            out = []
+            for l in dockerfile.split('\n'):
+                out.append(l)
+                elems = l.split()
+                if elems and elems[0] == 'FROM':
+                    out.append(line)
+            if len(out) == len(dockerfile.split('\n')):
                 raise Exception('no FROM statement')
-            lines.insert(i+1, line)
-            return '\n'.join(lines)
+            return '\n'.join(out)
 
         for env in ['http_proxy', 'https_proxy']:
             if env in os.environ:
@@ -623,11 +633,22 @@ class Container(object):
             dckr.remove_container(self.name, force=True)
 
         host_config = self.get_host_config()
+        cpuset = getattr(self, 'cpuset', None)
+        if cpuset:
+            host_config['CpusetCpus'] = cpuset
 
         ctn = dckr.create_container(image=self.image, command=self.command, environment=self.environment,
                                     detach=True, name=self.name,
                                     stdin_open=True, volumes=self.volumes, host_config=host_config)
         self.ctn_id = ctn['Id']
+        if cpuset:
+            # Read back rather than trusted: the stem and the manifest say the
+            # run was pinned, and a cpuset the daemon dropped would publish an
+            # unpinned run under that name.
+            applied = dckr.inspect_container(self.ctn_id)['HostConfig'].get('CpusetCpus')
+            if applied != cpuset:
+                raise RuntimeError('{0}: asked Docker for cpuset {1!r} and it '
+                                   'applied {2!r}'.format(self.name, cpuset, applied))
 
         ipv4_addresses = self.get_ipv4_addresses()
 

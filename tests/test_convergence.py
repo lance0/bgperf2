@@ -95,6 +95,41 @@ def test_no_progress_deadline_not_tripped_early():
     assert status == ConvergenceTracker.CONTINUE
 
 
+@pytest.mark.parametrize('checked', [False, True])
+def test_full_target_checkpoint_cannot_converge_a_zero_observer(checked):
+    """Receipt/selection at the target is not delivery to the observer."""
+    tracker = ConvergenceTracker()
+    tracker.note_neighbors_checkpoint()
+    for elapsed in range(1, NO_PROGRESS_DEADLINE_SECONDS + 1):
+        assert tracker.update(elapsed, recved=0, neighbors_checked=2,
+                              neighbors_received_full=2, checked=checked,
+                              offering_complete=True) == tracker.CONTINUE
+    # A real observer never reports checked=True for zero routes; even a
+    # contradictory checkpoint must not turn zero delivery into convergence.
+    if not checked:
+        assert tracker.update(NO_PROGRESS_DEADLINE_SECONDS + 1, 0, 2, 2, False,
+                              offering_complete=True) == tracker.FAILED
+        assert 'stuck received count 0' in tracker.fail_msg
+    else:
+        for elapsed in range(NO_PROGRESS_DEADLINE_SECONDS + 1, STUCK_SAMPLES + 2):
+            status = tracker.update(elapsed, 0, 2, 2, True, offering_complete=True)
+            assert status != tracker.CONVERGED
+            if status == tracker.FAILED:
+                break
+        assert status == tracker.FAILED
+
+
+def test_target_checkpoint_with_zero_then_real_delivery_can_converge():
+    tracker = ConvergenceTracker()
+    tracker.note_neighbors_checkpoint()
+    for elapsed in range(1, 10):
+        assert tracker.update(elapsed, 0, 2, 2, False) == tracker.CONTINUE
+    assert tracker.update(10, 200, 2, 2, True) == tracker.CONTINUE
+    for elapsed in range(11, 10 + ASSURANCE_SAMPLES_AFTER_CHECKPOINT):
+        assert tracker.update(elapsed, 200, 2, 2, True) == tracker.CONTINUE
+    assert tracker.update(10 + ASSURANCE_SAMPLES_AFTER_CHECKPOINT, 200, 2, 2, True) == tracker.CONVERGED
+
+
 def test_fails_when_the_count_stops_moving_for_too_long():
     t = ConvergenceTracker()
     t.update(1, 1000, 5, 5, False)
@@ -642,3 +677,204 @@ class TestATargetWhoseNeighbourCountersNeverFill:
         status = t.update(NO_PROGRESS_DEADLINE_SECONDS + 1, 0, 0, 0,
                           checked=False)
         assert status == ConvergenceTracker.FAILED
+
+
+# --- the windows are durations (measurement plan 7b) ------------------------
+
+import convergence as _convergence
+
+
+def test_at_the_one_second_cadence_every_window_is_what_it_was():
+    '''7b's own test: re-expressing the windows as durations changes no
+    decision at the cadence every existing run used.'''
+    t = ConvergenceTracker(sample_interval_s=1.0)
+    assert (t.assurance_samples_full, t.assurance_samples_short,
+            t.stuck_samples, t.drop_samples, t.witness_carry_samples,
+            t.witness_excused_limit) == (20, 5, 600, 10, 5, 600)
+    assert (ASSURANCE_SAMPLES, ASSURANCE_SAMPLES_AFTER_CHECKPOINT,
+            STUCK_SAMPLES, DROP_SAMPLES, WITNESS_CARRY_SAMPLES,
+            WITNESS_EXCUSED_LIMIT) == (20, 5, 600, 10, 5, 600)
+    assert ConvergenceTracker().sample_interval_s == 1.0
+
+
+def test_a_faster_cadence_keeps_the_window_and_not_the_count():
+    '''A monitor that reports ten times a second must still hold the count
+    steady for 20 s, not for 20 samples (2 s).'''
+    t = ConvergenceTracker(sample_interval_s=0.1)
+    assert t.assurance_samples_full == 200
+    assert t.assurance_samples_short == 50
+    assert t.drop_samples == 100 and t.stuck_samples == 6000
+    # the first sample sets the count; 200 unchanged ones follow it
+    status = feed(t, 200, recved=1000, checked=True)
+    assert status == ConvergenceTracker.CONTINUE
+    assert feed(t, 1, recved=1000, checked=True,
+                elapsed_start=201) == ConvergenceTracker.CONVERGED
+    # and at 1 s the same feed converges twenty-one samples in, as always
+    one = ConvergenceTracker()
+    assert feed(one, 20, recved=1000, checked=True) == ConvergenceTracker.CONTINUE
+    assert feed(one, 1, recved=1000, checked=True,
+                elapsed_start=21) == ConvergenceTracker.CONVERGED
+
+
+def test_a_sustained_drop_is_judged_over_the_same_ten_seconds():
+    t = ConvergenceTracker(sample_interval_s=0.5)
+    feed(t, 3, recved=1000)
+    assert feed(t, 19, recved=900, elapsed_start=4) == ConvergenceTracker.CONTINUE
+    assert feed(t, 1, recved=900, elapsed_start=23) == ConvergenceTracker.FAILED
+
+
+@pytest.mark.parametrize('duration,interval,samples', [
+    (20.0, 0.1, 200), (20.0, 0.3, 67), (5.0, 1.0, 5), (0.01, 1.0, 1)])
+def test_samples_for_rounds_up_and_never_below_one(duration, interval, samples):
+    assert _convergence.samples_for(duration, interval) == samples
+
+
+@pytest.mark.parametrize('interval', [0, -1.0])
+def test_a_cadence_that_is_not_positive_is_refused(interval):
+    with pytest.raises(ValueError):
+        ConvergenceTracker(sample_interval_s=interval)
+
+
+def test_the_rule_publishes_its_windows_as_durations():
+    t = ConvergenceTracker(sample_interval_s=0.1)
+    t.converged_without_neighbors_checkpoint = True
+    rule = t.convergence_rule()
+    assert rule['assurance_s'] == 20.0 and rule['sample_interval_s'] == 0.1
+    assert rule['assurance_samples_required'] == 200
+
+
+# --- the one-witness path waits for the generators (bgperf2-5o5) -------------
+
+def test_one_peers_table_does_not_converge_while_generators_are_offering():
+    '''rrc00 at 24 peers, RustyBGP 2026-08 pass 1: generator 0 came up first,
+    the monitor reached 1,049,977 against a required 1,039,500 and held there
+    for twenty samples while 23 generators were still sending, and the run was
+    published at 7s. With the offering incomplete it must keep waiting.'''
+    t = ConvergenceTracker()
+    for i in range(ASSURANCE_SAMPLES + 10):
+        status = t.update(i + 1, 1_049_977, 1, 0, checked=True,
+                          offering_complete=False)
+        assert status == ConvergenceTracker.CONTINUE
+
+
+def test_the_window_is_counted_after_every_generator_completed():
+    '''A count already steady when the last generator completes has not yet
+    been seen steady with the whole workload offered.'''
+    t = ConvergenceTracker()
+    for i in range(ASSURANCE_SAMPLES + 10):
+        t.update(i + 1, 1_049_977, 1, 0, checked=True,
+                 offering_complete=False)
+    start = ASSURANCE_SAMPLES + 11
+    for i in range(ASSURANCE_SAMPLES - 1):
+        status = t.update(start + i, 1_049_977, 1, 0, checked=True,
+                          offering_complete=True)
+        assert status == ConvergenceTracker.CONTINUE
+    status = t.update(start + ASSURANCE_SAMPLES - 1, 1_049_977, 1, 0,
+                      checked=True, offering_complete=True)
+    assert status == ConvergenceTracker.CONVERGED
+    assert t.convergence_rule()['offering_complete'] is True
+
+
+def test_a_run_complete_long_before_the_count_settled_is_unchanged():
+    '''The seven one-witness rows on disk converged 22.6-32.7s after their
+    last generator completed; the gate must decide them exactly as before.'''
+    t = ConvergenceTracker()
+    for i in range(30):
+        t.update(i + 1, 100 * i, 16, 16, checked=False,
+                 offering_complete=True)
+    for i in range(ASSURANCE_SAMPLES):
+        status = t.update(31 + i, 5_000_000, 16, 16, checked=True,
+                          offering_complete=True)
+        assert status == ConvergenceTracker.CONTINUE
+    assert t.update(31 + ASSURANCE_SAMPLES, 5_000_000, 16, 16, checked=True,
+                    offering_complete=True) == ConvergenceTracker.CONVERGED
+
+
+def test_no_offering_evidence_is_decided_as_before():
+    t = ConvergenceTracker()
+    for i in range(ASSURANCE_SAMPLES + 2):
+        status = t.update(i + 1, 5_000_000, 0, 0, checked=True,
+                          offering_complete=None)
+    assert status == ConvergenceTracker.CONVERGED
+    assert t.convergence_rule()['offering_complete'] is None
+
+
+def test_a_two_witness_run_does_not_wait_for_the_generators():
+    '''The target saying every neighbour is full already says the offering
+    arrived; the 484 two-witness rows on disk must not move.'''
+    t = ConvergenceTracker()
+    t.note_neighbors_checkpoint()
+    t.update(1, 1000, 5, 5, checked=True, offering_complete=False)
+    status = None
+    for i in range(ASSURANCE_SAMPLES_AFTER_CHECKPOINT):
+        status = t.update(2 + i, 1000, 5, 5, checked=True,
+                          offering_complete=False)
+    assert status == ConvergenceTracker.CONVERGED
+    assert t.convergence_rule() is None
+
+
+def test_a_run_held_by_the_generators_says_so_when_it_fails():
+    t = ConvergenceTracker()
+    for i in range(STUCK_SAMPLES + 2):
+        status = t.update(i + 1, 1_049_977, 1, 0, checked=True,
+                          offering_complete=False)
+    assert status == ConvergenceTracker.FAILED
+    assert "generators' offering incomplete" in t.fail_msg
+
+
+class _Recorder(object):
+    def __init__(self, complete):
+        self.complete = complete
+
+
+def test_fleet_offering_complete_reads_every_recorder():
+    from bgperf2 import tester_offering_complete
+    assert tester_offering_complete({}, {}) is None
+    both = {'a': _Recorder(True), 'b': _Recorder(True)}
+    assert tester_offering_complete(both, {}) is True
+    one = {'a': _Recorder(True), 'b': _Recorder(False)}
+    assert tester_offering_complete(one, {}) is False
+
+
+def test_a_retired_recorder_withdraws_the_evidence_rather_than_stalling():
+    '''A fault in the measurement wiring never ends or stalls a run that is
+    otherwise producing a result, so it leaves the run decided as before.'''
+    from bgperf2 import tester_offering_complete
+    fleet = {'a': _Recorder(True), 'b': _Recorder(False)}
+    assert tester_offering_complete(fleet, {'b': 'went backwards'}) is None
+    # one that had already completed before it was retired still counts
+    fleet = {'a': _Recorder(True), 'b': _Recorder(True)}
+    assert tester_offering_complete(fleet, {'b': 'went backwards'}) is True
+
+
+def test_a_run_that_never_peered_does_not_blame_the_generators():
+    '''Held by the check-point, not by the offering.'''
+    t = ConvergenceTracker()
+    status = t.update(NO_PROGRESS_DEADLINE_SECONDS + 1, 0, 0, 0,
+                      checked=False, offering_complete=False)
+    assert status == ConvergenceTracker.FAILED
+    assert 'offering' not in t.fail_msg
+
+
+@pytest.mark.parametrize('seconds', [True, 0, 14, 121, 120.0, float('inf'), None])
+def test_zero_route_startup_allowance_is_bounded(seconds):
+    with pytest.raises(ValueError, match='startup allowance'):
+        ConvergenceTracker(zero_route_startup_seconds=seconds)
+
+
+def test_explicit_startup_allowance_never_converges_zero_and_expires():
+    tracker = ConvergenceTracker(zero_route_startup_seconds=120)
+    tracker.note_neighbors_checkpoint()
+    for second in range(1, 121):
+        assert tracker.update(second, 0, 1, 1, False) == tracker.CONTINUE
+    assert tracker.update(121, 0, 1, 1, False) == tracker.FAILED
+
+
+def test_explicit_startup_allowance_accepts_late_positive_delivery():
+    tracker = ConvergenceTracker(zero_route_startup_seconds=120)
+    assert tracker.update(100, 0, 0, 0, False) == tracker.CONTINUE
+    tracker.note_neighbors_checkpoint()
+    assert tracker.update(110, 1000, 1, 1, True) == tracker.CONTINUE
+    for second in range(111, 116):
+        status = tracker.update(second, 1000, 1, 1, True)
+    assert status == tracker.CONVERGED

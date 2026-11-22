@@ -2,7 +2,7 @@
 
 Export-side timing: what the receiver fan-out was served, and when.
 
-**Read this before editing:** `bgperf2.py` (`controller_export_stats()`, `finish_bench()`), `monitor.py` (`Receiver`), `measurements.py` (`ExportEventRecorder`)
+**Read this before editing:** `run_lifecycle.py` (run orchestration), `bgperf2.py` (`controller_export_stats()`, `finish_bench()`), `monitor.py` (`Receiver`, `SinkReceiver`), `measurements.py` (`ExportEventRecorder`)
 
 These are invariants, not background: every rule here was written because the obvious alternative was tried and published a wrong number quietly. `CLAUDE.md` carries the one-line index; this file carries the argument.
 
@@ -126,7 +126,8 @@ intervals under `convergence` with nothing saying which one the row describes.
   `--path-diversity`. The stop event is per run and never cleared, unlike
   `controller_stop`, so a round still in flight at the end of a batch cell
   cannot find that event clear again at the start of the next one.
-- **This is the one sampler that does not go through the run's queue**, and the
+- **This sampler does not go through the run's queue** (nor does the per-role
+  cgroup poll in `role_cpu.py`, for the same reason), and the
   reason is that nothing would reliably take its messages out again: `bench()`'s
   monitor loop stops the instant convergence is declared, and `run_churn_bursts()`
   and `run_policy_reload()` read that queue afterwards and skip anything that is
@@ -147,6 +148,28 @@ intervals under `convergence` with nothing saying which one the row describes.
   complete on the first round — publishes an `unmeasured_reason` instead:
   absent is what an older build wrote, so silence could not be told from a
   build that never took the measurement.
+
+**Under `--monitor sink` the receivers are sinks** (`monitor.SinkReceiver`, chosen through
+`RECEIVER_CLASSES`), and `accepted_prefixes()` reads each one's log on the host. The rules above
+are unchanged, and not every reason given for them survives. The round is still serialised and
+still waits at least as long as it took, but a read no longer runs *inside* a receiver, so the
+`docker exec` cost these bullets were written against belongs to the GoBGP receivers alone. A
+sink receiver's unreadable log raises, exactly as a failed `gobgp neighbor -j` did: a stale or
+malformed log is a missing read, never a receiver holding nothing.
+
+**A sink receiver's events are dated by its own log** (7b, third change set), on the rules
+that date the monitor's (`measurements.sink_dated()`). The round still decides *that*
+`receiver_first_prefix` or `receiver_table_reached` happened. `SinkReceiver.read_export()`
+reads the count as of the round's stamp, together with the log's dates, and the event goes to
+the C line that showed it, with that line's bound as its resolution. Its threshold is
+`Instrument.check_point()`, the run's `check-points[0]`, which is `export_required`. So the
+line and the round judge one yardstick. Under `--monitor sink` both ends of `monitor_delta_s`
+and `export_spread_s` are therefore sink-dated, one instrument again, and their resolutions
+fall from a round to milliseconds: a smoke run published `monitor_delta_s` 48 µs at an 8 ms
+resolution. The round's cadence and its serialisation are unchanged; they now decide only when
+an event is *noticed*. A GoBGP fan-out is dated by the round exactly as before. The printed
+lines show a duration under 0.1 s in milliseconds (`duration_text()`) and no longer say
+"poll", because `0.0s` beside a 4 ms resolution reads as an instant.
 
 **What still cannot be separated is table selection.** With this in place a run
 decomposes into ingress (measured at the generators), the target's own work, and
