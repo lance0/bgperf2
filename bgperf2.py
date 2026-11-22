@@ -2873,19 +2873,6 @@ def bench(args):
         except ValueError as e:
             sys.exit(str(e))
 
-    if args.file:
-        # A scenario's generators are otherwise only checked in the dispatch
-        # loop, after the teardown below has already destroyed the previous
-        # run's containers and logs.
-        with open(args.file) as f:
-            early = yaml.safe_load(Template(f.read()).render()) or {}
-        try:
-            for tester in early.get('testers') or []:
-                if tester.get('type') == 'mrt':
-                    scenario_mrt_tester_class(tester)
-        except ValueError as e:
-            sys.exit(str(e))
-
     if not args.file:
         # After every guard that reads only the command line, and still before
         # anything is torn down. Both halves matter: a typo'd --version must
@@ -2928,6 +2915,13 @@ def bench(args):
                 scenario_load_s = time.monotonic() - scenario_load_start
             refuse_scenario_single_table(
                 conf, "the scenario's target `single-table`")
+            # A scenario's generators are otherwise only checked in the
+            # dispatch loop, after the teardown below has already destroyed
+            # the previous run's containers and logs. Checked on the same
+            # validated object, so the template is not rendered again.
+            for tester in conf.get('testers') or []:
+                if tester.get('type') == 'mrt':
+                    scenario_mrt_tester_class(tester)
             # Here rather than after the parse below, for the same reason
             # (bgperf2-urp): `resolve_receivers()` guards every path that
             # builds a scenario; this guards the one path handed one.
