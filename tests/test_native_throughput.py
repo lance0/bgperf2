@@ -61,7 +61,8 @@ def test_phase_journal_is_attempt_bound_ordered_and_exclusive(tmp_path):
 
 def synthetic(tmp_path):
     return engine.create_args_parser().parse_args(['-d',str(tmp_path/'work'),'bench','-t','bird','-g','bird','-n','2','-p','10',
-        '-i','sha256:'+'0'*64,'--generator-image','sha256:'+'1'*64,'--observer-image','sha256:'+'2'*64,'--results-dir',str(tmp_path/'results')])
+        '-i','sha256:'+'0'*64,'--generator-image','sha256:'+'1'*64,'--observer-image','sha256:'+'2'*64,'--results-dir',str(tmp_path/'results'),
+        '--monitor','sink'])
 
 
 @pytest.mark.parametrize('field,value',[('repeat',True),('tester_type','exa'),('path_diversity',2),('receivers',1),('image','mutable:tag'),('prefix_num',5000000)])
@@ -104,7 +105,8 @@ def test_preflight_checks_all_bindings_without_lifecycle(tmp_path,monkeypatch,ca
     config=tmp_path/'batch.yaml'
     import yaml
     config.write_text(yaml.safe_dump(dict(tests=[dict(name='preflight',targets=[dict(name='bird',label='bird',tester_type='bird',
-        image=args.image,generator_image=args.generator_image,observer_image=args.observer_image)],neighbors=[1,2],prefixes=[10],filter_test=['None'])])))
+        image=args.image,generator_image=args.generator_image,observer_image=args.observer_image)],neighbors=[1,2],prefixes=[10],filter_test=['None'],
+        monitor='sink')])))
     monkeypatch.setattr(engine,'img_exists',lambda image:selected.append(image) or True)
     actual=engine.create_args_parser().parse_args(['batch','-c',str(config),'--preflight'])
     engine.batch(actual);value=json.loads(capsys.readouterr().out)

@@ -1,8 +1,8 @@
 """`--monitor gobgp|sink`: the instrument as a run dimension (measurement plan
 7a, docs/invariants/workload-controls.md).
 
-The sink is the default since 7d, and GoBGP stays selectable to re-check a sink
-cell against. One cell measured with each is the same workload, so the
+Upstream made the sink the default in 7d; this fork keeps GoBGP as the
+default and the sink selectable. One cell measured with each is the same workload, so the
 instrument has to reach everything a dimension reaches -- the entry points, the
 cell id, the artifact stem and both `run` blocks -- or the two overwrite or
 resume into each other.
@@ -28,13 +28,17 @@ class TestNames:
         assert bgperf2.bench_output_prefix(self.args(monitor='gobgp')) == \
             'bird_bird_100_10'
 
-    def test_the_default_is_the_sink_and_is_marked(self):
-        '''7d. The omission stays with the instrument the old rows were
-        measured on, not with the default, or every one of them is renamed.'''
-        assert bgperf2.DEFAULT_MONITOR == 'sink'
+    def test_the_fork_default_is_gobgp_and_the_sink_is_marked(self):
+        '''This fork keeps GoBGP as the default (upstream's 7d flip is
+        opt-in here). The omission stays with the instrument the old rows were
+        measured on, so the default keeps every old name and the sink is
+        marked.'''
+        assert bgperf2.DEFAULT_MONITOR == 'gobgp'
         assert bgperf2.UNMARKED_MONITOR == 'gobgp'
-        for args in (self.args(), self.args(monitor=None), self.args(monitor='sink')):
-            assert bgperf2.bench_output_prefix(args) == 'bird_bird_100_10_mon-sink'
+        for args in (self.args(), self.args(monitor=None)):
+            assert bgperf2.bench_output_prefix(args) == 'bird_bird_100_10'
+        assert bgperf2.bench_output_prefix(self.args(monitor='sink')) == \
+            'bird_bird_100_10_mon-sink'
 
     def test_every_monitor_class_is_selectable(self):
         assert set(bgperf2.MONITOR_TYPES) == set(bgperf2.MONITOR_CLASSES)
@@ -44,7 +48,8 @@ class TestNames:
 class TestCli:
     def test_bench_takes_it_and_config_does_not(self):
         parser = bgperf2.create_args_parser()
-        assert parser.parse_args(['bench']).monitor == 'sink'
+        assert parser.parse_args(['bench']).monitor == 'gobgp'
+        assert parser.parse_args(['bench', '--monitor', 'sink']).monitor == 'sink'
         assert parser.parse_args(['bench', '--monitor', 'gobgp']).monitor == 'gobgp'
         with pytest.raises(SystemExit):
             parser.parse_args(['bench', '--monitor', 'bird'])
@@ -128,9 +133,12 @@ class TestBatch:
         test = self.test(monitor='gobgp')
         assert [c['monitor'] for c in
                 bgperf2.expand_batch_cells(test, test['targets'])] == ['gobgp']
-        test = self.test()
+        test = self.test(monitor='sink')
         assert [c['monitor'] for c in
                 bgperf2.expand_batch_cells(test, test['targets'])] == ['sink']
+        test = self.test()
+        assert [c['monitor'] for c in
+                bgperf2.expand_batch_cells(test, test['targets'])] == ['gobgp']
 
     def test_the_id_and_description_name_only_the_sink(self):
         test = self.test(monitor='gobgp')
@@ -155,15 +163,16 @@ class TestBatch:
         assert bgperf2.cell_monitor(old) == 'gobgp'
         assert 'monitor' not in bgperf2.batch_cell_description(old)
 
-    def test_a_config_with_no_monitor_does_not_resume_into_gobgp_rows(self):
-        '''A batch with no `monitor:` key ran GoBGP before 7d and runs the
-        sink after it. Its old rows must not be reused under the new
-        instrument, so the ids must differ.'''
-        before = self.test(monitor='gobgp')
-        after = self.test()
-        assert bgperf2.batch_cell_id('t', bgperf2.expand_batch_cells(
-            before, before['targets'])[0]) != bgperf2.batch_cell_id(
-            't', bgperf2.expand_batch_cells(after, after['targets'])[0])
+    def test_a_config_with_no_monitor_resumes_into_gobgp_rows(self):
+        '''Under the fork's GoBGP default, a batch with no `monitor:` key
+        measures exactly what one stating `monitor: gobgp` does, so the ids are
+        the same; a sink test's ids differ from both.'''
+        stated = self.test(monitor='gobgp')
+        omitted = self.test()
+        sink = self.test(monitor='sink')
+        ids = [bgperf2.batch_cell_id('t', bgperf2.expand_batch_cells(
+            t, t['targets'])[0]) for t in (stated, omitted, sink)]
+        assert ids[0] == ids[1] != ids[2]
 
     def test_a_missing_monitor_image_ends_the_batch_before_it_starts(self, monkeypatch):
         monkeypatch.setattr(base, 'img_exists', lambda tag, images=None:
@@ -171,7 +180,7 @@ class TestBatch:
         bgperf2.check_batch_monitor_images([self.test(monitor='gobgp')])
         with pytest.raises(SystemExit, match='bgperf/sink'):
             bgperf2.check_batch_monitor_images(
-                [self.test(monitor='gobgp'), self.test()])
+                [self.test(monitor='gobgp'), self.test(monitor='sink')])
 
     def test_a_missing_receiver_image_ends_the_batch_before_it_starts(self, monkeypatch):
         class OtherReceiver(base.Container):
@@ -208,7 +217,7 @@ class TestRecorded:
         assert doc['monitor']['daemon'] == 'sink'
         assert doc['monitor']['image'].startswith('bgperf/sink')
         doc = bgperf2.collect_provenance(Namespace(target='bird'), Target(), Ctn(), [])
-        assert doc['monitor']['daemon'] == 'sink'
+        assert doc['monitor']['daemon'] == 'gobgp'
         doc = bgperf2.collect_provenance(
             Namespace(target='bird', monitor='gobgp'), Target(), Ctn(), [])
         assert doc['monitor']['daemon'] == 'gobgp'
@@ -256,9 +265,9 @@ class TestResumeAcrossTheFlip:
         test.update(kw)
         return test
 
-    def test_gobgp_rows_under_a_test_naming_no_monitor_are_refused(self, tmp_path):
+    def test_sink_rows_under_a_test_naming_no_monitor_are_refused(self, tmp_path):
         test = self.a_test()
-        self.write(tmp_path, test, 'gobgp')
+        self.write(tmp_path, test, 'sink')
         with pytest.raises(SystemExit, match='1 result\\(s\\) for cells this config does not list'):
             bgperf2.check_resumable(self.expanded(test), str(tmp_path))
 

@@ -23,7 +23,8 @@ def fixture(tmp_path):
           '-n','1','-p',str(spec['peers'][0]['prefixes']),
           '-i','sha256:'+'0'*64,'--generator-image','sha256:'+'1'*64,
           '--observer-image','sha256:'+'2'*64,'--mrt-spec',str(workload),
-          '--mrt-spec-sha256',digest,'--results-dir',str(tmp_path/'results')]
+          '--mrt-spec-sha256',digest,'--results-dir',str(tmp_path/'results'),
+          '--monitor','sink']
     return engine.create_args_parser().parse_args(argv),spec
 
 

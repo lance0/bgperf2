@@ -167,12 +167,13 @@ MONITOR_CLASSES = {
 }
 
 # Which of them a run measures with (`--monitor`; batch: `monitor:`, a *test*
-# key). The sink is the default since measurement plan 7d. GoBGP stays
-# selectable as the reference a sink result can be re-checked against, one cell
-# at a time -- the bridge block that would have compared the two up front (7c)
-# was dropped by the operator in favour of re-benching.
+# key). Upstream made the sink the default in measurement plan 7d. This fork
+# keeps GoBGP as the default: its campaigns compare against receipts measured
+# with the GoBGP monitor, and a default flip would move every daemon's timings
+# at once. The sink stays selectable with `--monitor sink` / `monitor: sink`
+# until it is qualified against GoBGP on the fork's own shapes.
 MONITOR_TYPES = tuple(MONITOR_CLASSES)
-DEFAULT_MONITOR = 'sink'
+DEFAULT_MONITOR = 'gobgp'
 # The class each monitor's export receivers run as. A receiver is a monitor
 # nothing reads (`monitor.Receiver`), so it follows the run's instrument.
 RECEIVER_CLASSES = {

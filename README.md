@@ -43,6 +43,31 @@ workload. You can compare convergence time, CPU and memory without your own
 daemon source checkout or a bug to investigate. The advanced guides cover
 portable evidence, correctness checks and source investigation when you need them.
 
+## <a name="fork"></a>Differences from upstream
+
+This fork tracks upstream `netenglabs/bgperf2` by cherry-picking its commits,
+and keeps these deliberate differences. Where the rest of this README or the
+`docs/` pages say otherwise, this section takes precedence.
+
+- **GoBGP is a target and the default monitor.** Upstream removed GoBGP as a
+  target and made the sink the default monitor. Here `-t gobgp` is still
+  selectable, and `bench`/`batch` measure with the GoBGP monitor unless a run
+  says `--monitor sink` (batch: `monitor: sink`). This keeps new rows
+  comparable with earlier GoBGP-monitor receipts. `--monitor-version` (batch:
+  `monitor_version`) pins the GoBGP monitor image and is refused under the
+  sink. The native MRT and durable native batch runners require the sink, so
+  they need `--monitor sink` explicitly. The GoBGP MRT generator removal is
+  kept.
+- **rustbgpd builds from a local checkout.** The `rustbgpd` target builds a
+  clean `RUSTBGPD_SOURCE` worktree (see [the rustbgpd target guide](docs/rustbgpd.md)),
+  rather than repackaging a published release image as upstream's adapter does.
+  It accepts `-f` scenarios, refuses policy it cannot represent, and is left out
+  of a bare `prepare`. [docs/plans/new-daemon-adapters.md](docs/plans/new-daemon-adapters.md)
+  describes upstream's adapter choices, not this fork's.
+- **The baseline CSV is kept.** `benchmarks/baseline/baseline-benchmark.csv`,
+  which upstream deleted, stays with its corrected header, pinned by
+  `tests/test_stats_contract.py`.
+
 ## What it does
 
 Each run has three roles, each in its own container on a dedicated Docker

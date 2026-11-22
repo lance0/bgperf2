@@ -26,7 +26,7 @@ def model(tmp_path, monkeypatch):
     targets = [dict(name='bird', label=name, image='sha256:'+'0'*64,
                     generator_image='sha256:'+'1'*64, observer_image='sha256:'+'2'*64) for name in ('first','second')]
     config.write_text(yaml.safe_dump(dict(tests=[dict(name='comparison',neighbors=[1],prefixes=[10],
-        filter_test=['None'],targets=targets,repetitions=3)])))
+        filter_test=['None'],targets=targets,repetitions=3,monitor='sink')])))
     args = engine.create_args_parser().parse_args(['-d',str(tmp_path/'work'),'batch','-c',str(config),
                                                   '--results-dir',str(tmp_path/'results'),'--calibrate','--defer-graphs'])
     calls=[]; reports=[]; actual_report=engine.report_batch_from_cell_results
