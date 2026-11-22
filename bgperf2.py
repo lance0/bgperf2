@@ -44,7 +44,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from base import *
 from exabgp import ExaBGP, ExaBGP_MRTParse
-from gobgp import GoBGP
+from gobgp import GoBGP, GoBGPTarget
 from bird import BIRD, BIRDTarget
 from frr import FRRoutingTarget
 from frr_compiled import FRRoutingCompiled, FRRoutingCompiledTarget
@@ -135,6 +135,10 @@ MONITOR_CLASSES = {
 }
 
 TARGET_CLASSES = {
+    # Kept in this fork: GoBGP is one of the daemons its cross-stack campaign
+    # compares. Upstream dropped it as a target on 2026-09-29; the MRT
+    # generator removal is kept.
+    'gobgp': GoBGPTarget,
     'bird': BIRDTarget,
     'frr_c': FRRoutingCompiledTarget,
     'rustybgp': RustyBGPTarget,
@@ -1672,8 +1676,9 @@ def update(args):
 # Containers of roles bgperf2 no longer runs. A host whose last run used one
 # can still have it holding that role's address on the bench bridge, and the
 # next run would fail to attach there with nothing in the teardown saying why.
-# GoBGP stopped being a target and an MRT generator on 2026-09-29.
-RETIRED_TARGET_CONTAINERS = ('bgperf_gobgp_target',)
+# GoBGP stopped being an MRT generator on 2026-09-29; this fork keeps it as a
+# target, so no target container is retired.
+RETIRED_TARGET_CONTAINERS = ()
 RETIRED_TESTER_PREFIXES = ('bgperf_gobgp_mrttester_',)
 
 

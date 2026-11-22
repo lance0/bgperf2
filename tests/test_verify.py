@@ -187,11 +187,11 @@ class TestProbeUsesTheClassBenchUses:
         '''
         assert bgperf2.TARGET_CLASSES['bird'] is not bgperf2.TESTER_CLASSES['bird']
 
-    def test_gobgp_is_only_the_monitor(self):
-        '''GoBGP was dropped as a target and as an MRT generator; its image is
-        still built for the monitor and receivers, and must still be probed --
-        through Monitor, not the daemon base class.'''
-        assert 'gobgp' not in bgperf2.TARGET_CLASSES
+    def test_gobgp_is_a_target_and_the_monitor_but_not_a_generator(self):
+        '''This fork keeps GoBGP as a benchmark target; upstream dropped it.
+        It is no longer an MRT generator. Its image serves the target, the
+        monitor and the receivers, and is probed through Monitor as well.'''
+        assert bgperf2.TARGET_CLASSES['gobgp'] is bgperf2.GoBGPTarget
         assert 'gobgp' not in bgperf2.TESTER_CLASSES
         assert 'gobgp' in bgperf2.BUILDABLE_IMAGES
         assert bgperf2.MONITOR_CLASSES['gobgp'] is bgperf2.Monitor

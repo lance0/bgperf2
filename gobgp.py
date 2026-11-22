@@ -93,9 +93,8 @@ RUN rm -rf /root/gobgp && cp /go/bin/gobgp /root/gobgp
         super(GoBGP, cls).build_image(force, tag, nocache=nocache)
 
 
-# Not a selectable target any more (see bgperf2.TARGET_CLASSES). Kept because
-# RustyBGPTarget speaks the same config format and inherits this writer and
-# neighbour reader.
+# A selectable target in this fork (see bgperf2.TARGET_CLASSES), and the base
+# RustyBGPTarget inherits its config writer and neighbor reader from.
 class GoBGPTarget(GoBGP, Target):
 
     CONTAINER_NAME = 'bgperf_gobgp_target'
